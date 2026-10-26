@@ -46,6 +46,11 @@ class CellType(enum.IntEnum):
     BOUNDARY = 2  #: wet point that is part of an open boundary
     MIRROR_INT = 3  #: wet point within boundary, set by mirroring the interior
     MIRROR_EXT = 4  #: wet point just outside boundary, set by mirroring the interior
+    #: wet point whose values are set from outside the model (e.g., by nesting:
+    #: the ring of a child domain or the hole of a parent domain). It is not
+    #: updated by the model, but valid wherever ACTIVE points are, and fluxes
+    #: through its faces are computed.
+    EXTERNAL = 5
     EDGE_X = (
         -1
     )  #: edge between actively modeled and unresolved points (e.g., coastlines)

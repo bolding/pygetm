@@ -497,6 +497,7 @@ class Domain:
         self.coordinate_type = coordinate_type
         self.root_logger = logger or parallel.get_logger()
         self.logger = self.root_logger.getChild("domain")
+        self._external = None
 
         if self.comm.rank != 0:
             self._x = self._y = self._lon = self._lat = None
@@ -809,6 +810,27 @@ class Domain:
     @mask.setter
     def mask(self, values: npt.ArrayLike):
         self._mask = self._map_array(values, missing_value=0, dtype=int)
+
+    @property
+    def external(self) -> Optional[np.ndarray]:
+        """Cell centers (T points, shape ``(ny, nx)``) whose values are set from
+        outside the model, e.g., by nesting. Where these are water, their cell
+        type becomes :attr:`CellType.EXTERNAL`: wet and with open faces, but not
+        updated by the model. None (default) if there are no such points.
+
+        This attribute is None on non-root MPI nodes.
+        """
+        return self._external
+
+    @external.setter
+    def external(self, values: Optional[npt.ArrayLike]):
+        if self.comm.rank != 0 or values is None:
+            self._external = None
+            return
+        values = np.asarray(values, dtype=bool)
+        if values.shape != (self.ny, self.nx):
+            raise ValueError(f"external has shape {values.shape}, expected {(self.ny, self.nx)}")
+        self._external = values.copy()
 
     @property
     def H(self) -> Optional[np.ndarray]:
@@ -1295,6 +1317,11 @@ class Domain:
         ] = 0
 
         self.open_boundaries.adjust_mask(mask)
+
+        if self._external is not None:
+            # after U, V, X masks have been derived: faces of external points
+            # stay open
+            tmask[self._external & (tmask == CellType.ACTIVE)] = CellType.EXTERNAL
 
         return mask
 

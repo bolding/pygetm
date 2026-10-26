@@ -288,6 +288,60 @@ class TestAdvectionFlux(unittest.TestCase):
                 self.assertGreater(np.abs(fu.all_values).max(), 0.0)
 
 
+class TestExternalCells(unittest.TestCase):
+    def test_external_cells(self):
+        # Cells marked external are wet with valid depth and open faces, are
+        # not updated by advection, and are excluded from ACTIVE-only sums
+        nx, ny = 12, 8
+        domain = pygetm.domain.create_cartesian(
+            np.arange(nx + 1) * 1e3,
+            np.arange(ny + 1) * 1e3,
+            interfaces=True,
+            H=10.0,
+            f=0.0,
+            logger=parallel.get_logger(level="ERROR"),
+        )
+        external = np.zeros((ny, nx), dtype=bool)
+        external[:, :2] = True  # a band on the west side
+        domain.external = external
+        T = domain.create_grids(1, halox=2, haloy=2, velocity_grids=1)
+        if T is None:
+            return
+        from pygetm.constants import CellType
+
+        jg, ig = np.meshgrid(
+            np.arange(T.ny_) - T.haloy + T.tiling.yoffset,
+            np.arange(T.nx_) - T.halox + T.tiling.xoffset,
+            indexing="ij",
+        )
+        inside = (jg >= 0) & (jg < ny) & (ig >= 0) & (ig < nx)
+        own = np.zeros_like(inside)  # this subdomain's cells (no halos)
+        own[T.haloy : -T.haloy, T.halox : -T.halox] = True
+        inside &= own
+        ext = inside & (ig < 2)
+        self.assertTrue((T.mask.all_values[ext] == CellType.EXTERNAL).all())
+        self.assertTrue((T.mask.all_values[inside & ~ext] == CellType.ACTIVE).all())
+        # depth valid (not fill) in external cells
+        self.assertTrue(np.allclose(T.H.all_values[ext], 10.0))
+        self.assertTrue(np.allclose(T.D.all_values[ext], 10.0))
+        # faces between external and active cells are open
+        uopen = T.ugrid.mask.all_values[inside & (ig == 1)]
+        self.assertTrue((uopen != 0).all())
+        # advection: external cells keep their values, active ones change
+        f = T.array(fill=0.0)
+        f.all_values[ext] = 1.0
+        f.update_halos()
+        u = T.ugrid.array(fill=0.0)
+        u.all_values[T.ugrid.mask.all_values != 0] = 300.0
+        v = T.vgrid.array(fill=0.0)
+        before = f.all_values.copy()
+        pygetm.operators.Advection(T, scheme=pygetm.AdvectionScheme.UPSTREAM)(u, v, 1.0, f)
+        np.testing.assert_array_equal(f.all_values[ext], before[ext])
+        first_active = inside & (ig == 2)
+        if first_active.any():
+            self.assertTrue((f.all_values[first_active] > 0.0).all())
+
+
 class TestCoupler(unittest.TestCase):
     def test_hook_order(self):
         sim = barotropic_simulation()
