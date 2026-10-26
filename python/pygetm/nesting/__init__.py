@@ -10,6 +10,12 @@ This package currently provides:
 * :mod:`pygetm.nesting.exchange`: planning and execution of MPI exchanges of
   rectangular strips between independently decomposed parent and child domains
 * :func:`split_world`: division of the MPI processes over the domains
+* :mod:`pygetm.nesting.halo`: :class:`CellSet`, generic gather/scatter/pack of
+  any 2D or 3D array at a fixed set of cells; :func:`outer_halo` (the child's
+  ring outside its global domain) and :func:`hole_rim` (the parent's cells
+  around the hole occupied by the child)
+* :mod:`pygetm.nesting.variables`: which variables are exchanged, at which
+  stage of the time step (:data:`pygetm.simulation.COUPLING_STAGES`), and why
 
 Two complementary exchange paradigms
 ------------------------------------
@@ -31,5 +37,15 @@ package writes there are kept.
 """
 
 from .hierarchy import NestingContext, split_world
+from .halo import CellSet, outer_halo, hole_rim
+from .variables import ExchangeGroup, EXCHANGE_GROUPS
 
-__all__ = ["NestingContext", "split_world"]
+__all__ = [
+    "NestingContext",
+    "split_world",
+    "CellSet",
+    "outer_halo",
+    "hole_rim",
+    "ExchangeGroup",
+    "EXCHANGE_GROUPS",
+]

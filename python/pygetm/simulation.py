@@ -72,6 +72,13 @@ def log_exceptions(method):
     return wrapper
 
 
+#: Points within the state update of :class:`Simulation` at which
+#: :meth:`Coupler.on_stage` is called, in order of occurrence. ``transports_2d``
+#: and ``elevation`` occur every microtimestep; ``momentum_3d`` and ``tracers``
+#: only when the microtimestep completes a macrotimestep (3D runs only).
+COUPLING_STAGES = ("transports_2d", "elevation", "momentum_3d", "tracers")
+
+
 class Coupler:
     """Base class for objects that exchange information between a simulation and
     other simulations (e.g., nested domains) at fixed points in the time loop.
@@ -103,6 +110,26 @@ class Coupler:
 
         Args:
             sim: simulation that is being advanced
+            macro_active: whether the current microtimestep completes a
+                macrotimestep
+        """
+        pass
+
+    def on_stage(self, sim: "BaseSimulation", stage: str, macro_active: bool):
+        """Called from within the state update, just after a group of prognostic
+        variables has been updated (and halo-exchanged within the domain).
+
+        Args:
+            sim: simulation that is being advanced
+            stage: one of :data:`COUPLING_STAGES`:
+
+                * ``transports_2d``: depth-integrated transports ``U``, ``V``
+                * ``elevation``: surface elevation ``T.z``
+                * ``momentum_3d``: layer transports and velocities ``pk``,
+                  ``qk``, ``uk``, ``vk``; turbulent viscosity ``num``
+                * ``tracers``: all tracers (temperature, salinity, FABM),
+                  layer thicknesses ``hn``
+
             macro_active: whether the current microtimestep completes a
                 macrotimestep
         """
@@ -170,6 +197,10 @@ class BaseSimulation:
         This must be called before :meth:`start`.
         """
         self._couplers.append(coupler)
+
+    def _coupling_stage(self, stage: str, macro_active: bool):
+        for coupler in self._couplers:
+            coupler.on_stage(self, stage, macro_active)
 
     def __getitem__(self, key: str) -> core.Array:
         return self.output_manager.fields[key]
@@ -1229,6 +1260,7 @@ class Simulation(BaseSimulation):
         self.momentum.advance_depth_integrated(
             self.timestep, self.tausx, self.tausy, self.dpdx, self.dpdy
         )
+        self._coupling_stage("transports_2d", macro_active)
 
         # Update surface elevation on T grid from time=0 to time=1 using transports
         # U and V at time=1/2 and freshwater fluxes at time=0. This also updates halos
@@ -1243,6 +1275,7 @@ class Simulation(BaseSimulation):
         self._int_river_flow += self.rivers.flow * self.timestep
 
         self.T.z.halo_updaters[parallel.Neighbor.ALL].finish()
+        self._coupling_stage("elevation", macro_active)
 
         if self.runtype > RunType.BAROTROPIC_2D and macro_active:
             # Use previous source terms for biogeochemistry (valid for the start of the
@@ -1303,6 +1336,7 @@ class Simulation(BaseSimulation):
                 self.NN,
                 self.momentum.SS,
             )
+            self._coupling_stage("momentum_3d", macro_active)
 
             # Advect and diffuse tracers. Source terms are optionally handled too,
             # as part of the diffusion update.
@@ -1313,6 +1347,7 @@ class Simulation(BaseSimulation):
                 self.momentum.ww,
                 self.vertical_mixing.nuh,
             )
+            self._coupling_stage("tracers", macro_active)
 
             # If we have to delay slow (2D depth-integrated) terms for internal pressure
             # by one macrotimestep, calculate them now, at the end of state update of the
