@@ -362,6 +362,24 @@ def small_hierarchy(halo=2):
     )
 
 
+def active_hierarchy(halo=2):
+    """small_hierarchy with an L-shaped active region for the child (its
+    north-east quarter stays with the root) and a grandchild on the child's
+    south edge (registers passed upwards)."""
+    from pygetm.nesting.geometry import load_levels
+
+    act = np.ones((12, 16), dtype=bool)
+    act[6:, 8:] = False
+    return load_levels(
+        {
+            "root": dict(nx=40, ny=30, lon0=0.0, lat0=50.0, dlon=0.5, dlat=0.5),
+            "child": dict(parent="root", istart=10, istop=26, jstart=8, jstop=20, ratio=3, active=act.tolist()),
+            "gc": dict(parent="child", istart=3, istop=15, jstart=0, jstop=9, ratio=3),
+        },
+        halo=halo,
+    )
+
+
 def tiling_info(nrow, ncol, ny_ext, nx_ext, xoff=0, yoff=0, removed=(), halo=2):
     # pyGETM-like tiling description: equal subdomains, optional protrusion
     # (negative offsets) and removed tiles (map -1, ranks renumbered)
@@ -415,6 +433,57 @@ class TestNestingGeometry(unittest.TestCase):
         self.assertTrue(ext[8:20, 10:26].all())
         self.assertEqual(int(ext.sum()), 12 * 16)
 
+    def test_active_region(self):
+        root, child, gc = active_hierarchy()
+        # hole = the child's active region; the root computes the rest of the window
+        self.assertTrue(root.hole[8:14, 10:26].all())
+        self.assertFalse(root.hole[14:20, 18:26].any())
+        self.assertTrue(root.computed[14:20, 18:26].all())
+        np.testing.assert_array_equal(root.external(), ~np.pad(root.computed, 2, constant_values=False))
+        # ring: non-active cells within the band of the active region, also inside the window
+        b = child.band
+        bj, bi = child.ring_cells()
+        self.assertTrue(((bj >= 0) & (bj < child.ny) & (bi >= 0) & (bi < child.nx)).any())
+        self.assertFalse(child.cactive[np.clip(bj, 0, child.ny - 1), np.clip(bi, 0, child.nx - 1)][
+            (bj >= 0) & (bj < child.ny) & (bi >= 0) & (bi < child.nx)].any())
+        self.assertTrue(child.unused()[b + child.ny - 1, b + child.nx - 1])
+        # interface faces of the child in the root: the perimeter of the L
+        wf = root.wfaces["child"]
+        self.assertEqual(wf["is_x"].size, 2 * 6 + 2 * 16 + 2 * 12 - 2 * 6)
+        self.assertTrue(wf["inside"].all())
+        self.assertEqual(child.edge["is_x"].size, wf["is_x"].size * 3)
+        # the child's edge faces lie between an active and a non-active cell
+        cj, ci = child.edge["inner"]
+        self.assertTrue(child.cactive[cj, ci].all())
+        # grandchild on the child's south edge: those faces are passed upwards
+        g = child.wfaces["gc"]
+        up = g["up"][~g["inside"]]
+        self.assertTrue(up.size > 0 and (up >= 0).all())
+        e = child.edge
+        for m in np.nonzero(~g["inside"])[0]:
+            k = g["up"][m]
+            self.assertEqual((e["face"][0][k], e["face"][1][k]), (g["face"][0][m], g["face"][1][m]))
+            self.assertEqual((e["inner"][0][k], e["inner"][1][k]), (g["hole"][0][m], g["hole"][1][m]))
+        # full window: unchanged behaviour
+        levels = small_hierarchy()
+        bj, bi = levels[1].ring_cells()
+        self.assertEqual(bj.size, levels[1].extended_shape[0] * levels[1].extended_shape[1] - levels[1].nx * levels[1].ny)
+
+    def test_active_region_from_seed(self):
+        from pygetm.nesting.geometry import Level, active_region
+
+        root = Level("root", dict(nx=20, ny=10, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0))
+        child = Level("child", dict(istart=2, istop=18, jstart=1, jstop=9, ratio=2), root)
+        wet = np.ones((child.ny, child.nx), dtype=bool)
+        wet[:, 15] = False  # land wall at lon 9.5..10 (child column 15)
+        act = active_region(child, dict(seed=[3.0, 4.0], barriers=[{"lat_gt": 7.0, "lon_lt": 6.0}]), wet)
+        self.assertEqual(act.shape, (8, 16))
+        self.assertFalse(act[:, 8:].any())  # behind the land wall
+        self.assertFalse(act[6:, :4].any())  # behind the barrier
+        self.assertTrue(act[:6, :7].all())
+        with self.assertRaises(ValueError):
+            active_region(child, dict(seed=[15.0, 4.0], barriers=[]), wet & False)
+
 
 class TestNestingOperators(unittest.TestCase):
     def test_prolong_restrict(self):
@@ -454,6 +523,19 @@ class TestNestingMasks(unittest.TestCase):
         self.assertTrue(all(v == 0 for d in changes.values() for v in d.values()))
         for l in levels:
             np.testing.assert_array_equal(wet3[l.name], wet2[l.name])
+
+    def test_child_led_consistency_active(self):
+        from pygetm.nesting.masks import make_consistent, check_consistent
+
+        levels = active_hierarchy()
+        rng = np.random.default_rng(2)
+        wet = {l.name: rng.random(l.extended_shape) > 0.3 for l in levels}
+        H = {l.name: 5.0 + 10.0 * rng.random(l.extended_shape) for l in levels}
+        wet2, H2, changes = make_consistent(levels, wet, H)
+        self.assertGreater(changes["child"]["unused_dried"], 0)
+        self.assertTrue(all(v == 0 for d in check_consistent(levels, wet2).values() for v in d.values()))
+        # root cells of the window outside the active region are left alone
+        np.testing.assert_array_equal(wet2["root"][2 + 14 : 2 + 20, 2 + 18 : 2 + 26], wet["root"][2 + 14 : 2 + 20, 2 + 18 : 2 + 26])
 
 
 class TestNestingPlan(unittest.TestCase):
@@ -503,6 +585,15 @@ class TestNestingPlan(unittest.TestCase):
             "root": (2, 3, dict(xoff=-4)),
             "child": (3, 2, dict(yoff=-5, removed=[(0, 1)])),
             "gc": (2, 4, dict(xoff=-7, removed=[(1, 3), (0, 0)])),
+        })
+
+    def test_plans_active(self):
+        levels = active_hierarchy()
+        self._check(levels, {"root": (1, 1, {}), "child": (1, 1, {}), "gc": (1, 1, {})})
+        self._check(levels, {
+            "root": (2, 3, dict(xoff=-4)),
+            "child": (3, 2, dict(yoff=-5, removed=[(2, 1)])),
+            "gc": (2, 2, dict(xoff=-3)),
         })
 
 

@@ -48,7 +48,7 @@ package writes there are kept.
 from .hierarchy import NestingContext, split_world
 from .halo import CellSet, outer_halo, hole_rim
 from .variables import ExchangeGroup, EXCHANGE_GROUPS
-from .geometry import Level, load_levels
+from .geometry import Level, active_region, load_levels
 from .plan import LevelTiling, Plan
 
 __all__ = [

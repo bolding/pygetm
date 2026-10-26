@@ -14,9 +14,10 @@ shares the tilings of all levels and builds the exchange plans
 * the parent's rim from the child (volume-weighted mean over wet child cells),
   once per parent step;
 * flux matching: every level keeps a register of the transports through its
-  outer edge faces over its sub-steps; after the child's sub-steps the parent
-  corrects its cells next to the window by (parent - child) transport, and
-  registers of children on the parent's edge are passed upwards.
+  edge faces (its interface with the parent) over its sub-steps; after the
+  child's sub-steps the parent corrects its cells next to the hole by
+  (parent - child) transport, and registers of children on the parent's own
+  interface are passed upwards.
 
 The transports are the tracer amounts the advection actually moved through
 every face (``Advection(..., flux_u=, flux_v=)``). The time loop belongs to
@@ -29,7 +30,7 @@ from typing import Callable, Dict, List, Mapping, Optional
 import numpy as np
 from mpi4py import MPI
 
-from .geometry import SIDES, Level
+from .geometry import Level
 from .hierarchy import split_world
 from .plan import LevelTiling, Plan, gather_tilings
 from . import operators as ops
@@ -144,10 +145,10 @@ class NestedTracer:
         self.halo = h
         # tracer amount through every face during a step (from the advection)
         self.flux = {"x": T.ugrid.array(fill=0.0), "y": T.vgrid.array(fill=0.0)}
-        # this level's flux register (outer edge faces), kept by the owner of
-        # the inner edge cell
-        self.reg = {sd: np.zeros(len(lev.edge[sd]["inner"][0])) for sd in SIDES}
-        self.own_edge = {sd: self.owned(*lev.edge[sd]["inner"]) for sd in SIDES}
+        # this level's flux register (edge faces), kept by the owner of the
+        # inner edge cell
+        self.reg = np.zeros(lev.edge["is_x"].size)
+        self.own_edge = self.owned(*lev.edge["inner"])
         self.outflow = 0.0  # root: tracer amount that left through the boundary
         if self.up is not None:
             ring = [(p, v) for (p, tt), v in self.up.pro.items() if tt == self.t]
@@ -166,8 +167,12 @@ class NestedTracer:
     def owned(self, j, i):
         return self.til.owner(j, i) == self.t
 
-    def _face_values(self, axis, j, i):
-        return self.flux[axis].all_values[self.loc(j, i)]
+    def _face_values(self, is_x, j, i):
+        jj, ii = self.loc(j, i)
+        out = np.empty(np.shape(is_x))
+        out[is_x] = self.flux["x"].all_values[jj[is_x], ii[is_x]]
+        out[~is_x] = self.flux["y"].all_values[jj[~is_x], ii[~is_x]]
+        return out
 
     # --- ring (child side) -------------------------------------------------
 
@@ -225,30 +230,29 @@ class NestedTracer:
 
     def _window_fluxes(self, plan):
         wf = self.lev.wfaces[plan.child.name]
-        return np.array([self._face_values(wf[sd]["axis"], wf[sd]["face"][0][m], wf[sd]["face"][1][m])
-                         for sd, m in plan.faces_of[self.t]])
+        m = plan.faces_of[self.t]
+        return self._face_values(wf["is_x"][m], wf["face"][0][m], wf["face"][1][m])
 
     def _match_fluxes(self, plan, fp):
         faces = plan.faces_of[self.t]
-        if not faces:
+        if not faces.size:
             return
         r = plan.child.ratio
-        sub = np.zeros((len(faces), r))  # faces in removed tiles carry no flux
-        for (tt, p), (fpos, fa, _, _) in sorted(plan.flx.items()):
+        sub = np.zeros((faces.size, r))  # faces in removed tiles carry no flux
+        for (tt, p), (fpos, fa, _) in sorted(plan.flx.items()):
             if p == self.t:
                 buf = np.empty(fpos.size)
                 self.world.Recv(buf, source=plan.ctil.offset + tt, tag=plan.tag_f)
                 sub[fpos, fa] = buf
         fc = ops.face_sum(sub)
         wf = self.lev.wfaces[plan.child.name]
-        for n, (sd, m) in enumerate(faces):
-            w = wf[sd]
-            if w["inside"]:
+        for n, m in enumerate(faces):
+            if wf["inside"][m]:
                 if not self.break_flux:
-                    oj, oi = self.loc(w["out"][0][m], w["out"][1][m])
-                    self.f.all_values[oj, oi] += w["sign"] * (fp[n] - fc[n]) / self.content[oj, oi]
-            elif self.lev.parent is not None:
-                self.reg[sd][w["edge_index"][m]] += fc[n]
+                    oj, oi = self.loc(wf["out"][0][m], wf["out"][1][m])
+                    self.f.all_values[oj, oi] += wf["sign"][m] * (fp[n] - fc[n]) / self.content[oj, oi]
+            elif wf["up"][m] >= 0:
+                self.reg[wf["up"][m]] += fc[n]
 
     def _couple_down(self, fps):
         for plan in self.down:
@@ -271,30 +275,26 @@ class NestedTracer:
                 buf = np.ascontiguousarray(np.stack([np.where(weight > 0, f[jj, ii], 0.0), weight]))
                 reqs.append(self.world.Isend(buf, dest=self.up.ptil.offset + p, tag=self.up.tag_r))
         if fluxes:
-            for (tt, p), (_, _, fside, fk) in self.up.flx.items():
+            for (tt, p), (_, _, fk) in self.up.flx.items():
                 if tt == self.t:
-                    vals = np.array([self.reg[sd][kk] for sd, kk in zip(fside, fk)])
+                    vals = np.ascontiguousarray(self.reg[fk])
                     reqs.append(self.world.Isend(vals, dest=self.up.ptil.offset + p, tag=self.up.tag_f))
-            for sd in SIDES:
-                self.reg[sd][:] = 0.0
+            self.reg = np.zeros_like(self.reg)
         MPI.Request.Waitall(reqs)
 
     def _own_edge_fluxes(self):
-        for sd in SIDES:
-            e = self.lev.edge[sd]
-            keep = self.own_edge[sd] & self.lev.computed[e["inner"]]
-            if keep.any():
-                self.reg[sd][keep] += self._face_values(e["axis"], e["face"][0][keep], e["face"][1][keep])
+        e = self.lev.edge
+        keep = self.own_edge & self.lev.computed[e["inner"]]
+        if keep.any():
+            self.reg[keep] += self._face_values(e["is_x"][keep], e["face"][0][keep], e["face"][1][keep])
 
     def _root_outflow(self):
-        total = 0.0
-        for sd in SIDES:
-            e = self.lev.edge[sd]
-            keep = self.owned(*e["inner"])
-            if keep.any():
-                amount = self._face_values(e["axis"], e["face"][0][keep], e["face"][1][keep]).sum()
-                total += amount if sd in "EN" else -amount
-        return total
+        e = self.lev.edge
+        keep = self.own_edge
+        if not keep.any():
+            return 0.0
+        amount = self._face_values(e["is_x"][keep], e["face"][0][keep], e["face"][1][keep])
+        return float((e["sign"][keep] * amount).sum())
 
     # --- public ---------------------------------------------------------------
 

@@ -38,7 +38,7 @@ import numpy as np
 from mpi4py import MPI
 
 from ..simulation import Coupler
-from .geometry import SIDES, Level
+from .geometry import Level
 from .plan import LevelTiling
 from .runtime import NestingRun, ops_interp
 from . import operators as ops
@@ -114,19 +114,26 @@ class PointTransfer:
         return out
 
 
-def _band_mask(lev: Level, j, i):
-    return (j < 0) | (j >= lev.ny) | (i < 0) | (i >= lev.nx)
+def _outside_masks(lev: Level):
+    """Lookups (global j, i; band included) of the non-active cells and of
+    the ring cells of a child."""
+    b = lev.band
+    act = np.zeros(lev.extended_shape, dtype=bool)
+    act[b : b + lev.ny, b : b + lev.nx] = lev.cactive
+    ring = lev._ring_mask()
+    return (lambda j, i: ~act[j + b, i + b]), (lambda j, i: ring[j + b, i + b])
 
 
 def ring_faces(child: Level, axis: str):
-    """Child U (axis x) or V (axis y) points with ring cells on both sides,
-    their parent source faces (2 per point) and weights: linear across,
-    constant along the parent faces."""
+    """Child U (axis x) or V (axis y) points with non-active cells on both
+    sides, at least one of them a ring cell, their parent source faces (2 per
+    point) and weights: linear across, constant along the parent faces."""
     b, r = child.band, child.ratio
     i0, _, j0, _ = child.window
+    outside, ring = _outside_masks(child)
     if axis == "x":
         j, i = np.meshgrid(np.arange(-b, child.ny + b), np.arange(-b, child.nx + b - 1), indexing="ij")
-        keep = _band_mask(child, j, i) & _band_mask(child, j, i + 1)
+        keep = outside(j, i) & outside(j, i + 1) & (ring(j, i) | ring(j, i + 1))
         j, i = j[keep], i[keep]
         fl, rem = np.floor_divide(i + 1, r), np.mod(i + 1, r)
         fw = i0 + fl - 1
@@ -135,7 +142,7 @@ def ring_faces(child: Level, axis: str):
         src_i = np.stack([fw, fw + 1], axis=1)
     else:
         j, i = np.meshgrid(np.arange(-b, child.ny + b - 1), np.arange(-b, child.nx + b), indexing="ij")
-        keep = _band_mask(child, j, i) & _band_mask(child, j + 1, i)
+        keep = outside(j, i) & outside(j + 1, i) & (ring(j, i) | ring(j + 1, i))
         j, i = j[keep], i[keep]
         fl, rem = np.floor_divide(j + 1, r), np.mod(j + 1, r)
         fs = j0 + fl - 1
@@ -154,16 +161,17 @@ def rim_faces(child: Level, axis: str):
     i0, i1, j0, j1 = child.window
     rim = np.zeros((par.ny, par.nx), dtype=bool)
     rim[par.rims[child.name][:, 0], par.rims[child.name][:, 1]] = True
+    hole = par.hole_of(child)
     a = np.arange(r)
     if axis == "x":
         pj, pf = np.meshgrid(np.arange(j0, j1), np.arange(i0, i1 - 1), indexing="ij")
-        keep = rim[pj, pf] | rim[pj, pf + 1]
+        keep = hole[pj, pf] & hole[pj, pf + 1] & (rim[pj, pf] | rim[pj, pf + 1])
         pj, pf = pj[keep], pf[keep]
         src_j = (pj - j0)[:, None] * r + a[None, :]
         src_i = np.repeat(((pf - i0 + 1) * r - 1)[:, None], r, axis=1)
     else:
         pf, pi = np.meshgrid(np.arange(j0, j1 - 1), np.arange(i0, i1), indexing="ij")
-        keep = rim[pf, pi] | rim[pf + 1, pi]
+        keep = hole[pf, pi] & hole[pf + 1, pi] & (rim[pf, pi] | rim[pf + 1, pi])
         pf, pi = pf[keep], pi[keep]
         src_j = np.repeat(((pf - j0 + 1) * r - 1)[:, None], r, axis=1)
         src_i = (pi - i0)[:, None] * r + a[None, :]
@@ -209,8 +217,8 @@ class NestedBarotropic(Coupler):
         if lev.parent is not None:
             self.up_faces = face_transfers(lev, nest.tilings[lev.parent.name], self.til, links[lev.name])
         self.down_faces = [face_transfers(c, self.til, nest.tilings[c.name], links[c.name]) for c in lev.children]
-        self.reg = {sd: np.zeros(len(lev.edge[sd]["inner"][0])) for sd in SIDES}
-        self.own_edge = {sd: self.til.owner(*lev.edge[sd]["inner"]) == self.t for sd in SIDES}
+        self.reg = np.zeros(lev.edge["is_x"].size)
+        self.own_edge = self.til.owner(*lev.edge["inner"]) == self.t
         if self.up is not None:
             ring = [(p, v) for (p, tt), v in self.up.pro.items() if tt == self.t]
             cat = lambda k: np.concatenate([v[k] for _, v in ring]) if ring else np.zeros(0, int)
@@ -233,11 +241,13 @@ class NestedBarotropic(Coupler):
     def _dt(self):
         return self.sim.timestep
 
-    def _face_volume(self, axis, j, i):
+    def _face_volume(self, is_x, j, i):
         jj, ii = self.loc(j, i)
-        if axis == "x":
-            return self.U.all_values[jj, ii] * self.dyu[jj, ii] * self._dt()
-        return self.V.all_values[jj, ii] * self.dxv[jj, ii] * self._dt()
+        out = np.empty(np.shape(is_x))
+        x, y = is_x, ~is_x
+        out[x] = self.U.all_values[jj[x], ii[x]] * self.dyu[jj[x], ii[x]] * self._dt()
+        out[y] = self.V.all_values[jj[y], ii[y]] * self.dxv[jj[y], ii[y]] * self._dt()
+        return out
 
     # --- child side -------------------------------------------------------------
 
@@ -278,20 +288,18 @@ class NestedBarotropic(Coupler):
         reqs += self.up_faces["rim_x"].send(self.world, self.t, self.U.all_values, self.loc)
         reqs += self.up_faces["rim_y"].send(self.world, self.t, self.V.all_values, self.loc)
         if fluxes:
-            for (tt, p), (_, _, fside, fk) in self.up.flx.items():
+            for (tt, p), (_, _, fk) in self.up.flx.items():
                 if tt == self.t:
-                    vals = np.array([self.reg[sd][kk] for sd, kk in zip(fside, fk)])
+                    vals = np.ascontiguousarray(self.reg[fk])
                     reqs.append(self.world.Isend(vals, dest=self.up.ptil.offset + p, tag=self.up.tag_f))
-            for sd in SIDES:
-                self.reg[sd][:] = 0.0
+            self.reg = np.zeros_like(self.reg)
         MPI.Request.Waitall(reqs)
 
     def _own_edge_fluxes(self):
-        for sd in SIDES:
-            e = self.lev.edge[sd]
-            keep = self.own_edge[sd] & self.lev.computed[e["inner"]]
-            if keep.any():
-                self.reg[sd][keep] += self._face_volume(e["axis"], e["face"][0][keep], e["face"][1][keep])
+        e = self.lev.edge
+        keep = self.own_edge & self.lev.computed[e["inner"]]
+        if keep.any():
+            self.reg[keep] += self._face_volume(e["is_x"][keep], e["face"][0][keep], e["face"][1][keep])
 
     # --- parent side ------------------------------------------------------------
 
@@ -310,8 +318,8 @@ class NestedBarotropic(Coupler):
 
     def _window_volumes(self, plan):
         wf = self.lev.wfaces[plan.child.name]
-        return np.array([self._face_volume(wf[sd]["axis"], wf[sd]["face"][0][m], wf[sd]["face"][1][m])
-                         for sd, m in plan.faces_of[self.t]])
+        m = plan.faces_of[self.t]
+        return self._face_volume(wf["is_x"][m], wf["face"][0][m], wf["face"][1][m])
 
     def _recv_child(self, plan, faces, fp):
         # rim z (area-weighted mean over wet child cells)
@@ -343,36 +351,36 @@ class NestedBarotropic(Coupler):
         if fp is None:
             return
         flist = plan.faces_of[self.t]
-        if not flist:
+        if not flist.size:
             return
         r = plan.child.ratio
-        sub = np.zeros((len(flist), r))
-        for (tt, p), (fpos, fa, _, _) in sorted(plan.flx.items()):
+        sub = np.zeros((flist.size, r))
+        for (tt, p), (fpos, fa, _) in sorted(plan.flx.items()):
             if p == self.t:
                 buf = np.empty(fpos.size)
                 self.world.Recv(buf, source=plan.ctil.offset + tt, tag=plan.tag_f)
                 sub[fpos, fa] = buf
         fc = ops.face_sum(sub)
         wf = self.lev.wfaces[plan.child.name]
-        for n, (sd, m) in enumerate(flist):
-            w = wf[sd]
-            if w["inside"]:
-                oj, oi = self.loc(w["out"][0][m], w["out"][1][m])
-                dz = w["sign"] * (fp[n] - fc[n]) / self.area[oj, oi]
+        for n, m in enumerate(flist):
+            if wf["inside"][m]:
+                oj, oi = self.loc(wf["out"][0][m], wf["out"][1][m])
+                dz = wf["sign"][m] * (fp[n] - fc[n]) / self.area[oj, oi]
                 if not self.break_flux:
                     self.z.all_values[oj, oi] += dz
                     if self.replace_transport:
                         # the parent continues from the child's mean transport
-                        fj, fi = self.loc(w["face"][0][m], w["face"][1][m])
-                        if w["axis"] == "x":
+                        fj, fi = self.loc(wf["face"][0][m], wf["face"][1][m])
+                        if wf["is_x"][m]:
                             self.U.all_values[fj, fi] = fc[n] / (self.dyu[fj, fi] * self._dt())
                         else:
                             self.V.all_values[fj, fi] = fc[n] / (self.dxv[fj, fi] * self._dt())
                 if abs(dz) > self.max_correction:  # diagnostic
                     self.max_correction = abs(dz)
-                    self.max_correction_info = (self._k, sd, int(m), float(fp[n]), float(fc[n]), float(dz))
-            elif self.lev.parent is not None:
-                self.reg[sd][w["edge_index"][m]] += fc[n]
+                    face = (wf["face"][0][m], wf["face"][1][m])
+                    self.max_correction_info = (self._k, "U" if wf["is_x"][m] else "V", face, float(fp[n]), float(fc[n]), float(dz))
+            elif wf["up"][m] >= 0:
+                self.reg[wf["up"][m]] += fc[n]
 
     def _send_corrected_z(self, plan):
         """After the volume correction: the corrected z (with slopes) at the

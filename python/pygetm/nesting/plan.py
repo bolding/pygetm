@@ -16,9 +16,10 @@ so no handshake is needed:
 * R (restriction): child tile -> parent tile, value and weight of the
   child cells of each rim cell's ratio x ratio block (rim-major, a, b);
 * F (flux register): child tile -> parent tile, the child's transports
-  through the faces of the window. The parent tile handling a face is the
-  owner of the cell outside the window (flux matching), or, where the window
-  lies on the parent's edge, of the parent's edge cell (passed upwards).
+  through the interface faces (r sub-faces each). The parent tile handling
+  a face is the owner of the cell outside the hole (flux matching), or,
+  where that cell is not computed by the parent (the parent's own interface),
+  of the hole cell (passed upwards).
 
 This is the nesting exchange; it shares no code with pyGETM's halo exchange.
 """
@@ -27,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .geometry import SIDES, Level
+from .geometry import Level
 
 
 class LevelTiling:
@@ -129,32 +130,28 @@ class Plan:
                 if sel.any():
                     self.res[(t, p)] = (k[sel], aa[sel], bb[sel], cj[sel], ci[sel])
 
-        # F: window faces per parent tile, and the child edge faces feeding them
+        # F: interface faces per parent tile, and the child edge faces
+        # (r per interface face, k = n * r + a) feeding them
         wf = par.wfaces[child.name]
-        face_owner = {}
-        for side in SIDES:
-            f = wf[side]
-            if f["inside"]:
-                cell = f["out"]
-            else:
-                oj, oi = f["out"]
-                cell = {"W": (oj, oi + 1), "E": f["face"], "S": (oj + 1, oi), "N": f["face"]}[side]
-            face_owner[side] = ptil.owner(*cell)
-        self.faces_of: Dict[int, list] = {}
+        hj, hi = wf["hole"]
+        oj, oi = wf["out"]
+        face_owner = np.where(wf["inside"], ptil.owner(oj, oi), ptil.owner(hj, hi))
+        #: interface face indices n handled by each parent tile
+        self.faces_of: Dict[int, np.ndarray] = {}
         self.flx: Dict[Tuple[int, int], tuple] = {}
         for p in range(ptil.ntiles):
-            self.faces_of[p] = [(side, m) for side in SIDES for m in np.nonzero(face_owner[side] == p)[0]]
-            entries = [(n, a_, side, m * r + a_) for n, (side, m) in enumerate(self.faces_of[p]) for a_ in range(r)]
-            if not entries:
+            mine = np.nonzero(face_owner == p)[0]
+            self.faces_of[p] = mine
+            if not mine.size:
                 continue
-            fpos, fa, fside, fk = map(np.array, zip(*entries))
-            cj = np.array([child.edge[sd]["inner"][0][kk] for sd, kk in zip(fside, fk)])
-            ci = np.array([child.edge[sd]["inner"][1][kk] for sd, kk in zip(fside, fk)])
-            own = ctil.owner(cj, ci)
+            fpos = np.repeat(np.arange(mine.size), r)
+            fa = np.tile(np.arange(r), mine.size)
+            fk = mine[fpos] * r + fa
+            own = ctil.owner(child.edge["inner"][0][fk], child.edge["inner"][1][fk])
             for t in range(ctil.ntiles):
                 sel = own == t
                 if sel.any():
-                    self.flx[(t, p)] = (fpos[sel], fa[sel], fside[sel], fk[sel])
+                    self.flx[(t, p)] = (fpos[sel], fa[sel], fk[sel])
 
     def describe(self, me: int, role: str, tile: int) -> List[str]:
         """Messages of this rank, in the format of check_print_plan.py
@@ -193,7 +190,7 @@ class Plan:
         for (t, p), v in self.flx.items():
             for n, a in zip(v[0].tolist(), v[1].tolist()):
                 faces[(p, n, a)] = faces.get((p, n, a), 0) + 1
-        nfaces = sum(len(f) for f in self.faces_of.values()) * self.child.ratio
+        nfaces = sum(f.size for f in self.faces_of.values()) * self.child.ratio
         return {
             "ring_duplicates": sum(c - 1 for c in ring.values()),
             "block_duplicates": sum(c - 1 for c in block.values()),
