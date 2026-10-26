@@ -816,7 +816,8 @@ class Domain:
         """Cell centers (T points, shape ``(ny, nx)``) whose values are set from
         outside the model, e.g., by nesting. Where these are water, their cell
         type becomes :attr:`CellType.EXTERNAL`: wet and with open faces, but not
-        updated by the model. None (default) if there are no such points.
+        updated by the model. U, V and X points with external T points on all
+        sides become external too. None (default) if there are no such points.
 
         This attribute is None on non-root MPI nodes.
         """
@@ -1319,8 +1320,21 @@ class Domain:
         self.open_boundaries.adjust_mask(mask)
 
         if self._external is not None:
-            # after U, V, X masks have been derived: faces of external points
-            # stay open
+            # After U, V, X masks have been derived from the T mask: faces
+            # between an external and an active point stay open (ACTIVE). Faces
+            # and corners with external points on all sides are external too,
+            # so the model does not overwrite values set there from outside
+            # (e.g. transports in a nested child's ring). Kernels update only
+            # ACTIVE points; advection stencils treat EXTERNAL faces as open.
+            ext_ex = expand_2d(
+                self._external.astype(int), edges_x=edges_x, edges_y=edges_y, missing_value=0
+            ).astype(bool)
+            uext = ext_ex[1:-1, 1:] & ext_ex[1:-1, :-1]
+            vext = ext_ex[1:, 1:-1] & ext_ex[:-1, 1:-1]
+            xext = ext_ex[1:, 1:] & ext_ex[:-1, 1:] & ext_ex[1:, :-1] & ext_ex[:-1, :-1]
+            umask[uext & (umask == CellType.ACTIVE)] = CellType.EXTERNAL
+            vmask[vext & (vmask == CellType.ACTIVE)] = CellType.EXTERNAL
+            xmask[xext & (xmask == CellType.ACTIVE)] = CellType.EXTERNAL
             tmask[self._external & (tmask == CellType.ACTIVE)] = CellType.EXTERNAL
 
         return mask

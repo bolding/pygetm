@@ -30,11 +30,19 @@ class Level:
     the faces at its interfaces. Call :meth:`finish` once all children have
     been added (:func:`load_levels` does this)."""
 
-    def __init__(self, name: str, cfg: Mapping[str, Any], parent: Optional["Level"] = None, halo: int = 2):
+    def __init__(self, name: str, cfg: Mapping[str, Any], parent: Optional["Level"] = None,
+                 halo: int = 2, band: Optional[int] = None):
         self.name = name
         self.parent = parent
         self.children: List["Level"] = []
+        #: width of stencils (rims are this wide around computed cells)
         self.halo = halo
+        #: width of the ring band around the window (part of the level's
+        #: pyGETM domain). Children need band = halo; the root may have 0 (its
+        #: edges then are ordinary pyGETM open boundaries)
+        self.band = halo if band is None else band
+        if parent is not None and self.band != halo:
+            raise ValueError(f"{name}: a child needs a band of {halo} cells")
         if parent is None:
             self.ratio, self.window = 1, None
             self.nx, self.ny = int(cfg["nx"]), int(cfg["ny"])
@@ -58,11 +66,11 @@ class Level:
     @property
     def extended_shape(self):
         """Shape of the level including its ring band."""
-        return (self.ny + 2 * self.halo, self.nx + 2 * self.halo)
+        return (self.ny + 2 * self.band, self.nx + 2 * self.band)
 
     def edges(self):
         """Cell edges (degrees) in x and y, including the band."""
-        h = self.halo
+        h = self.band
         lon = self.lon0 + np.arange(-h, self.nx + h + 1) * self.dlon
         lat = self.lat0 + np.arange(-h, self.ny + h + 1) * self.dlat
         return lon, lat
@@ -139,16 +147,16 @@ class Level:
         """Cells (including the band) set from outside: the band (filled from
         the parent, or a zero-inflow open boundary for the root) and the hole
         (filled from the children). For :attr:`pygetm.domain.Domain.external`."""
-        h = self.halo
+        h = self.band
         ext = np.ones(self.extended_shape, dtype=bool)
-        ext[h:-h, h:-h] = ~self.computed
+        ext[h : h + self.ny, h : h + self.nx] = ~self.computed
         return ext
 
     def ring_cells(self):
         """Global (j, i) of all band cells, row-major."""
-        h = self.halo
+        h = self.band
         band = np.ones(self.extended_shape, dtype=bool)
-        band[h:-h, h:-h] = False
+        band[h : h + self.ny, h : h + self.nx] = False
         j, i = np.nonzero(band)
         return j - h, i - h
 
@@ -177,9 +185,11 @@ def dilate(mask: np.ndarray, width: int) -> np.ndarray:
     return out
 
 
-def load_levels(config, halo: int = 2) -> List[Level]:
+def load_levels(config, halo: int = 2, root_band: Optional[int] = None) -> List[Level]:
     """Levels from a nesting YAML file (path) or mapping, parents before
-    children; keys other than levels (e.g. ``config``) are ignored."""
+    children; keys other than levels (e.g. ``config``) are ignored.
+    ``root_band``: width of the root's band (default ``halo``; 0 when the
+    root's edges are pyGETM open boundaries, e.g. tides)."""
     if not isinstance(config, Mapping):
         import yaml
 
@@ -195,7 +205,8 @@ def load_levels(config, halo: int = 2) -> List[Level]:
                 continue
             parent = spec.get("parent")
             if parent is None or parent in done:
-                lev = Level(name, spec, done.get(parent), halo=halo)
+                lev = Level(name, spec, done.get(parent), halo=halo,
+                            band=root_band if parent is None else None)
                 lev.index = len(levels)
                 levels.append(lev)
                 done[name] = lev

@@ -326,9 +326,13 @@ class TestExternalCells(unittest.TestCase):
         # depth valid (not fill) in external cells
         self.assertTrue(np.allclose(T.H.all_values[ext], 10.0))
         self.assertTrue(np.allclose(T.D.all_values[ext], 10.0))
-        # faces between external and active cells are open
+        # faces between external and active cells are open and computed
         uopen = T.ugrid.mask.all_values[inside & (ig == 1)]
-        self.assertTrue((uopen != 0).all())
+        self.assertTrue((uopen == CellType.ACTIVE).all())
+        # faces with external cells on both sides are external
+        uext = T.ugrid.mask.all_values[inside & (ig == 0)]
+        self.assertTrue((uext == CellType.EXTERNAL).all())
+        self.assertTrue(np.allclose(T.ugrid.D.all_values[inside & (ig == 0)], 10.0))
         # advection: external cells keep their values, active ones change
         f = T.array(fill=0.0)
         f.all_values[ext] = 1.0
@@ -393,6 +397,23 @@ class TestNestingGeometry(unittest.TestCase):
         self.assertGreaterEqual(child.rims["gc"][:, 0].max(), 2 * 3 - 1)
         bj, bi = child.ring_cells()
         self.assertEqual(bj.size, child.extended_shape[0] * child.extended_shape[1] - child.nx * child.ny)
+
+    def test_root_without_band(self):
+        from pygetm.nesting.geometry import load_levels
+
+        levels = load_levels(
+            {
+                "root": dict(nx=40, ny=30, lon0=0.0, lat0=50.0, dlon=0.5, dlat=0.5),
+                "child": dict(parent="root", istart=10, istop=26, jstart=8, jstop=20, ratio=3),
+            },
+            root_band=0,
+        )
+        root, child = levels
+        self.assertEqual(root.extended_shape, (30, 40))
+        self.assertEqual(child.band, 2)
+        ext = root.external()
+        self.assertTrue(ext[8:20, 10:26].all())
+        self.assertEqual(int(ext.sum()), 12 * 16)
 
 
 class TestNestingOperators(unittest.TestCase):

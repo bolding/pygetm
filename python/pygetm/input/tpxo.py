@@ -1,5 +1,5 @@
 import os.path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -21,7 +21,11 @@ def get(
     verbose: bool = False,
     root: str = ROOT,
     scale_factor: float = 1.0,
+    components: Sequence[str] = COMPONENTS,
 ) -> xr.DataArray:
+    """Tidal elevation (h) or transport (u, v) from TPXO at the given
+    positions, as a time-varying array; ``components`` selects the
+    constituents (default: all)."""
     assert variable in ("h", "u", "v", "hz", "hu", "hv")
 
     lon = np.asarray(lon)
@@ -61,7 +65,7 @@ def get(
     axis = {"h": "z"}.get(variable, variable)
     file_prefix = {"v": "u"}.get(variable, variable)
     components: Mapping[str, tuple[np.ndarray, np.ndarray]] = {}
-    for component in COMPONENTS:
+    for component in components:
         if verbose:
             print(f"TPXO: reading {component} constituent of {variable}...")
         name = f"{file_prefix}_{component}_tpxo{version}_atlas_30{postfix}.nc"

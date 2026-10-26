@@ -32,14 +32,14 @@ def make_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict
     for lev in reversed(levels):
         if lev.parent is None:
             continue
-        h, p, r = lev.halo, lev.parent, lev.ratio
+        h, p, r = lev.band, lev.parent, lev.ratio
         i0, i1, j0, j1 = lev.window
         cw = wet[lev.name][h:-h, h:-h].reshape(j1 - j0, r, i1 - i0, r)
         cH = H[lev.name][h:-h, h:-h].reshape(j1 - j0, r, i1 - i0, r)
         anywet = cw.any(axis=(1, 3))
         n = cw.sum(axis=(1, 3))
         Hmean = np.where(cw, cH, 0.0).sum(axis=(1, 3)) / np.where(n > 0, n, 1)
-        hp = p.halo
+        hp = p.band
         sl = (slice(j0 + hp, j1 + hp), slice(i0 + hp, i1 + hp))
         before = wet[p.name][sl].copy()
         changes[p.name]["hole_wetted"] += int((anywet & ~before).sum())
@@ -50,10 +50,10 @@ def make_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict
     for lev in levels:
         if lev.parent is None:
             continue
-        h, p = lev.halo, lev.parent
+        h, p = lev.band, lev.parent
         bj, bi = lev.ring_cells()
         pj, pi, _, _ = lev.ring_source(bj, bi)
-        src_wet = wet[p.name][pj + p.halo, pi + p.halo]
+        src_wet = wet[p.name][pj + p.band, pi + p.band]
         dry = wet[lev.name][bj + h, bi + h] & ~src_wet
         changes[lev.name]["band_dried"] += int(dry.sum())
         wet[lev.name][bj[dry] + h, bi[dry] + h] = False
@@ -67,14 +67,14 @@ def check_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray]):
     for lev in levels:
         if lev.parent is None:
             continue
-        h, p, r = lev.halo, lev.parent, lev.ratio
+        h, p, r = lev.band, lev.parent, lev.ratio
         i0, i1, j0, j1 = lev.window
         cw = wet[lev.name][h:-h, h:-h].reshape(j1 - j0, r, i1 - i0, r)
-        hole = wet[p.name][j0 + p.halo : j1 + p.halo, i0 + p.halo : i1 + p.halo]
+        hole = wet[p.name][j0 + p.band : j1 + p.band, i0 + p.band : i1 + p.band]
         bj, bi = lev.ring_cells()
         pj, pi, _, _ = lev.ring_source(bj, bi)
         out[lev.name] = {
             "hole_mismatch": int((hole != cw.any(axis=(1, 3))).sum()),
-            "band_wet_over_dry_parent": int((wet[lev.name][bj + h, bi + h] & ~wet[p.name][pj + p.halo, pi + p.halo]).sum()),
+            "band_wet_over_dry_parent": int((wet[lev.name][bj + h, bi + h] & ~wet[p.name][pj + p.band, pi + p.band]).sum()),
         }
     return out

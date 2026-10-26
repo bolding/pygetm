@@ -82,7 +82,7 @@ def gather_tilings(levels: List[Level], world, level: Level, grid, offsets: Dict
     for name, inf in world.allgather((level.name, info)):
         if inf is not None:
             lev = next(l for l in levels if l.name == name)
-            tilings[name] = LevelTiling(inf, lev.halo, offsets[name])
+            tilings[name] = LevelTiling(inf, lev.band, offsets[name])
     return tilings
 
 

@@ -54,7 +54,7 @@ class NestingRun:
     def build(self, make_domain: Callable, nz: int = 1, **grid_kwargs):
         """Build this level's grids. ``make_domain(level, comm)`` returns the
         pyGETM domain of the level including its band (window extended by
-        ``level.halo`` cells on every side). Returns the T grid, or None if
+        ``level.band`` cells on every side). Returns the T grid, or None if
         pyGETM's tiling leaves this process unused."""
         lev = self.level
         domain = make_domain(lev, self.comm)

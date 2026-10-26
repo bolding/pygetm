@@ -69,14 +69,14 @@ SUBROUTINE u2d(imin,imax,jmin,jmax,halo,umask,idxu,dyu,hu,u,tmask,iA,apply_diffu
                fu  = f(i,j)
                fuu = fu
 !               if (i > imin) then
-                  if (umask(i-1,j) == 1 .or. umask(i-1,j) == 2) fuu = f(i-1,j)
+                  if (umask(i-1,j) == 1 .or. umask(i-1,j) == 2 .or. umask(i-1,j) == 5) fuu = f(i-1,j)
 !               end if
                fd = f(i+1,j)
             else
                fu  = f(i+1,j)
                fuu = fu
 !               if (i < imax-1) then
-                  if (umask(i+1,j) == 1 .or. umask(i+1,j) == 2) fuu = f(i+2,j)
+                  if (umask(i+1,j) == 1 .or. umask(i+1,j) == 2 .or. umask(i+1,j) == 5) fuu = f(i+2,j)
 !               end if
                fd = f(i,j)
             end if
@@ -179,14 +179,14 @@ SUBROUTINE v2d(imin,imax,jmin,jmax,halo,vmask,dxv,idyv,hv,v,tmask,iA,apply_diffu
                fu  = f(i,j)
                fuu = fu
 !               if (j > jmin) then
-                  if (vmask(i,j-1) == 1 .or. vmask(i,j-1) == 2) fuu = f(i,j-1)
+                  if (vmask(i,j-1) == 1 .or. vmask(i,j-1) == 2 .or. vmask(i,j-1) == 5) fuu = f(i,j-1)
 !               end if
                fd = f(i,j+1)
             else
                fu  = f(i,j+1)
                fuu = fu
 !               if (j < jmax-1) then
-                  if (vmask(i,j+1) == 1 .or. vmask(i,j+1) == 2) fuu = f(i,j+2)
+                  if (vmask(i,j+1) == 1 .or. vmask(i,j+1) == 2 .or. vmask(i,j+1) == 5) fuu = f(i,j+2)
 !               end if
                fd = f(i,j)
             end if
