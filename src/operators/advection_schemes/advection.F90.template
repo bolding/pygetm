@@ -62,7 +62,7 @@ SUBROUTINE u2d(imin,imax,jmin,jmax,halo,umask,idxu,dyu,hu,u,tmask,iA,apply_diffu
 
    do j=jmin,jmax
       do i=imin-1,imax
-         if (umask(i,j) == 1 .or. umask(i,j) == 2) then
+         if (umask(i,j) == 1 .or. umask(i,j) == 2 .or. umask(i,j) == 5) then
             QU(i,j) = u(i,j) * hu(i,j) * dyu(i,j)
             cfl = abs(u(i,j)*dt*idxu(i,j))
             if (u(i,j) > 0) then
@@ -99,7 +99,7 @@ SUBROUTINE u2d(imin,imax,jmin,jmax,halo,umask,idxu,dyu,hu,u,tmask,iA,apply_diffu
    if (apply_diffusion) then
       do j=jmin,jmax
          do i=imin-1,imax
-            if (umask(i,j) == 1 .or. umask(i,j) == 2) then
+            if (umask(i,j) == 1 .or. umask(i,j) == 2 .or. umask(i,j) == 5) then
                flux(i,j) = flux(i,j) - Ah(i,j)*hu(i,j)*(f(i+1,j)-f(i,j))*idxu(i,j)*dyu(i,j)
             end if
          end do
@@ -172,7 +172,7 @@ SUBROUTINE v2d(imin,imax,jmin,jmax,halo,vmask,dxv,idyv,hv,v,tmask,iA,apply_diffu
 
    do j=jmin-1,jmax
       do i=imin,imax
-         if (vmask(i,j) == 1 .or. vmask(i,j) == 2) then
+         if (vmask(i,j) == 1 .or. vmask(i,j) == 2 .or. vmask(i,j) == 5) then
             QV(i,j) = v(i,j) * hv(i,j) * dxv(i,j)
             cfl = abs(v(i,j)*dt*idyv(i,j))
             if (v(i,j) > 0) then
@@ -209,7 +209,7 @@ SUBROUTINE v2d(imin,imax,jmin,jmax,halo,vmask,dxv,idyv,hv,v,tmask,iA,apply_diffu
    if (apply_diffusion) then
       do j=jmin-1,jmax
          do i=imin,imax
-            if (vmask(i,j) == 1 .or. vmask(i,j) == 2) then
+            if (vmask(i,j) == 1 .or. vmask(i,j) == 2 .or. vmask(i,j) == 5) then
                flux(i,j) = flux(i,j) - Ah(i,j)*hv(i,j)*(f(i,j+1)-f(i,j))*idyv(i,j)*dxv(i,j)
             end if
          end do

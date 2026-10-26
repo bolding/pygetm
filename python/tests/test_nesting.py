@@ -568,6 +568,127 @@ class TestNestingRuntime(unittest.TestCase):
         self.assertLess(abs(total[1] - total[0]) / total[0], 1e-13)
 
 
+def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=True, children=True):
+    """Closed basin, root (+ child), 2D barotropic; returns (volumes per
+    output, gathered z of this level or None, level name, world)."""
+    from pygetm.nesting import load_levels
+    from pygetm.nesting.runtime import NestingRun
+    from pygetm.nesting.barotropic import NestedBarotropic
+
+    cfg = {"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0)}
+    if children:
+        cfg["child"] = dict(parent="root", istart=12, istop=24, jstart=8, jstop=20, ratio=ratio)
+    levels = load_levels(cfg, root_band=0)
+    world = parallel.MPI.COMM_WORLD
+    ranks = {"root": nroot, "child": world.size - nroot} if children else {"root": world.size}
+    nest = NestingRun(levels, ranks)
+
+    def make_domain(lev, comm):
+        lon, lat = lev.edges()
+        xc = 0.5 * (lon[1:] + lon[:-1])
+        H = (20.0 + (10.0 * xc / 40.0 if slope else 0.0))[None, :] * np.ones((lat.size - 1, 1))
+        return pygetm.domain.create_cartesian(
+            lon * 2e3, lat * 2e3, interfaces=True, H=H, f=coriolis, comm=comm,
+            logger=parallel.get_logger(level="ERROR", comm=comm),
+        )
+
+    def make_sim(lev, domain):
+        sim = pygetm.Simulation(
+            domain, runtype=pygetm.RunType.BAROTROPIC_2D, airsea=pygetm.airsea.Fluxes(),
+            logger=parallel.get_logger(level="ERROR", comm=domain.comm),
+        )
+        sim.airsea.taux.set(0.0)
+        sim.airsea.tauy.set(0.0)
+        sim.airsea.sp.set(0.0)
+        return sim
+
+    sim = nest.build_simulation(make_domain, make_sim)
+    cpl = NestedBarotropic(nest, sim)
+    sim.add_coupler(cpl)
+    lev = nest.level
+    gj, gi = nest.global_indices()
+    x = lev.lon0 + (gi + 0.5) * lev.dlon
+    y = lev.lat0 + (gj + 0.5) * lev.dlat
+    sim.T.z.all_values[...] = amplitude * np.exp(-((x[None, :] - 18.0) ** 2 + (y[:, None] - 14.0) ** 2) / 8.0)
+    sim.T.z.all_values[sim.T.mask.all_values == 0] = 0.0
+    import datetime
+
+    sim.start(datetime.datetime(2000, 1, 1), timestep=20.0 / lev.steps_per_root, split_factor=1, report=0)
+    vols = [cpl.level_volume()]
+    for _ in range(nsteps * lev.steps_per_root):
+        sim.advance()
+    vols.append(cpl.level_volume())
+    sim.finish()
+    g = sim.T.z.gather()
+    return nest.world.allreduce(np.array(vols)), (None if g is None else np.array(g)), lev.name, nest.world
+
+
+class TestNestingBarotropic(unittest.TestCase):
+    """2D barotropic nesting (NestedBarotropic). Needs >= 2 processes."""
+
+    def setUp(self):
+        if parallel.MPI.COMM_WORLD.size < 2:
+            self.skipTest("needs at least 2 MPI processes")
+
+    def test_volume_conserved(self):
+        nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
+        vols, _, _, _ = run_barotropic(3, nroot, 60)
+        self.assertLess(abs(vols[1] - vols[0]) / vols[0], 1e-13)
+
+    def test_lake_at_rest(self):
+        nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
+        _, z, _, world = run_barotropic(3, nroot, 30, amplitude=0.0)
+        if z is not None:
+            self.assertEqual(float(np.abs(z[np.isfinite(z)]).max()), 0.0)
+
+    def test_ratio_one_twin(self):
+        world = parallel.MPI.COMM_WORLD
+        nroot = (world.size + 1) // 2
+        _, z_nested, name, nworld = run_barotropic(1, nroot, 100)
+        # single domain on the root's processes only
+        color = 0 if world.rank < nroot else parallel.MPI.UNDEFINED
+        sub = world.Split(color, world.rank)
+        single = None
+        if sub != parallel.MPI.COMM_NULL:
+            from pygetm.nesting import load_levels
+
+            lev = load_levels({"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0)}, root_band=0)[0]
+            lon, lat = lev.edges()
+            xc = 0.5 * (lon[1:] + lon[:-1])
+            H = (20.0 + 10.0 * xc / 40.0)[None, :] * np.ones((lat.size - 1, 1))
+            domain = pygetm.domain.create_cartesian(
+                lon * 2e3, lat * 2e3, interfaces=True, H=H, f=1e-4, comm=sub,
+                logger=parallel.get_logger(level="ERROR", comm=sub),
+            )
+            sim = pygetm.Simulation(domain, runtype=pygetm.RunType.BAROTROPIC_2D,
+                                    airsea=pygetm.airsea.Fluxes(),
+                                    logger=parallel.get_logger(level="ERROR", comm=sub))
+            sim.airsea.taux.set(0.0)
+            sim.airsea.tauy.set(0.0)
+            sim.airsea.sp.set(0.0)
+            gj = np.arange(sim.T.ny_) - sim.T.haloy + sim.T.tiling.yoffset
+            gi = np.arange(sim.T.nx_) - sim.T.halox + sim.T.tiling.xoffset
+            sim.T.z.all_values[...] = 0.5 * np.exp(-(((gi + 0.5)[None, :] - 18.0) ** 2 + ((gj + 0.5)[:, None] - 14.0) ** 2) / 8.0)
+            sim.T.z.all_values[sim.T.mask.all_values == 0] = 0.0
+            import datetime
+
+            sim.start(datetime.datetime(2000, 1, 1), timestep=20.0, split_factor=1, report=0)
+            for _ in range(100):
+                sim.advance()
+            sim.finish()
+            g = sim.T.z.gather()
+            single = None if g is None else np.array(g)
+        # compare on world rank 0 (root's rank 0, holds both root fields)
+        child = nworld.bcast(z_nested if (name == "child" and z_nested is not None) else None,
+                             root=nroot)
+        if world.rank == 0:
+            hole = np.zeros_like(single, dtype=bool)
+            hole[8:20, 12:24] = True
+            scale = np.abs(single).max()
+            self.assertLess(np.abs(z_nested - single)[~hole].max() / scale, 1e-3)
+            self.assertLess(np.abs(child[2:-2, 2:-2] - single[8:20, 12:24]).max() / scale, 1e-3)
+
+
 class TestCoupler(unittest.TestCase):
     def test_hook_order(self):
         sim = barotropic_simulation()

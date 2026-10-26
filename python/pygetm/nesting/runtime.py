@@ -60,7 +60,26 @@ class NestingRun:
         domain = make_domain(lev, self.comm)
         domain.external = lev.external()
         grid_kwargs.setdefault("velocity_grids", 1)
-        self.grid = domain.create_grids(nz, halox=lev.halo, haloy=lev.halo, **grid_kwargs)
+        return self._setup(domain.create_grids(nz, halox=lev.halo, haloy=lev.halo, **grid_kwargs))
+
+    def build_simulation(self, make_domain: Callable, make_simulation: Callable):
+        """Build this level's :class:`pygetm.Simulation`. ``make_domain(level,
+        comm)`` returns the level's domain including its band;
+        ``make_simulation(level, domain)`` the simulation (its halo must equal
+        ``level.halo``). The band and the hole are marked external before the
+        simulation builds its grids. Returns the simulation."""
+        lev = self.level
+        domain = make_domain(lev, self.comm)
+        domain.external = lev.external()
+        sim = make_simulation(lev, domain)
+        if sim.T is not None and sim.T.halox != lev.halo:
+            raise ValueError(f"simulation halo {sim.T.halox} differs from nesting halo {lev.halo}")
+        self._setup(sim.T)
+        return sim
+
+    def _setup(self, grid):
+        lev = self.level
+        self.grid = grid
         self.tilings = gather_tilings(self.levels, self.world, lev, self.grid, self.offsets)
         links = {c.name: k for k, c in enumerate(self.levels[1:])}
         til = self.tilings[lev.name]
