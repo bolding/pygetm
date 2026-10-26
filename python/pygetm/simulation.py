@@ -72,6 +72,47 @@ def log_exceptions(method):
     return wrapper
 
 
+class Coupler:
+    """Base class for objects that exchange information between a simulation and
+    other simulations (e.g., nested domains) at fixed points in the time loop.
+
+    Register couplers with :meth:`BaseSimulation.add_coupler`. All methods are
+    no-ops by default; subclasses override the ones they need.
+    """
+
+    def on_start(self, sim: "BaseSimulation"):
+        """Called from :meth:`BaseSimulation.start`, after the simulation has been
+        initialized but before inputs are updated for the first time."""
+        pass
+
+    def before_state_update(self, sim: "BaseSimulation", macro_active: bool):
+        """Called from :meth:`BaseSimulation.advance` after the time has been
+        incremented to the end of the current microtimestep, but before the model
+        state is updated.
+
+        Args:
+            sim: simulation that is being advanced
+            macro_active: whether the current microtimestep completes a
+                macrotimestep
+        """
+        pass
+
+    def after_state_update(self, sim: "BaseSimulation", macro_active: bool):
+        """Called from :meth:`BaseSimulation.advance` after the model state has been
+        updated, but before inputs and diagnostics are updated.
+
+        Args:
+            sim: simulation that is being advanced
+            macro_active: whether the current microtimestep completes a
+                macrotimestep
+        """
+        pass
+
+    def on_finish(self, sim: "BaseSimulation"):
+        """Called from :meth:`BaseSimulation.finish`, before output is closed."""
+        pass
+
+
 class BaseSimulation:
     __slots__ = (
         "logger",
@@ -91,6 +132,7 @@ class BaseSimulation:
         "_start_time",
         "_profile",
         "_cached_check_finite_info",
+        "_couplers",
     )
 
     def __init__(
@@ -120,6 +162,14 @@ class BaseSimulation:
 
         self.default_time_reference: Optional[cftime.datetime] = None
         self._cached_check_finite_info = None
+        self._couplers: list[Coupler] = []
+
+    def add_coupler(self, coupler: Coupler):
+        """Register an object that will be notified at fixed points in the time loop,
+        for instance, to exchange information with nested domains.
+        This must be called before :meth:`start`.
+        """
+        self._couplers.append(coupler)
 
     def __getitem__(self, key: str) -> core.Array:
         return self.output_manager.fields[key]
@@ -269,6 +319,9 @@ class BaseSimulation:
 
         self._start()
 
+        for coupler in self._couplers:
+            coupler.on_start(self)
+
         # Update all inputs and diagnostics.
         # This includes forcing for the future state update (e.g., tracer source terms)
         self.input_manager.update(self.time, macro=True)
@@ -323,7 +376,13 @@ class BaseSimulation:
         if self.report != 0 and self.istep % self.report == 0:
             self.logger.info(self.time)
 
+        for coupler in self._couplers:
+            coupler.before_state_update(self, macro_active)
+
         self._advance_state(macro_active)
+
+        for coupler in self._couplers:
+            coupler.after_state_update(self, macro_active)
 
         # Update all inputs and (state-dependent) diagnostics.
         # This includes forcing for the future state update (e.g., tracer source terms)
@@ -363,6 +422,8 @@ class BaseSimulation:
                 self._summarize_profiling_result(ps)
         nsecs = timeit.default_timer() - self._start_time
         self.logger.info(f"Time spent in main loop: {nsecs:.3f} s")
+        for coupler in self._couplers:
+            coupler.on_finish(self)
         self.output_manager.close(self.timestep * self.istep, self.time)
 
     def check_finite(self, macro_active: bool = True, dump: bool = True) -> bool:
@@ -422,7 +483,7 @@ class BaseSimulation:
                 assert all_bad_fields
                 dump_fields = set(all_bad_fields)
                 dump_fields = [f for f in self._fields.values() if f.ndim]
-                dump_file = f"{parallel.LOGFILE_PREFIX}dump.nc"
+                dump_file = f"{parallel.file_prefix()}dump.nc"
                 self.logger.info(f"Dumping {len(dump_fields)} fields to {dump_file}")
                 self.output_manager.dump(dump_file, *dump_fields)
             self.tiling.comm.Barrier()

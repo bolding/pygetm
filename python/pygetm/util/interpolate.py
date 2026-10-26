@@ -356,3 +356,61 @@ def interp_1d(
     f_left = np.take_along_axis(fp, i_left, axis=axis)
     f_right = np.take_along_axis(fp, i_right, axis=axis)
     return f_left + (f_right - f_left) * scale
+
+
+def interp_columns(
+    x: npt.ArrayLike, xp: npt.ArrayLike, fp: npt.ArrayLike, axis: int = 0
+) -> np.ndarray:
+    """One-dimensional linear interpolation along a given axis, for source and
+    target coordinates that both vary along the remaining dimensions.
+    For instance, to interpolate values at the layer centers of one water column
+    to the layer centers of another water column with different depth and
+    layer distribution (e.g., from a parent to a nested child domain).
+
+    Source values or coordinates may be NaN or masked; these points are skipped.
+    Where target coordinates fall outside the range of valid source coordinates,
+    the corresponding output values will be equal to the nearest valid source value.
+    Columns without any valid source point produce NaN.
+
+    Args:
+        x: Target coordinate values (nD, matching shape of fp except at `axis`)
+        xp: Source coordinate values (nD, same shape as fp)
+        fp: Source values (nD)
+        axis: Axis along which to interpolate
+
+    Returns:
+        Interpolated values with the shape of x
+    """
+    x = np.asarray(x, dtype=float)
+    xp = np.ma.filled(np.ma.asarray(xp, dtype=float), np.nan)
+    fp = np.ma.filled(np.ma.asarray(fp, dtype=float), np.nan)
+    if xp.shape != fp.shape:
+        raise ValueError(
+            f"Shape {xp.shape} of source coordinates does not match"
+            f" shape {fp.shape} of source values."
+        )
+    if fp.ndim != x.ndim:
+        raise ValueError(
+            f"Number of dimensions {fp.ndim} of source values"
+            f" does not match {x.ndim} of target coordinate."
+        )
+    axis = axis % fp.ndim
+    if fp.shape[:axis] != x.shape[:axis] or fp.shape[axis + 1 :] != x.shape[axis + 1 :]:
+        raise ValueError(
+            f"Shapes of source values {fp.shape} and target coordinates {x.shape}"
+            f" should match in all dimensions except axis {axis}."
+        )
+
+    # Move the interpolated axis to the end and flatten all other dimensions
+    x_cols = np.moveaxis(x, axis, -1).reshape(-1, x.shape[axis])
+    xp_cols = np.moveaxis(xp, axis, -1).reshape(-1, xp.shape[axis])
+    fp_cols = np.moveaxis(fp, axis, -1).reshape(-1, fp.shape[axis])
+    out = np.full(x_cols.shape, np.nan)
+    for x_col, xp_col, fp_col, out_col in zip(x_cols, xp_cols, fp_cols, out):
+        valid = np.isfinite(xp_col) & np.isfinite(fp_col)
+        if valid.any():
+            xp_valid = xp_col[valid]
+            order = np.argsort(xp_valid, kind="stable")
+            out_col[...] = np.interp(x_col, xp_valid[order], fp_col[valid][order])
+    out_shape = np.moveaxis(x, axis, -1).shape
+    return np.moveaxis(out.reshape(out_shape), -1, axis)
