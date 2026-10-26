@@ -16,6 +16,15 @@ This package currently provides:
   around the hole occupied by the child)
 * :mod:`pygetm.nesting.variables`: which variables are exchanged, at which
   stage of the time step (:data:`pygetm.simulation.COUPLING_STAGES`), and why
+* :mod:`pygetm.nesting.geometry`: the hierarchy (:class:`Level`,
+  :func:`load_levels`): windows, ratios, holes, rims, ring cells and the faces
+  at every interface; :meth:`Level.external` for
+  :attr:`pygetm.domain.Domain.external`
+* :mod:`pygetm.nesting.masks`: child-led land/sea consistency between levels
+* :mod:`pygetm.nesting.operators`: conservative transfer operators (limited
+  linear prolongation, weighted restriction, face sums for flux matching)
+* :mod:`pygetm.nesting.plan`: the M:N exchange lists between a parent and a
+  child on their pyGETM tilings (:class:`LevelTiling`, :class:`Plan`)
 
 Two complementary exchange paradigms
 ------------------------------------
@@ -39,6 +48,8 @@ package writes there are kept.
 from .hierarchy import NestingContext, split_world
 from .halo import CellSet, outer_halo, hole_rim
 from .variables import ExchangeGroup, EXCHANGE_GROUPS
+from .geometry import Level, load_levels
+from .plan import LevelTiling, Plan
 
 __all__ = [
     "NestingContext",
@@ -48,4 +59,8 @@ __all__ = [
     "hole_rim",
     "ExchangeGroup",
     "EXCHANGE_GROUPS",
+    "Level",
+    "load_levels",
+    "LevelTiling",
+    "Plan",
 ]
