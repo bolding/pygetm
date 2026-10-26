@@ -12,8 +12,11 @@ Every parent and child is a :class:`pygetm.Simulation` with
   (z: area-weighted mean over wet child cells; U, V: mean over the child
   faces along each parent face) for the rim, and their volume flux
   registers; correct z of the parent cells next to the window by
-  (parent - child) volume through each shared face. All this happens before
-  pyGETM recomputes depths and pressure gradients from z.
+  (parent - child) volume through each shared face, and continue from the
+  child's mean transport at those faces (without this, the correction loop
+  is unstable in deep water); send the corrected z to the children (the
+  start of their next parent step). All this happens before pyGETM
+  recomputes depths and pressure gradients from z.
 * child, sub-step k of r:
   - after its momentum update: ring U, V at t_n + (k + 1/2)/r, interpolated
     (and beyond t_n+1/2 extrapolated) between the parent's U(n-1/2) and
@@ -39,6 +42,9 @@ from .geometry import SIDES, Level
 from .plan import LevelTiling
 from .runtime import NestingRun, ops_interp
 from . import operators as ops
+
+#: tag offset of the parent's corrected z snapshot
+TAG_CORRECTED = 50
 
 
 class PointTransfer:
@@ -181,7 +187,8 @@ class NestedBarotropic(Coupler):
     """Coupler exchanging z, U, V of a 2D barotropic simulation with its
     parent and children (see module documentation)."""
 
-    def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False):
+    def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False,
+                 replace_transport=True):
         self.nest, self.sim = nest, sim
         self.lev = lev = nest.level
         self.t = nest.tile
@@ -189,6 +196,9 @@ class NestedBarotropic(Coupler):
         self.world = nest.world
         self.up, self.down = nest.up, nest.down
         self.break_ring, self.break_rim, self.break_flux = break_ring, break_rim, break_flux
+        #: after flux matching, set the parent's transport at each window face
+        #: to the child's mean transport (stabilises the coupling in deep water)
+        self.replace_transport = replace_transport
         T = sim.T
         self.z, self.U, self.V = T.z, sim.momentum.U, sim.momentum.V
         self.wetmask = T.mask.all_values != 0
@@ -211,6 +221,9 @@ class NestedBarotropic(Coupler):
             self._rv = self.loc(*self.up_faces["ring_y"].points(self.t))
         self._k = 0
         self._fps = []
+        #: largest elevation correction (m) by flux matching so far (diagnostic)
+        self.max_correction = 0.0
+        self.max_correction_info = None
 
     # --- helpers --------------------------------------------------------------
 
@@ -344,11 +357,36 @@ class NestedBarotropic(Coupler):
         for n, (sd, m) in enumerate(flist):
             w = wf[sd]
             if w["inside"]:
+                oj, oi = self.loc(w["out"][0][m], w["out"][1][m])
+                dz = w["sign"] * (fp[n] - fc[n]) / self.area[oj, oi]
                 if not self.break_flux:
-                    oj, oi = self.loc(w["out"][0][m], w["out"][1][m])
-                    self.z.all_values[oj, oi] += w["sign"] * (fp[n] - fc[n]) / self.area[oj, oi]
+                    self.z.all_values[oj, oi] += dz
+                    if self.replace_transport:
+                        # the parent continues from the child's mean transport
+                        fj, fi = self.loc(w["face"][0][m], w["face"][1][m])
+                        if w["axis"] == "x":
+                            self.U.all_values[fj, fi] = fc[n] / (self.dyu[fj, fi] * self._dt())
+                        else:
+                            self.V.all_values[fj, fi] = fc[n] / (self.dxv[fj, fi] * self._dt())
+                if abs(dz) > self.max_correction:  # diagnostic
+                    self.max_correction = abs(dz)
+                    self.max_correction_info = (self._k, sd, int(m), float(fp[n]), float(fc[n]), float(dz))
             elif self.lev.parent is not None:
                 self.reg[sd][w["edge_index"][m]] += fc[n]
+
+    def _send_corrected_z(self, plan):
+        """After the volume correction: the corrected z (with slopes) at the
+        cells the child's ring is filled from. The child uses it as the start
+        of its next parent step, so ring and parent stay consistent."""
+        z = self.z.all_values
+        sx, sy = ops.limited_slopes(z, self.wetmask)
+        reqs = []
+        for (p, tt), (pj, pi, *_rest) in plan.pro.items():
+            if p == self.t:
+                jj, ii = self.loc(pj, pi)
+                buf = np.ascontiguousarray(np.stack([z[jj, ii], sx[jj, ii], sy[jj, ii]]))
+                reqs.append(self.world.Isend(buf, dest=plan.ctil.offset + tt, tag=plan.tag_p + TAG_CORRECTED))
+        return reqs
 
     def _couple_down(self, fps):
         reqs = []
@@ -360,6 +398,11 @@ class NestedBarotropic(Coupler):
         self.z.update_halos()
         self.U.update_halos()
         self.V.update_halos()
+        if any(fp is not None for fp in fps):
+            reqs = []
+            for plan in self.down:
+                reqs += self._send_corrected_z(plan)
+            MPI.Request.Waitall(reqs)
 
     # --- Coupler hooks -------------------------------------------------------------
 
@@ -381,7 +424,9 @@ class NestedBarotropic(Coupler):
         r = self.lev.ratio
         k = self._k % r
         if stage == "transports_2d" and self.up is not None:
-            a = (k + 0.5) / r + 0.5  # parent U lives at n-1/2 and n+1/2
+            # parent U lives at n-1/2 and n+1/2: interpolate up to n+1/2,
+            # hold beyond (extrapolation is unstable in deep water)
+            a = min((k + 0.5) / r + 0.5, 1.0)
             self._set_ring_uv(ops_interp(self._prev[1], self._new[1], a), ops_interp(self._prev[2], self._new[2], a))
         elif stage == "elevation":
             if self.up is not None:
@@ -389,13 +434,26 @@ class NestedBarotropic(Coupler):
                 self._own_edge_fluxes()
             self._fps = [self._window_volumes(plan) for plan in self.down]
 
+    def _recv_corrected_z(self):
+        parts = []
+        for p, v in self._ring:
+            buf = np.empty((3, v[2].size))
+            self.world.Recv(buf, source=self.up.ptil.offset + p, tag=self.up.tag_p + TAG_CORRECTED)
+            parts.append(buf)
+        return np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
+
     def after_state_update(self, sim, macro_active):
         r = self.lev.ratio
         k = self._k % r
         self._couple_down(self._fps)
         if self.up is not None and k == r - 1:
-            self._prev = self._new
             self._send_up()
+            # the parent's z after its volume correction is the start of the
+            # next parent step (and the ring's value now)
+            zc = self._recv_corrected_z()
+            self._new = (zc,) + tuple(self._new[1:])
+            self._set_ring_z(zc)
+            self._prev = self._new
         self._k += 1
 
     def describe(self) -> List[str]:
