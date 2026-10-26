@@ -242,6 +242,52 @@ class TestVariables(unittest.TestCase):
                 self.assertIs(a.grid, getattr(sim, g.grid))
 
 
+class TestAdvectionFlux(unittest.TestCase):
+    def test_face_fluxes_close_cell_budgets(self):
+        # The amounts returned in flux_u/flux_v must explain every cell's change
+        # in tracer content, for every scheme (needed for flux matching)
+        domain = pygetm.domain.create_cartesian(
+            np.arange(31) * 1e3,
+            np.arange(21) * 1e3,
+            interfaces=True,
+            H=1.0,
+            f=0.0,
+            logger=parallel.get_logger(level="ERROR"),
+        )
+        T = domain.create_grids(1, halox=2, haloy=2, velocity_grids=1)
+        if T is None:
+            return
+        rng = np.random.default_rng(1)
+        h = T.halox
+        for scheme in pygetm.AdvectionScheme:
+            if scheme.name == "DEFAULT":
+                continue
+            with self.subTest(scheme=scheme.name):
+                f = T.array(fill=0.0)
+                f.all_values[...] = rng.random(f.all_values.shape)
+                f.update_halos()
+                u = T.ugrid.array(fill=300.0)
+                v = T.vgrid.array(fill=200.0)
+                u.all_values[T.ugrid.mask.all_values == 0] = 0.0
+                v.all_values[T.vgrid.mask.all_values == 0] = 0.0
+                fu = T.ugrid.array(fill=0.0)
+                fv = T.vgrid.array(fill=0.0)
+                adv = pygetm.operators.Advection(T, scheme=scheme)
+                c0 = f.all_values * T.D.all_values * T.area.all_values
+                adv(u, v, 1.0, f, flux_u=fu, flux_v=fv)
+                c1 = f.all_values * adv.D * T.area.all_values
+                net = (
+                    fu.all_values[h:-h, h - 1 : -h - 1]
+                    - fu.all_values[h:-h, h:-h]
+                    + fv.all_values[h - 1 : -h - 1, h:-h]
+                    - fv.all_values[h:-h, h:-h]
+                )
+                water = T.mask.all_values[h:-h, h:-h] == 1
+                err = np.abs((c1 - c0)[h:-h, h:-h] - net)[water].max()
+                self.assertLess(err, 1e-12 * np.abs(c0).max())
+                self.assertGreater(np.abs(fu.all_values).max(), 0.0)
+
+
 class TestCoupler(unittest.TestCase):
     def test_hook_order(self):
         sim = barotropic_simulation()

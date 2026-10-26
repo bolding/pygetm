@@ -210,16 +210,17 @@ contains
       deallocate(advection)
    end subroutine
 
-   subroutine advection_uv_calculate(direction, nk, padvection, ptgrid, pugrid, pu, pAh, timestep, ph, phu, pvar) bind(c)
+   subroutine advection_uv_calculate(direction, nk, padvection, ptgrid, pugrid, pu, pAh, timestep, ph, phu, pvar, pflux) bind(c)
       integer(c_int), intent(in), value :: direction, nk
       type(c_ptr),    intent(in), value :: pAh
       real(c_double), intent(in), value :: timestep
       type(c_ptr),    intent(in), value :: padvection, ptgrid, pugrid, pu, ph, phu, pvar
+      type(c_ptr),    intent(in), value :: pflux  ! optional (NULL): accumulates dt * face flux
 
       type (type_advection),    pointer                   :: advection
       type (type_getm_grid),  pointer                     :: tgrid, ugrid
       real(real64), contiguous, pointer, dimension(:,:)   :: Ah
-      real(real64), contiguous, pointer, dimension(:,:,:) :: u, h, hu, var
+      real(real64), contiguous, pointer, dimension(:,:,:) :: u, h, hu, var, flux
       integer                                             :: k
       logical                                             :: apply_diffusion
 
@@ -237,18 +238,33 @@ contains
       call c_f_pointer(ph, h, (/tgrid%u(1) - tgrid%l(1) + 1, tgrid%u(2) - tgrid%l(2) + 1, nk/))
       call c_f_pointer(phu, hu, (/ugrid%u(1) - ugrid%l(1) + 1, ugrid%u(2) - ugrid%l(2) + 1, nk/))
       call c_f_pointer(pvar, var, (/tgrid%u(1) - tgrid%l(1) + 1, tgrid%u(2) - tgrid%l(2) + 1, nk/))
+      if (c_associated(pflux)) then
+         call c_f_pointer(pflux, flux, (/ugrid%u(1) - ugrid%l(1) + 1, ugrid%u(2) - ugrid%l(2) + 1, nk/))
+      end if
       select case (direction)
          case (1)
             do k = 1, nk
-               call advection%op%u2d(tgrid%imin,tgrid%imax,tgrid%jmin,tgrid%jmax,tgrid%halo, &
-                       ugrid%mask,ugrid%idx,ugrid%dy,hu(:,:,k),u(:,:,k), &
-                       tgrid%mask,tgrid%iarea,apply_diffusion,Ah,timestep,h(:,:,k),var(:,:,k))
+               if (c_associated(pflux)) then
+                  call advection%op%u2d(tgrid%imin,tgrid%imax,tgrid%jmin,tgrid%jmax,tgrid%halo, &
+                          ugrid%mask,ugrid%idx,ugrid%dy,hu(:,:,k),u(:,:,k), &
+                          tgrid%mask,tgrid%iarea,apply_diffusion,Ah,timestep,h(:,:,k),var(:,:,k),flux(:,:,k))
+               else
+                  call advection%op%u2d(tgrid%imin,tgrid%imax,tgrid%jmin,tgrid%jmax,tgrid%halo, &
+                          ugrid%mask,ugrid%idx,ugrid%dy,hu(:,:,k),u(:,:,k), &
+                          tgrid%mask,tgrid%iarea,apply_diffusion,Ah,timestep,h(:,:,k),var(:,:,k))
+               end if
             end do
          case (2)
             do k = 1, nk
-               call advection%op%v2d(tgrid%imin,tgrid%imax,tgrid%jmin,tgrid%jmax,tgrid%halo, &
-                       ugrid%mask,ugrid%dx,ugrid%idy,hu(:,:,k),u(:,:,k), &
-                       tgrid%mask,tgrid%iarea,apply_diffusion,Ah,timestep,h(:,:,k),var(:,:,k))
+               if (c_associated(pflux)) then
+                  call advection%op%v2d(tgrid%imin,tgrid%imax,tgrid%jmin,tgrid%jmax,tgrid%halo, &
+                          ugrid%mask,ugrid%dx,ugrid%idy,hu(:,:,k),u(:,:,k), &
+                          tgrid%mask,tgrid%iarea,apply_diffusion,Ah,timestep,h(:,:,k),var(:,:,k),flux(:,:,k))
+               else
+                  call advection%op%v2d(tgrid%imin,tgrid%imax,tgrid%jmin,tgrid%jmax,tgrid%halo, &
+                          ugrid%mask,ugrid%dx,ugrid%idy,hu(:,:,k),u(:,:,k), &
+                          tgrid%mask,tgrid%iarea,apply_diffusion,Ah,timestep,h(:,:,k),var(:,:,k))
+               end if
             end do
       end select
    end subroutine
