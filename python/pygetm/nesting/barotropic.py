@@ -256,6 +256,11 @@ class NestedBarotropic(Coupler):
             self._rv = self.loc(*self.up_faces["ring_y"].points(self.t))
         self._k = 0
         self._fps = []
+        #: wall-clock monitoring (seconds, this process): time in the syncs
+        #: with parent and children (waiting in MPI + the exchange itself)
+        #: and the elapsed time since the end of on_start
+        self.t_sync = 0.0
+        self._t_start = None
         #: largest elevation correction (m) by flux matching so far (diagnostic)
         self.max_correction = 0.0
         self.max_correction_info = None
@@ -445,6 +450,12 @@ class NestedBarotropic(Coupler):
         registers, then flux matching; (b) to the parent: restriction and
         registers; (c) from the parent: its (corrected) state for the ring;
         (d) to the children: this level's state for their rings."""
+        t0 = MPI.Wtime()
+        self._sync_inner(fps, with_parent, fluxes)
+        if self._t_start is not None:
+            self.t_sync += MPI.Wtime() - t0
+
+    def _sync_inner(self, fps, with_parent: bool, fluxes: bool):
         for plan, faces, fp in zip(self.down, self.down_faces, fps):
             self._recv_child(plan, faces, fp)
         if self.down:
@@ -467,6 +478,7 @@ class NestedBarotropic(Coupler):
     def on_start(self, sim):
         if self.schedule == "sync":
             self._sync([None] * len(self.down), self.up is not None, fluxes=False)
+            self._t_start = MPI.Wtime()
             return
         if self.up is not None:
             snap = self._recv_snapshot()
@@ -540,6 +552,14 @@ class NestedBarotropic(Coupler):
             self._set_ring_z(zc)
             self._prev = self._new
         self._k += 1
+
+    def timing(self) -> dict:
+        """Wall-clock monitoring of this process since the start: elapsed
+        time, time in the syncs (waiting for parent/children + exchange) and
+        its fraction (schedule "sync")."""
+        elapsed = MPI.Wtime() - self._t_start if self._t_start is not None else 0.0
+        return dict(level=self.lev.name, tile=self.t, elapsed=elapsed, sync=self.t_sync,
+                    idle=self.t_sync / elapsed if elapsed > 0 else 0.0)
 
     def describe(self) -> List[str]:
         """Messages of the U/V transfers of this process."""
