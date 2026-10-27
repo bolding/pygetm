@@ -1,5 +1,15 @@
 """Two-way nesting of 2D barotropic pyGETM simulations (z, U, V).
 
+Schedule (``NestedBarotropic(schedule=...)``):
+
+* "sync" (default): all models step at the same time; at the end of every
+  parent step they meet at a sync point: children send the halo inside the
+  hole and their flux registers, the parent matches the fluxes of the same
+  step and sends its corrected state, which the child holds as its ring for
+  its next ``time_ratio`` sub-steps. Models only wait in MPI at the syncs.
+* "sequential" (old, kept for comparison; described below): the child
+  steps after the parent and interpolates its ring in time.
+
 Every parent and child is a :class:`pygetm.Simulation` with
 ``runtype=BAROTROPIC_2D``; :class:`NestedBarotropic` is a
 :class:`pygetm.simulation.Coupler` attached to each of them. Per parent step n
@@ -196,7 +206,7 @@ class NestedBarotropic(Coupler):
     parent and children (see module documentation)."""
 
     def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False,
-                 replace_transport=True):
+                 replace_transport=True, schedule="sync"):
         self.nest, self.sim = nest, sim
         self.lev = lev = nest.level
         self.t = nest.tile
@@ -207,6 +217,14 @@ class NestedBarotropic(Coupler):
         #: after flux matching, set the parent's transport at each window face
         #: to the child's mean transport (stabilises the coupling in deep water)
         self.replace_transport = replace_transport
+        #: "sync" (default): all models step at the same time and exchange at
+        #: the end of every parent step; the child holds its ring from the
+        #: parent's state at the last sync. "sequential" (old, for comparison):
+        #: the child steps after the parent and interpolates its ring in time
+        #: between the parent's n and n+1.
+        if schedule not in ("sync", "sequential"):
+            raise ValueError(f"unknown schedule {schedule!r}")
+        self.schedule = schedule
         T = sim.T
         self.z, self.U, self.V = T.z, sim.momentum.U, sim.momentum.V
         self.wetmask = T.mask.all_values != 0
@@ -412,9 +430,34 @@ class NestedBarotropic(Coupler):
                 reqs += self._send_corrected_z(plan)
             MPI.Request.Waitall(reqs)
 
+    def _sync(self, fps, with_parent: bool, fluxes: bool):
+        """One sync point (schedule "sync"), in an order without cycles over
+        the hierarchy: (a) from the children: halo in the hole and flux
+        registers, then flux matching; (b) to the parent: restriction and
+        registers; (c) from the parent: its (corrected) state for the ring;
+        (d) to the children: this level's state for their rings."""
+        for plan, faces, fp in zip(self.down, self.down_faces, fps):
+            self._recv_child(plan, faces, fp)
+        if self.down:
+            self.z.update_halos()
+            self.U.update_halos()
+            self.V.update_halos()
+        if with_parent:
+            self._send_up(fluxes=fluxes)
+            self._snap = self._recv_snapshot()
+            self._set_ring_z(self._snap[0])
+            self._set_ring_uv(self._snap[1], self._snap[2])
+        reqs = []
+        for plan, faces in zip(self.down, self.down_faces):
+            reqs += self._send_snapshot(plan, faces)
+        MPI.Request.Waitall(reqs)
+
     # --- Coupler hooks -------------------------------------------------------------
 
     def on_start(self, sim):
+        if self.schedule == "sync":
+            self._sync([None] * len(self.down), self.up is not None, fluxes=False)
+            return
         if self.up is not None:
             snap = self._recv_snapshot()
             self._prev = self._new = snap
@@ -425,12 +468,23 @@ class NestedBarotropic(Coupler):
             self._send_up(fluxes=False)
 
     def before_state_update(self, sim, macro_active):
-        if self.up is not None and self._k % self.lev.time_ratio == 0:
+        if self.schedule == "sequential" and self.up is not None and self._k % self.lev.time_ratio == 0:
             self._new = self._recv_snapshot()
 
     def on_stage(self, sim, stage, macro_active):
         r = self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
+        if self.schedule == "sync":
+            # ring held at the parent's state of the last sync (external
+            # cells/faces: pyGETM keeps them, set again for safety)
+            if stage == "transports_2d" and self.up is not None:
+                self._set_ring_uv(self._snap[1], self._snap[2])
+            elif stage == "elevation":
+                if self.up is not None:
+                    self._set_ring_z(self._snap[0])
+                    self._own_edge_fluxes()
+                self._fps = [self._window_volumes(plan) for plan in self.down]
+            return
         if stage == "transports_2d" and self.up is not None:
             # parent U lives at n-1/2 and n+1/2: interpolate up to n+1/2,
             # hold beyond (extrapolation is unstable in deep water)
@@ -453,6 +507,10 @@ class NestedBarotropic(Coupler):
     def after_state_update(self, sim, macro_active):
         r = self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
+        if self.schedule == "sync":
+            self._sync(self._fps, self.up is not None and k == r - 1, fluxes=True)
+            self._k += 1
+            return
         self._couple_down(self._fps)
         if self.up is not None and k == r - 1:
             self._send_up()

@@ -6,7 +6,10 @@ ring band and the hole marked external (:attr:`pygetm.domain.Domain.external`),
 shares the tilings of all levels and builds the exchange plans
 (:class:`pygetm.nesting.plan.Plan`).
 
-:class:`NestedTracer` exchanges one tracer between the levels:
+:class:`NestedTracer` exchanges one tracer between the levels. Schedule
+"sync" (default): all levels step at the same time and exchange at the end
+of every parent step (the ring is held at the parent's state of the last
+sync). The old "sequential" schedule, kept for comparison:
 
 * the child's ring from the parent (limited linear reconstruction of the
   parent's (c, sx, sy) snapshot, interpolated in time over the child's
@@ -178,7 +181,8 @@ class NestedTracer:
     """Exchange of one tracer (a T-grid :class:`pygetm.core.Array`) between
     this level, its parent and its children."""
 
-    def __init__(self, run: NestingRun, f, break_ring=False, break_rim=False, break_flux=False):
+    def __init__(self, run: NestingRun, f, break_ring=False, break_rim=False, break_flux=False,
+                 schedule: str = "sync"):
         self.run = run
         self.f = f
         T = run.grid
@@ -189,6 +193,13 @@ class NestedTracer:
         self.world = run.world
         self.up, self.down = run.up, run.down
         self.break_ring, self.break_rim, self.break_flux = break_ring, break_rim, break_flux
+        #: "sync" (default): all levels step at the same time, exchange at the
+        #: end of every parent step, the ring is held at the parent's state of
+        #: the last sync; "sequential": the old order (child after parent, ring
+        #: interpolated in time), kept for comparison
+        if schedule not in ("sync", "sequential"):
+            raise ValueError(f"unknown schedule {schedule!r}")
+        self.schedule = schedule
         self.wetmask = T.mask.all_values != 0
         self.content = T.D.all_values * T.area.all_values  # per unit concentration
         h = T.halox
@@ -349,8 +360,29 @@ class NestedTracer:
 
     # --- public ---------------------------------------------------------------
 
+    def _sync(self, fps, with_parent: bool, fluxes: bool):
+        """One sync point: (a) restriction and flux matching from the
+        children, (b) restriction and registers to the parent, (c) the
+        parent's corrected state for the ring, (d) this level's state to the
+        children (an order without cycles over the hierarchy)."""
+        for plan, fp in zip(self.down, fps):
+            self._recv_restriction(plan)
+            if fp is not None:
+                self._match_fluxes(plan, fp)
+        if self.down:
+            self.f.update_halos()
+        if with_parent:
+            self._send_up(fluxes=fluxes)
+            self._s_hold = self._recv_snapshot()
+            self._set_ring(self._s_hold)
+        for plan in self.down:
+            self._send_snapshot(plan)
+
     def start(self):
         """Initial exchanges (no transport yet). Call once on every process."""
+        if self.schedule == "sync":
+            self._sync([None] * len(self.down), self.up is not None, fluxes=False)
+            return
         if self.up is not None:
             self._s_prev = self._recv_snapshot()
             self._set_ring(self._s_prev)
@@ -364,6 +396,21 @@ class NestedTracer:
         (e.g. ``Advection(u, v, dt, f, flux_u=flux_u, flux_v=flux_v)``)."""
         up, r = self.up, self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
+        if self.schedule == "sync":
+            if up is not None:
+                self._set_ring(self._s_hold)
+            self.flux["x"].all_values[...] = 0.0
+            self.flux["y"].all_values[...] = 0.0
+            advect(self.flux["x"], self.flux["y"])
+            self.f.update_halos()
+            fps = [self._window_fluxes(plan) for plan in self.down]
+            if up is not None:
+                self._own_edge_fluxes()
+            else:
+                self.outflow += self._root_outflow()
+            self._sync(fps, up is not None and k == r - 1, fluxes=True)
+            self._k += 1
+            return
         if up is not None:
             if k == 0:
                 self._s_new = self._recv_snapshot()
