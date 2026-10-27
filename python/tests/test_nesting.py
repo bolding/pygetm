@@ -602,26 +602,34 @@ class TestNestingRuntime(unittest.TestCase):
     (all levels + outflow through the root boundary). Needs >= 2 processes."""
 
     def test_two_levels_conserve_mass(self):
+        self._two_levels(None)
+
+    def test_two_levels_conserve_mass_active(self):
+        # L-shaped active region: the north-east of the window stays with the root
+        act = np.ones((10, 12), dtype=bool)
+        act[5:, 6:] = False
+        self._two_levels(act)
+
+    def _two_levels(self, active):
         from pygetm.nesting import load_levels
         from pygetm.nesting.runtime import NestingRun, NestedTracer
 
         world = parallel.MPI.COMM_WORLD
         if world.size < 2:
             self.skipTest("needs at least 2 MPI processes")
-        levels = load_levels(
-            {
-                "root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
-                "child": dict(parent="root", istart=10, istop=22, jstart=8, jstop=18, ratio=3),
-            }
-        )
+        child = dict(parent="root", istart=10, istop=22, jstart=8, jstop=18, ratio=3)
+        if active is not None:
+            child["active"] = active.tolist()
+        levels = load_levels({"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0), "child": child})
         nroot = (world.size + 1) // 2
         nest = NestingRun(levels, {"root": nroot, "child": world.size - nroot})
         lev = nest.level
 
         def make_domain(lev, comm):
             lon, lat = lev.edges()
+            H = np.where(lev.unused(), np.nan, 1.0) if lev.parent is not None else 1.0
             return pygetm.domain.create_cartesian(
-                lon * 1e4, lat * 1e4, interfaces=True, H=1.0, f=0.0, comm=comm,
+                lon * 1e4, lat * 1e4, interfaces=True, H=H, f=0.0, comm=comm,
                 logger=parallel.get_logger(level="ERROR", comm=comm),
             )
 
@@ -659,7 +667,7 @@ class TestNestingRuntime(unittest.TestCase):
         self.assertLess(abs(total[1] - total[0]) / total[0], 1e-13)
 
 
-def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=True, children=True):
+def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=True, children=True, active=None):
     """Closed basin, root (+ child), 2D barotropic; returns (volumes per
     output, gathered z of this level or None, level name, world)."""
     from pygetm.nesting import load_levels
@@ -669,6 +677,8 @@ def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=Tru
     cfg = {"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0)}
     if children:
         cfg["child"] = dict(parent="root", istart=12, istop=24, jstart=8, jstop=20, ratio=ratio)
+        if active is not None:
+            cfg["child"]["active"] = active.tolist()
     levels = load_levels(cfg, root_band=0)
     world = parallel.MPI.COMM_WORLD
     ranks = {"root": nroot, "child": world.size - nroot} if children else {"root": world.size}
@@ -678,6 +688,8 @@ def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=Tru
         lon, lat = lev.edges()
         xc = 0.5 * (lon[1:] + lon[:-1])
         H = (20.0 + (10.0 * xc / 40.0 if slope else 0.0))[None, :] * np.ones((lat.size - 1, 1))
+        if lev.parent is not None:
+            H = np.where(lev.unused(), np.nan, H)  # window cells the child does not use
         return pygetm.domain.create_cartesian(
             lon * 2e3, lat * 2e3, interfaces=True, H=H, f=coriolis, comm=comm,
             logger=parallel.get_logger(level="ERROR", comm=comm),
@@ -724,6 +736,14 @@ class TestNestingBarotropic(unittest.TestCase):
     def test_volume_conserved(self):
         nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
         vols, _, _, _ = run_barotropic(3, nroot, 60)
+        self.assertLess(abs(vols[1] - vols[0]) / vols[0], 1e-13)
+
+    def test_volume_conserved_active(self):
+        # L-shaped active region (south-west corner of the window stays with the root)
+        act = np.ones((12, 12), dtype=bool)
+        act[:5, :5] = False
+        nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
+        vols, _, _, _ = run_barotropic(3, nroot, 60, active=act)
         self.assertLess(abs(vols[1] - vols[0]) / vols[0], 1e-13)
 
     def test_lake_at_rest(self):
