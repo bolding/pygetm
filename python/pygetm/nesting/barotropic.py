@@ -206,7 +206,7 @@ class NestedBarotropic(Coupler):
     parent and children (see module documentation)."""
 
     def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False,
-                 replace_transport=True, schedule="sync", ring_time="hold"):
+                 replace_transport=True, schedule="sync", ring_time="extrapolate"):
         self.nest, self.sim = nest, sim
         self.lev = lev = nest.level
         self.t = nest.tile
@@ -225,9 +225,11 @@ class NestedBarotropic(Coupler):
         if schedule not in ("sync", "sequential"):
             raise ValueError(f"unknown schedule {schedule!r}")
         self.schedule = schedule
-        #: schedule "sync": the ring between syncs is "hold" (the parent's state
-        #: at the last sync) or "extrapolate" (linear in time from the parent's
-        #: last two syncs; z to the child's time, U/V to its half steps)
+        #: schedule "sync": the ring between syncs is "extrapolate" (default;
+        #: linear in time from the parent's last two syncs, z to the child's
+        #: time, U/V to its half steps) or "hold" (the parent's state at the
+        #: last sync). NWES coarse M2 tides: extrapolate reproduces the
+        #: sequential schedule to < 1 mm, hold differs by up to 6 mm.
         if ring_time not in ("hold", "extrapolate"):
             raise ValueError(f"unknown ring_time {ring_time!r}")
         self.ring_time = ring_time
