@@ -321,10 +321,12 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
           barriers:                         # every key must hold
             - {lat_gt: 61.0, lon_lt: 8.0}   # also lon_gt, lat_lt
 
-    The child's wet cells (``wet``: window shape (ny, nx) or extended shape)
-    connected to the seed without crossing a barrier (barrier lines should lie
-    on parent cell edges); a parent cell is active if any of its child cells
-    is; enclosed parent cells (islands) are active too. Returns the mask for
+    The parent keeps the child's wet cells (``wet``: window shape (ny, nx) or
+    extended shape) that are not connected to the seed without crossing a
+    barrier (barrier lines should lie on parent cell edges). A parent cell is
+    active if it holds water connected to the seed or no water the parent
+    keeps: land always belongs to the child (it costs nothing, and the active
+    regions of nested levels then fit into each other). Returns the mask for
     :meth:`Level.set_active`."""
     from scipy import ndimage
 
@@ -338,22 +340,31 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
     lat = level.lat0 + (np.arange(level.ny) + 0.5) * level.dlat
     LO, LA = np.meshgrid(lon, lat)
     ok = wet.copy()
+    barred = np.zeros_like(ok)
     tests = {"lon_lt": lambda v: LO < v, "lon_gt": lambda v: LO > v, "lat_lt": lambda v: LA < v, "lat_gt": lambda v: LA > v}
     for b in spec.get("barriers", []) or []:
         sel = np.ones_like(ok)
         for key, v in b.items():
             sel &= tests[key](float(v))
-        ok &= ~sel
+        barred |= sel
+    ok &= ~barred
     lab, _ = ndimage.label(ok)
     sx, sy = spec["seed"]
     seed = lab[int(np.argmin(abs(lat - float(sy)))), int(np.argmin(abs(lon - float(sx))))]
     if seed == 0:
         raise ValueError(f"{level.name}: seed {spec['seed']} is on land or behind a barrier")
     r = level.ratio
-    active = (lab == seed).reshape(level.ny // r, r, level.nx // r, r).any(axis=(1, 3))
-    # land enclosed by the active region (islands) belongs to the child: no
-    # interfaces or rims around islands
-    return ndimage.binary_fill_holes(active)
+    connected = lab == seed
+    # water the parent keeps: not connected to the seed, and continuing into
+    # the parent's area (touching the window edge) or behind a barrier; water
+    # cut off at this resolution (lagoons, fjord ends) counts as land
+    other, _ = ndimage.label(wet & ~connected)
+    edge = np.unique(np.concatenate([other[0], other[-1], other[:, 0], other[:, -1], other[barred & wet]]))
+    kept = np.isin(other, edge[edge > 0])
+    blocks = lambda m: m.reshape(level.ny // r, r, level.nx // r, r).any(axis=(1, 3))
+    # every parent cell without water the parent keeps is active: land always
+    # belongs to the child (it costs nothing; nested active regions then fit)
+    return blocks(connected) | ~blocks(kept)
 
 
 def load_levels(config, halo: int = 2, root_band: Optional[int] = None,

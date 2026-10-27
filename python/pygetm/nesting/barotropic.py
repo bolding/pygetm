@@ -206,7 +206,7 @@ class NestedBarotropic(Coupler):
     parent and children (see module documentation)."""
 
     def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False,
-                 replace_transport=True, schedule="sync"):
+                 replace_transport=True, schedule="sync", ring_time="hold"):
         self.nest, self.sim = nest, sim
         self.lev = lev = nest.level
         self.t = nest.tile
@@ -225,6 +225,13 @@ class NestedBarotropic(Coupler):
         if schedule not in ("sync", "sequential"):
             raise ValueError(f"unknown schedule {schedule!r}")
         self.schedule = schedule
+        #: schedule "sync": the ring between syncs is "hold" (the parent's state
+        #: at the last sync) or "extrapolate" (linear in time from the parent's
+        #: last two syncs; z to the child's time, U/V to its half steps)
+        if ring_time not in ("hold", "extrapolate"):
+            raise ValueError(f"unknown ring_time {ring_time!r}")
+        self.ring_time = ring_time
+        self._snap_old = None
         T = sim.T
         self.z, self.U, self.V = T.z, sim.momentum.U, sim.momentum.V
         self.wetmask = T.mask.all_values != 0
@@ -444,6 +451,7 @@ class NestedBarotropic(Coupler):
             self.V.update_halos()
         if with_parent:
             self._send_up(fluxes=fluxes)
+            self._snap_old = getattr(self, "_snap", None) if fluxes else None
             self._snap = self._recv_snapshot()
             self._set_ring_z(self._snap[0])
             self._set_ring_uv(self._snap[1], self._snap[2])
@@ -477,11 +485,20 @@ class NestedBarotropic(Coupler):
         if self.schedule == "sync":
             # ring held at the parent's state of the last sync (external
             # cells/faces: pyGETM keeps them, set again for safety)
+            ex = self.ring_time == "extrapolate" and self._snap_old is not None
             if stage == "transports_2d" and self.up is not None:
-                self._set_ring_uv(self._snap[1], self._snap[2])
+                if ex:  # parent U at n-1/2 and n-3/2 -> child half step n + (k+1/2)/r
+                    a = 1.0 + (k + 0.5) / r
+                    self._set_ring_uv(ops_interp(self._snap_old[1], self._snap[1], a),
+                                      ops_interp(self._snap_old[2], self._snap[2], a))
+                else:
+                    self._set_ring_uv(self._snap[1], self._snap[2])
             elif stage == "elevation":
                 if self.up is not None:
-                    self._set_ring_z(self._snap[0])
+                    if ex:  # parent z at n and n-1 -> child time n + (k+1)/r
+                        self._set_ring_z(ops_interp(self._snap_old[0], self._snap[0], 1.0 + (k + 1) / r))
+                    else:
+                        self._set_ring_z(self._snap[0])
                     self._own_edge_fluxes()
                 self._fps = [self._window_volumes(plan) for plan in self.down]
             return
