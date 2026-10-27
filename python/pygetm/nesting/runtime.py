@@ -362,7 +362,7 @@ class NestedTracer:
         """One step of this level. ``advect(flux_u, flux_v)`` must advance the
         tracer by one step and add the transported amounts to flux_u/flux_v
         (e.g. ``Advection(u, v, dt, f, flux_u=flux_u, flux_v=flux_v)``)."""
-        up, r = self.up, self.lev.ratio
+        up, r = self.up, self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
         if up is not None:
             if k == 0:

@@ -93,7 +93,7 @@ class Level:
         if parent is not None and self.band != halo:
             raise ValueError(f"{name}: a child needs a band of {halo} cells")
         if parent is None:
-            self.ratio, self.window = 1, None
+            self.ratio, self.window, self.time_ratio = 1, None, 1
             self.nx, self.ny = int(cfg["nx"]), int(cfg["ny"])
             self.lon0, self.lat0 = float(cfg["lon0"]), float(cfg["lat0"])
             self.dlon, self.dlat = float(cfg["dlon"]), float(cfg["dlat"])
@@ -104,6 +104,11 @@ class Level:
             if not (0 <= i0 < i1 <= parent.nx and 0 <= j0 < j1 <= parent.ny):
                 raise ValueError(f"{name}: window {(i0, i1, j0, j1)} outside {parent.name}")
             self.ratio, self.window = r, (i0, i1, j0, j1)
+            #: steps per parent step (YAML ``time_ratio``, default: ratio); 1 =
+            #: the parent's time step
+            self.time_ratio = int(cfg.get("time_ratio", r))
+            if self.time_ratio < 1:
+                raise ValueError(f"{name}: time_ratio must be >= 1")
             self.nx, self.ny = (i1 - i0) * r, (j1 - j0) * r
             self.dlon, self.dlat = parent.dlon / r, parent.dlat / r
             self.lon0 = parent.lon0 + i0 * parent.dlon
@@ -114,7 +119,7 @@ class Level:
         self.active: Optional[np.ndarray] = None
         self.set_active(None)
         self.index = -1
-        self.steps_per_root = 1 if parent is None else parent.steps_per_root * self.ratio
+        self.steps_per_root = 1 if parent is None else parent.steps_per_root * self.time_ratio
 
     def set_active(self, mask: Optional[np.ndarray]):
         """Set the active region: a boolean mask of the window's parent cells

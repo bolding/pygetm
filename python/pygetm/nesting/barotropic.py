@@ -17,7 +17,7 @@ Every parent and child is a :class:`pygetm.Simulation` with
   is unstable in deep water); send the corrected z to the children (the
   start of their next parent step). All this happens before pyGETM
   recomputes depths and pressure gradients from z.
-* child, sub-step k of r:
+* child, sub-step k of r (r = time_ratio, steps per parent step):
   - after its momentum update: ring U, V at t_n + (k + 1/2)/r, interpolated
     (and beyond t_n+1/2 extrapolated) between the parent's U(n-1/2) and
     U(n+1/2); in space linear across and constant along parent faces;
@@ -425,11 +425,11 @@ class NestedBarotropic(Coupler):
             self._send_up(fluxes=False)
 
     def before_state_update(self, sim, macro_active):
-        if self.up is not None and self._k % self.lev.ratio == 0:
+        if self.up is not None and self._k % self.lev.time_ratio == 0:
             self._new = self._recv_snapshot()
 
     def on_stage(self, sim, stage, macro_active):
-        r = self.lev.ratio
+        r = self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
         if stage == "transports_2d" and self.up is not None:
             # parent U lives at n-1/2 and n+1/2: interpolate up to n+1/2,
@@ -451,7 +451,7 @@ class NestedBarotropic(Coupler):
         return np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
 
     def after_state_update(self, sim, macro_active):
-        r = self.lev.ratio
+        r = self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
         self._couple_down(self._fps)
         if self.up is not None and k == r - 1:

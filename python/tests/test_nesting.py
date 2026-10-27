@@ -610,7 +610,10 @@ class TestNestingRuntime(unittest.TestCase):
         act[5:, 6:] = False
         self._two_levels(act)
 
-    def _two_levels(self, active):
+    def test_two_levels_conserve_mass_time_ratio_one(self):
+        self._two_levels(None, time_ratio=1)
+
+    def _two_levels(self, active, time_ratio=None):
         from pygetm.nesting import load_levels
         from pygetm.nesting.runtime import NestingRun, NestedTracer
 
@@ -620,6 +623,8 @@ class TestNestingRuntime(unittest.TestCase):
         child = dict(parent="root", istart=10, istop=22, jstart=8, jstop=18, ratio=3)
         if active is not None:
             child["active"] = active.tolist()
+        if time_ratio is not None:
+            child["time_ratio"] = time_ratio
         levels = load_levels({"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0), "child": child})
         nroot = (world.size + 1) // 2
         nest = NestingRun(levels, {"root": nroot, "child": world.size - nroot})
@@ -667,7 +672,8 @@ class TestNestingRuntime(unittest.TestCase):
         self.assertLess(abs(total[1] - total[0]) / total[0], 1e-13)
 
 
-def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=True, children=True, active=None):
+def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=True, children=True, active=None,
+                   time_ratio=None, dt_root=20.0):
     """Closed basin, root (+ child), 2D barotropic; returns (volumes per
     output, gathered z of this level or None, level name, world)."""
     from pygetm.nesting import load_levels
@@ -679,6 +685,8 @@ def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=Tru
         cfg["child"] = dict(parent="root", istart=12, istop=24, jstart=8, jstop=20, ratio=ratio)
         if active is not None:
             cfg["child"]["active"] = active.tolist()
+        if time_ratio is not None:
+            cfg["child"]["time_ratio"] = time_ratio
     levels = load_levels(cfg, root_band=0)
     world = parallel.MPI.COMM_WORLD
     ranks = {"root": nroot, "child": world.size - nroot} if children else {"root": world.size}
@@ -716,7 +724,7 @@ def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=Tru
     sim.T.z.all_values[sim.T.mask.all_values == 0] = 0.0
     import datetime
 
-    sim.start(datetime.datetime(2000, 1, 1), timestep=20.0 / lev.steps_per_root, split_factor=1, report=0)
+    sim.start(datetime.datetime(2000, 1, 1), timestep=dt_root / lev.steps_per_root, split_factor=1, report=0)
     vols = [cpl.level_volume()]
     for _ in range(nsteps * lev.steps_per_root):
         sim.advance()
@@ -745,6 +753,25 @@ class TestNestingBarotropic(unittest.TestCase):
         nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
         vols, _, _, _ = run_barotropic(3, nroot, 60, active=act)
         self.assertLess(abs(vols[1] - vols[0]) / vols[0], 1e-13)
+
+    def test_volume_conserved_time_ratio_one(self):
+        # child with the parent's time step (ratio 3 in space, 1 in time)
+        nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
+        vols, z, _, _ = run_barotropic(3, nroot, 120, time_ratio=1, dt_root=6.0)
+        self.assertLess(abs(vols[1] - vols[0]) / vols[0], 1e-13)
+        if z is not None:
+            self.assertTrue(np.isfinite(z[np.isfinite(z)]).all())
+
+    def test_tracer_time_ratio(self):
+        from pygetm.nesting import load_levels
+
+        levels = load_levels({
+            "root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
+            "child": dict(parent="root", istart=10, istop=22, jstart=8, jstop=18, ratio=3, time_ratio=1),
+            "gc": dict(parent="child", istart=6, istop=18, jstart=6, jstop=18, ratio=2, time_ratio=4),
+        })
+        self.assertEqual([l.steps_per_root for l in levels], [1, 1, 4])
+        self.assertEqual(levels[2].time_ratio, 4)
 
     def test_lake_at_rest(self):
         nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
