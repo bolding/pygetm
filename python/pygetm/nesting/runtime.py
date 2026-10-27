@@ -36,17 +36,44 @@ from .plan import LevelTiling, Plan, gather_tilings
 from . import operators as ops
 
 
+def install_abort_hook(comm: MPI.Comm, label: str):
+    """Make an unhandled exception on any process abort the whole run.
+
+    The levels of a nesting run wait for each other in MPI: if one level
+    stops with an exception, the others would wait forever. The hook prints
+    the traceback with the level and rank, then calls ``comm.Abort``."""
+    import sys
+    import traceback
+
+    previous = sys.excepthook
+
+    def hook(etype, value, tb):
+        traceback.print_exception(etype, value, tb)
+        sys.stderr.write(f"[nesting: {label}, rank {comm.rank}] unhandled exception - aborting all levels\n")
+        sys.stderr.flush()
+        try:
+            comm.Abort(1)
+        finally:
+            previous(etype, value, tb)
+
+    sys.excepthook = hook
+
+
 class NestingRun:
     """Processes, grids and exchange plans of a nesting hierarchy (one level
-    per group of processes)."""
+    per group of processes). With ``abort_on_error`` (default), an unhandled
+    exception on any process aborts all levels (:func:`install_abort_hook`)."""
 
-    def __init__(self, levels: List[Level], ranks: Mapping[str, int], comm: Optional[MPI.Comm] = None):
+    def __init__(self, levels: List[Level], ranks: Mapping[str, int], comm: Optional[MPI.Comm] = None,
+                 abort_on_error: bool = True):
         self.levels = levels
         ctx = split_world({l.name: int(ranks[l.name]) for l in levels}, comm=comm)
         self.world = ctx.nesting_comm
         self.comm = ctx.comm
         self.offsets = ctx.offsets
         self.level = next(l for l in levels if l.name == ctx.name)
+        if abort_on_error:
+            install_abort_hook(self.world, self.level.name)
         self.grid = None
         self.tilings: Dict[str, LevelTiling] = {}
         self.up: Optional[Plan] = None
@@ -61,7 +88,9 @@ class NestingRun:
         domain = make_domain(lev, self.comm)
         domain.external = lev.external()
         grid_kwargs.setdefault("velocity_grids", 1)
-        return self._setup(domain.create_grids(nz, halox=lev.halo, haloy=lev.halo, **grid_kwargs))
+        with self._tiling_hint():
+            grid = domain.create_grids(nz, halox=lev.halo, haloy=lev.halo, **grid_kwargs)
+        return self._setup(grid)
 
     def build_simulation(self, make_domain: Callable, make_simulation: Callable):
         """Build this level's :class:`pygetm.Simulation`. ``make_domain(level,
@@ -72,11 +101,33 @@ class NestingRun:
         lev = self.level
         domain = make_domain(lev, self.comm)
         domain.external = lev.external()
-        sim = make_simulation(lev, domain)
+        with self._tiling_hint():
+            sim = make_simulation(lev, domain)
         if sim.T is not None and sim.T.halox != lev.halo:
             raise ValueError(f"simulation halo {sim.T.halox} differs from nesting halo {lev.halo}")
         self._setup(sim.T)
         return sim
+
+    def _tiling_hint(self):
+        """Context: a failing subdomain division names the level and its
+        number of processes (then abort_on_error stops all levels)."""
+        import contextlib
+
+        run = self
+
+        @contextlib.contextmanager
+        def ctx():
+            try:
+                yield
+            except Exception as e:
+                if "subdomain" in str(e).lower() or "decompos" in str(e).lower():
+                    raise RuntimeError(
+                        f"level {run.level.name}: no subdomain division for {run.comm.size} processes"
+                        f" ({run.level.nx} x {run.level.ny} cells) - use fewer processes for this level"
+                        " (see nesting-balance in pygetm-nesting)") from e
+                raise
+
+        return ctx()
 
     def _setup(self, grid):
         lev = self.level
