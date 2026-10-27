@@ -319,7 +319,8 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
     The child's wet cells (``wet``: window shape (ny, nx) or extended shape)
     connected to the seed without crossing a barrier (barrier lines should lie
     on parent cell edges); a parent cell is active if any of its child cells
-    is. Returns the mask for :meth:`Level.set_active`."""
+    is; enclosed parent cells (islands) are active too. Returns the mask for
+    :meth:`Level.set_active`."""
     from scipy import ndimage
 
     wet = np.asarray(wet, dtype=bool)
@@ -344,7 +345,10 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
     if seed == 0:
         raise ValueError(f"{level.name}: seed {spec['seed']} is on land or behind a barrier")
     r = level.ratio
-    return (lab == seed).reshape(level.ny // r, r, level.nx // r, r).any(axis=(1, 3))
+    active = (lab == seed).reshape(level.ny // r, r, level.nx // r, r).any(axis=(1, 3))
+    # land enclosed by the active region (islands) belongs to the child: no
+    # interfaces or rims around islands
+    return ndimage.binary_fill_holes(active)
 
 
 def load_levels(config, halo: int = 2, root_band: Optional[int] = None,
