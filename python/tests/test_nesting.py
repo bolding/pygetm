@@ -504,6 +504,26 @@ class TestNestingGeometry(unittest.TestCase):
             active_region(child, dict(seed=[15.0, 4.0], barriers=[]), wet & False)
 
 
+class TestNestingSponge(unittest.TestCase):
+    def test_water_distance_and_weight(self):
+        from pygetm.nesting.sponge import sponge_weight, water_distance
+
+        wet = np.ones((5, 7), dtype=bool)
+        wet[:4, 3] = False  # a wall with a gap in the top row
+        source = np.zeros_like(wet)
+        source[:, 0] = True
+        d = water_distance(source, wet)
+        np.testing.assert_array_equal(d[:, 0], 0.0)
+        np.testing.assert_array_equal(d[0, :3], [0.0, 1.0, 2.0])
+        self.assertTrue(np.isinf(d[:4, 3]).all())
+        self.assertEqual(d[4, 3], 3.0)  # through the gap only
+        self.assertEqual(d[0, 4], 7.0)  # around the wall (3 + 4), not across it (4)
+        w = sponge_weight(d, 2.0)
+        np.testing.assert_allclose(w[0, :4], [0.0, 1.0, 0.5, 0.0])
+        self.assertEqual(w[0, 4], 0.0)
+        self.assertTrue((w[~wet] == 0.0).all())
+
+
 class TestNestingOperators(unittest.TestCase):
     def test_prolong_restrict(self):
         from pygetm.nesting.operators import prolong, restrict, limited_slopes
@@ -706,7 +726,7 @@ class TestNestingRuntime(unittest.TestCase):
 
 
 def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=True, children=True, active=None,
-                   time_ratio=None, dt_root=20.0, interface_comms=True):
+                   time_ratio=None, dt_root=20.0, interface_comms=True, **coupler_kwargs):
     """Closed basin, root (+ child), 2D barotropic; returns (volumes per
     output, gathered z of this level or None, level name, world)."""
     from pygetm.nesting import load_levels
@@ -747,7 +767,7 @@ def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=Tru
         return sim
 
     sim = nest.build_simulation(make_domain, make_sim)
-    cpl = NestedBarotropic(nest, sim)
+    cpl = NestedBarotropic(nest, sim, **coupler_kwargs)
     sim.add_coupler(cpl)
     lev = nest.level
     gj, gi = nest.global_indices()
@@ -791,6 +811,14 @@ class TestNestingBarotropic(unittest.TestCase):
         # child with the parent's time step (ratio 3 in space, 1 in time)
         nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
         vols, z, _, _ = run_barotropic(3, nroot, 120, time_ratio=1, dt_root=6.0)
+        self.assertLess(abs(vols[1] - vols[0]) / vols[0], 1e-13)
+        if z is not None:
+            self.assertTrue(np.isfinite(z[np.isfinite(z)]).all())
+
+    def test_volume_conserved_sponge(self):
+        # the sponge damps momentum only: volume stays conserved
+        nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
+        vols, z, _, _ = run_barotropic(3, nroot, 60, sponge_width=1.0, sponge_alpha=0.01)
         self.assertLess(abs(vols[1] - vols[0]) / vols[0], 1e-13)
         if z is not None:
             self.assertTrue(np.isfinite(z[np.isfinite(z)]).all())

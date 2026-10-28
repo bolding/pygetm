@@ -260,7 +260,7 @@ class NestedBarotropic(Coupler):
 
     def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False,
                  replace_transport=True, schedule="sync", ring_time="extrapolate", correct_late=False,
-                 edge_flux="child"):
+                 edge_flux="child", sponge_width=0.0, sponge_alpha=0.01):
         self.nest, self.sim = nest, sim
         self.lev = lev = nest.level
         self.t = nest.tile
@@ -285,6 +285,15 @@ class NestedBarotropic(Coupler):
         if edge_flux not in ("child", "parent"):
             raise ValueError(f"unknown edge_flux {edge_flux!r}")
         self.edge_flux = edge_flux
+        #: sponge (child levels; see :mod:`pygetm.nesting.sponge`): damping of
+        #: the transports over ``sponge_width`` parent cells next to the
+        #: interface (counted through water), with An dt / dx^2 =
+        #: ``sponge_alpha`` at the interface, decaying linearly inward. Added
+        #: to any An already set. 0 (default): no sponge. Needed for stability
+        #: with time_ratio > 1 and flux matching.
+        self.sponge_width, self.sponge_alpha = float(sponge_width), float(sponge_alpha)
+        if self.sponge_width < 0.0 or self.sponge_alpha < 0.0:
+            raise ValueError("sponge_width and sponge_alpha must be >= 0")
         #: "sync" (default): all models step at the same time and exchange at
         #: the end of every parent step; the child holds its ring from the
         #: parent's state at the last sync. "sequential" (old, for comparison):
@@ -574,7 +583,40 @@ class NestedBarotropic(Coupler):
 
     # --- Coupler hooks -------------------------------------------------------------
 
+    def _set_sponge(self, sim):
+        """Add the sponge to An and redo pyGETM's interpolation of An to the
+        U and V grids (momentum.start has done it before the couplers start;
+        the time step is known only now)."""
+        from .sponge import sponge_weight, water_distance
+
+        lev, T, mom = self.lev, sim.T, sim.momentum
+        # the level's wet cells including its band, on every process
+        gmask = T.mask.gather()
+        wet = self.nest.comm.bcast(None if gmask is None else np.asarray(gmask) != 0)
+        if wet.shape != lev.extended_shape:
+            raise ValueError(f"{lev.name}: gathered mask has shape {wet.shape}, expected {lev.extended_shape}")
+        dist = water_distance(lev._ring_mask() & wet, wet)
+        w_glob = sponge_weight(dist, self.sponge_width * lev.ratio)
+        gj, gi = self.nest.global_indices()
+        jj = np.clip(gj + lev.band, 0, wet.shape[0] - 1)
+        ii = np.clip(gi + lev.band, 0, wet.shape[1] - 1)
+        w = w_glob[np.ix_(jj, ii)] * self.wetmask
+        dx2 = np.minimum(T.dx.all_values, T.dy.all_values) ** 2
+        mom.An.all_values[...] += np.where(w > 0.0, self.sponge_alpha * dx2 / sim.timestep * w, 0.0)
+        mom.An_uu = mom.An.interp(mom.U.grid.ugrid.array(fill=np.nan))
+        mom.An_uv = mom.An.interp(mom.U.grid.vgrid.array(fill=np.nan))
+        mom.An_vu = mom.An.interp(mom.V.grid.ugrid.array(fill=np.nan))
+        mom.An_vv = mom.An.interp(mom.V.grid.vgrid.array(fill=np.nan))
+        # no damping where interpolated from masked cells (fill values)
+        for a in (mom.An_uu, mom.An_uv, mom.An_vu, mom.An_vv):
+            v = a.all_values
+            v[~np.isfinite(v) | (v < 0.0)] = 0.0
+        #: largest sponge An (m2 s-1) of this process (diagnostic)
+        self.sponge_max = float(mom.An.all_values[w > 0].max(initial=0.0))
+
     def on_start(self, sim):
+        if self.sponge_width > 0.0 and self.up is not None:
+            self._set_sponge(sim)
         if self.schedule == "sync":
             self._sync([None] * len(self.down), self.up is not None, fluxes=False)
             self.clock.reset()
