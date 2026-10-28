@@ -57,6 +57,33 @@ from . import operators as ops
 TAG_CORRECTED = 50
 
 
+class ExchangeClock:
+    """Wall-clock time of the nesting exchanges of one process, split into
+    waiting (blocked until the partner's message is there: MPI_Probe before
+    every receive, and the completion of sends) and transfer (the receive
+    itself)."""
+
+    def __init__(self):
+        self.wait = 0.0
+        self.transfer = 0.0
+
+    def recv(self, comm, buf, source: int, tag: int):
+        t0 = MPI.Wtime()
+        comm.Probe(source=source, tag=tag)
+        t1 = MPI.Wtime()
+        comm.Recv(buf, source=source, tag=tag)
+        self.wait += t1 - t0
+        self.transfer += MPI.Wtime() - t1
+
+    def waitall(self, reqs):
+        t0 = MPI.Wtime()
+        MPI.Request.Waitall(reqs)
+        self.wait += MPI.Wtime() - t0
+
+    def reset(self):
+        self.wait = self.transfer = 0.0
+
+
 class PointTransfer:
     """Weighted transfer from points of one level to points of another, on
     their tilings: value(dst n) = sum_k w[n, k] * value(src[n, k]). Points
@@ -101,14 +128,17 @@ class PointTransfer:
                 reqs.append(world.Isend(buf, dest=self.dst_off + t, tag=self.tag))
         return reqs
 
-    def recv(self, world, me: int) -> np.ndarray:
+    def recv(self, world, me: int, clock: Optional[ExchangeClock] = None) -> np.ndarray:
         """Destination side: weighted values at this tile's points."""
         dj, di, w = self.dst_of.get(me, (np.zeros(0, int),) * 2 + (np.zeros((0, self.K)),))
         vals = np.zeros((dj.size, self.K))
         for (p, t), (pos, k, sj, _) in sorted(self.pairs.items()):
             if t == me:
                 buf = np.empty(sj.size)
-                world.Recv(buf, source=self.src_off + p, tag=self.tag)
+                if clock is None:
+                    world.Recv(buf, source=self.src_off + p, tag=self.tag)
+                else:
+                    clock.recv(world, buf, self.src_off + p, self.tag)
                 vals[pos, k] = buf
         out = np.zeros(dj.size)
         for kk in range(self.K):
@@ -268,6 +298,11 @@ class NestedBarotropic(Coupler):
         #: and the elapsed time since the end of on_start
         self.t_sync = 0.0
         self._t_start = None
+        #: waiting and transfer within the syncs (MPI calls of the exchanges)
+        self.clock = ExchangeClock()
+        #: time in the coupler's own work during the model step (ring values,
+        #: window volumes, edge registers)
+        self.t_stage = 0.0
         #: largest elevation correction (m) by flux matching so far (diagnostic)
         self.max_correction = 0.0
         self.max_correction_info = None
@@ -294,11 +329,11 @@ class NestedBarotropic(Coupler):
         parts = []
         for p, v in self._ring:
             buf = np.empty((3, v[2].size))
-            self.up.comm.Recv(buf, source=self.up.poff + p, tag=self.up.tag_p)
+            self.clock.recv(self.up.comm, buf, self.up.poff + p, self.up.tag_p)
             parts.append(buf)
         z = np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
-        u = self.up_faces["ring_x"].recv(self.up.comm, self.t)
-        v = self.up_faces["ring_y"].recv(self.up.comm, self.t)
+        u = self.up_faces["ring_x"].recv(self.up.comm, self.t, self.clock)
+        v = self.up_faces["ring_y"].recv(self.up.comm, self.t, self.clock)
         return z, u, v
 
     def _set_ring_z(self, snap):
@@ -332,7 +367,7 @@ class NestedBarotropic(Coupler):
                     vals = np.ascontiguousarray(self.reg[fk])
                     reqs.append(self.up.comm.Isend(vals, dest=self.up.poff + p, tag=self.up.tag_f))
             self.reg = np.zeros_like(self.reg)
-        MPI.Request.Waitall(reqs)
+        self.clock.waitall(reqs)
 
     def _own_edge_fluxes(self):
         e = self.lev.edge
@@ -370,7 +405,7 @@ class NestedBarotropic(Coupler):
             for (tt, p), (k, a, b, _, _) in plan.res.items():
                 if p == self.t:
                     buf = np.empty((2, k.size))
-                    plan.comm.Recv(buf, source=plan.coff + tt, tag=plan.tag_r)
+                    self.clock.recv(plan.comm, buf, plan.coff + tt, plan.tag_r)
                     blk[k, a, b] = buf[0]
                     wgt[k, a, b] = buf[1]
             if not self.break_rim:
@@ -381,8 +416,8 @@ class NestedBarotropic(Coupler):
                 ok = np.isfinite(vals)
                 self.z.all_values[jj[ok], ii[ok]] = vals[ok]
         # rim U, V (mean over child faces)
-        u = faces["rim_x"].recv(plan.comm, self.t)
-        v = faces["rim_y"].recv(plan.comm, self.t)
+        u = faces["rim_x"].recv(plan.comm, self.t, self.clock)
+        v = faces["rim_y"].recv(plan.comm, self.t, self.clock)
         if not self.break_rim:
             self.U.all_values[self.loc(*faces["rim_x"].points(self.t))] = u
             self.V.all_values[self.loc(*faces["rim_y"].points(self.t))] = v
@@ -397,7 +432,7 @@ class NestedBarotropic(Coupler):
         for (tt, p), (fpos, fa, _) in sorted(plan.flx.items()):
             if p == self.t:
                 buf = np.empty(fpos.size)
-                plan.comm.Recv(buf, source=plan.coff + tt, tag=plan.tag_f)
+                self.clock.recv(plan.comm, buf, plan.coff + tt, plan.tag_f)
                 sub[fpos, fa] = buf
         fc = ops.face_sum(sub)
         wf = self.lev.wfaces[plan.child.name]
@@ -439,7 +474,7 @@ class NestedBarotropic(Coupler):
         reqs = []
         for plan, faces in zip(self.down, self.down_faces):
             reqs += self._send_snapshot(plan, faces)
-        MPI.Request.Waitall(reqs)
+        self.clock.waitall(reqs)
         for plan, faces, fp in zip(self.down, self.down_faces, fps):
             self._recv_child(plan, faces, fp)
         self.z.update_halos()
@@ -449,7 +484,7 @@ class NestedBarotropic(Coupler):
             reqs = []
             for plan in self.down:
                 reqs += self._send_corrected_z(plan)
-            MPI.Request.Waitall(reqs)
+            self.clock.waitall(reqs)
 
     def _sync(self, fps, with_parent: bool, fluxes: bool):
         """One sync point (schedule "sync"), in an order without cycles over
@@ -478,13 +513,14 @@ class NestedBarotropic(Coupler):
         reqs = []
         for plan, faces in zip(self.down, self.down_faces):
             reqs += self._send_snapshot(plan, faces)
-        MPI.Request.Waitall(reqs)
+        self.clock.waitall(reqs)
 
     # --- Coupler hooks -------------------------------------------------------------
 
     def on_start(self, sim):
         if self.schedule == "sync":
             self._sync([None] * len(self.down), self.up is not None, fluxes=False)
+            self.clock.reset()
             self._t_start = MPI.Wtime()
             return
         if self.up is not None:
@@ -501,6 +537,12 @@ class NestedBarotropic(Coupler):
             self._new = self._recv_snapshot()
 
     def on_stage(self, sim, stage, macro_active):
+        t0 = MPI.Wtime()
+        self._on_stage(sim, stage, macro_active)
+        if self._t_start is not None:
+            self.t_stage += MPI.Wtime() - t0
+
+    def _on_stage(self, sim, stage, macro_active):
         r = self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
         if self.schedule == "sync":
@@ -538,7 +580,7 @@ class NestedBarotropic(Coupler):
         parts = []
         for p, v in self._ring:
             buf = np.empty((3, v[2].size))
-            self.up.comm.Recv(buf, source=self.up.poff + p, tag=self.up.tag_p + TAG_CORRECTED)
+            self.clock.recv(self.up.comm, buf, self.up.poff + p, self.up.tag_p + TAG_CORRECTED)
             parts.append(buf)
         return np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
 
@@ -561,12 +603,24 @@ class NestedBarotropic(Coupler):
         self._k += 1
 
     def timing(self) -> dict:
-        """Wall-clock monitoring of this process since the start: elapsed
-        time, time in the syncs (waiting for parent/children + exchange) and
-        its fraction (schedule "sync")."""
+        """Wall-clock monitoring of this process since the start (seconds):
+
+        * ``elapsed``;
+        * ``compute``: the model's own step (elapsed - sync - stage);
+        * ``work``: the nesting's own computations (restriction, flux
+          matching, ring values; sync - wait - transfer + stage);
+        * ``transfer``: receiving the exchanged data;
+        * ``wait``: blocked until a partner's data is there (idle);
+        * ``sync``: all time in the syncs (wait + transfer + part of work);
+        * ``idle``: wait / elapsed.
+
+        Schedule "sync"; ``wait`` and ``transfer`` exclude the initial sync."""
         elapsed = MPI.Wtime() - self._t_start if self._t_start is not None else 0.0
+        wait, transfer = self.clock.wait, self.clock.transfer
+        work = max(self.t_sync - wait - transfer, 0.0) + self.t_stage
         return dict(level=self.lev.name, tile=self.t, elapsed=elapsed, sync=self.t_sync,
-                    idle=self.t_sync / elapsed if elapsed > 0 else 0.0)
+                    compute=max(elapsed - self.t_sync - self.t_stage, 0.0), work=work,
+                    transfer=transfer, wait=wait, idle=wait / elapsed if elapsed > 0 else 0.0)
 
     def describe(self) -> List[str]:
         """Messages of the U/V transfers of this process."""
