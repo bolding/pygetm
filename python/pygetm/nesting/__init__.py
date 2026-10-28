@@ -9,7 +9,8 @@ This package currently provides:
 
 * :mod:`pygetm.nesting.exchange`: planning and execution of MPI exchanges of
   rectangular strips between independently decomposed parent and child domains
-* :func:`split_world`: division of the MPI processes over the domains
+* :func:`split_world`: division of the MPI processes over the domains;
+  :func:`split_mpmd` for an MPMD launch (one ``mpiexec`` component per domain)
 * :mod:`pygetm.nesting.halo`: :class:`CellSet`, generic gather/scatter/pack of
   any 2D or 3D array at a fixed set of cells; :func:`outer_halo` (the child's
   ring outside its global domain) and :func:`hole_rim` (the parent's cells
@@ -45,7 +46,7 @@ pyGETM's halo exchange has no neighbour and does nothing, so the values this
 package writes there are kept.
 """
 
-from .hierarchy import NestingContext, split_world
+from .hierarchy import NestingContext, split_world, split_mpmd, mpmd_blocks
 from .halo import CellSet, outer_halo, hole_rim
 from .variables import ExchangeGroup, EXCHANGE_GROUPS
 from .geometry import Level, active_region, load_levels
@@ -54,6 +55,8 @@ from .plan import LevelTiling, Plan
 __all__ = [
     "NestingContext",
     "split_world",
+    "split_mpmd",
+    "mpmd_blocks",
     "CellSet",
     "outer_halo",
     "hole_rim",

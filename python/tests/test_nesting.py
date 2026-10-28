@@ -69,6 +69,25 @@ class TestSplitWorld(unittest.TestCase):
         with self.assertRaises(ValueError):
             split_world({"root": world.size + 1})
 
+    def test_mpmd_blocks(self):
+        from pygetm.nesting import mpmd_blocks
+
+        e = [("root", 0), ("root", 0), ("child", 1), ("gc", 2), ("gc", 2)]
+        self.assertEqual(mpmd_blocks(e), {"root": (0, 2), "child": (2, 1), "gc": (3, 2)})
+        self.assertEqual(mpmd_blocks([("root", -1)] * 3), {"root": (0, 3)})
+        with self.assertRaises(ValueError):  # two domains in one component
+            mpmd_blocks([("root", 0), ("child", 0)])
+        with self.assertRaises(ValueError):  # one domain in two components
+            mpmd_blocks([("root", 0), ("child", 1), ("root", 2)])
+
+    def test_split_mpmd(self):
+        # a plain (non-MPMD) launch: every process names the same domain
+        from pygetm.nesting import split_mpmd
+
+        world = parallel.MPI.COMM_WORLD
+        ctx = split_mpmd("root")
+        self.assertEqual((ctx.name, ctx.comm.size, ctx.sizes), ("root", world.size, {"root": world.size}))
+
 
 class RecordingCoupler(Coupler):
     def __init__(self):
