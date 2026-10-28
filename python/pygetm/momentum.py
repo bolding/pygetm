@@ -831,12 +831,14 @@ class Momentum:
         )
 
         if self.An_uu is not None:
-            # Numerical damping of transports
+            # Numerical damping of transports. dampU/dampV are tendencies
+            # (advance_2d_transport multiplies them by the time step), so the
+            # increment of horizontal_diffusion is taken for a unit time step
             pygetm._pygetm.horizontal_diffusion(
-                self.U, self.An_uu, self.An_uv, timestep, self.dampU
+                self.U, self.An_uu, self.An_uv, 1.0, self.dampU
             )
             pygetm._pygetm.horizontal_diffusion(
-                self.V, self.An_vu, self.An_vv, timestep, self.dampV
+                self.V, self.An_vu, self.An_vv, 1.0, self.dampV
             )
 
     def advance(
