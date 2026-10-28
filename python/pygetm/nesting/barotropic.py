@@ -64,8 +64,13 @@ class PointTransfer:
     the owner of a point is the owner of its T cell. Sums are formed in a
     fixed order (k), so results do not depend on the decomposition."""
 
-    def __init__(self, src_til: LevelTiling, dst_til: LevelTiling, dst, src, weights, tag: int, label: str):
+    def __init__(self, src_til: LevelTiling, dst_til: LevelTiling, dst, src, weights, tag: int, label: str,
+                 src_off: Optional[int] = None, dst_off: Optional[int] = None):
         dj, di = (np.asarray(x) for x in dst)
+        #: ranks of tile 0 of source and destination on the exchange
+        #: communicator (default: the tilings' offsets on the shared one)
+        self.src_off = src_til.offset if src_off is None else src_off
+        self.dst_off = dst_til.offset if dst_off is None else dst_off
         sj, si = (np.asarray(x) for x in src)
         w = np.asarray(weights, dtype=float)
         self.src_til, self.dst_til, self.tag, self.label = src_til, dst_til, tag, label
@@ -93,7 +98,7 @@ class PointTransfer:
         for (p, t), (_, _, sj, si) in self.pairs.items():
             if p == me:
                 buf = np.ascontiguousarray(values[loc(sj, si)])
-                reqs.append(world.Isend(buf, dest=self.dst_til.offset + t, tag=self.tag))
+                reqs.append(world.Isend(buf, dest=self.dst_off + t, tag=self.tag))
         return reqs
 
     def recv(self, world, me: int) -> np.ndarray:
@@ -103,7 +108,7 @@ class PointTransfer:
         for (p, t), (pos, k, sj, _) in sorted(self.pairs.items()):
             if t == me:
                 buf = np.empty(sj.size)
-                world.Recv(buf, source=self.src_til.offset + p, tag=self.tag)
+                world.Recv(buf, source=self.src_off + p, tag=self.tag)
                 vals[pos, k] = buf
         out = np.zeros(dj.size)
         for kk in range(self.K):
@@ -190,14 +195,16 @@ def rim_faces(child: Level, axis: str):
     return (pj, pf), (src_j, src_i), weights
 
 
-def face_transfers(child: Level, ptil: LevelTiling, ctil: LevelTiling, link: int, tag_base: int = 600):
-    """U/V ring (parent -> child) and rim (child -> parent) transfers."""
+def face_transfers(child: Level, plan, link: int, tag_base: int = 600):
+    """U/V ring (parent -> child) and rim (child -> parent) transfers of the
+    interface of *plan* (on ``plan.comm``)."""
+    ptil, ctil, po, co = plan.ptil, plan.ctil, plan.poff, plan.coff
     out = {}
     for n, axis in enumerate("xy"):
         dst, src, w = ring_faces(child, axis)
-        out[f"ring_{axis}"] = PointTransfer(ptil, ctil, dst, src, w, tag_base + 4 * link + n, "UV"[n] + "r")
+        out[f"ring_{axis}"] = PointTransfer(ptil, ctil, dst, src, w, tag_base + 4 * link + n, "UV"[n] + "r", po, co)
         dst, src, w = rim_faces(child, axis)
-        out[f"rim_{axis}"] = PointTransfer(ctil, ptil, dst, src, w, tag_base + 4 * link + 2 + n, "UV"[n] + "R")
+        out[f"rim_{axis}"] = PointTransfer(ctil, ptil, dst, src, w, tag_base + 4 * link + 2 + n, "UV"[n] + "R", co, po)
     return out
 
 
@@ -242,8 +249,8 @@ class NestedBarotropic(Coupler):
         links = {c.name: k for k, c in enumerate(nest.levels[1:])}
         self.up_faces = None
         if lev.parent is not None:
-            self.up_faces = face_transfers(lev, nest.tilings[lev.parent.name], self.til, links[lev.name])
-        self.down_faces = [face_transfers(c, self.til, nest.tilings[c.name], links[c.name]) for c in lev.children]
+            self.up_faces = face_transfers(lev, self.up, links[lev.name])
+        self.down_faces = [face_transfers(c, plan, links[c.name]) for c, plan in zip(lev.children, self.down)]
         self.reg = np.zeros(lev.edge["is_x"].size)
         self.own_edge = self.til.owner(*lev.edge["inner"]) == self.t
         if self.up is not None:
@@ -287,11 +294,11 @@ class NestedBarotropic(Coupler):
         parts = []
         for p, v in self._ring:
             buf = np.empty((3, v[2].size))
-            self.world.Recv(buf, source=self.up.ptil.offset + p, tag=self.up.tag_p)
+            self.up.comm.Recv(buf, source=self.up.poff + p, tag=self.up.tag_p)
             parts.append(buf)
         z = np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
-        u = self.up_faces["ring_x"].recv(self.world, self.t)
-        v = self.up_faces["ring_y"].recv(self.world, self.t)
+        u = self.up_faces["ring_x"].recv(self.up.comm, self.t)
+        v = self.up_faces["ring_y"].recv(self.up.comm, self.t)
         return z, u, v
 
     def _set_ring_z(self, snap):
@@ -316,14 +323,14 @@ class NestedBarotropic(Coupler):
                 jj, ii = self.loc(cj, ci)
                 weight = np.where(self.wetmask[jj, ii], self.area[jj, ii], 0.0)
                 buf = np.ascontiguousarray(np.stack([np.where(weight > 0, z[jj, ii], 0.0), weight]))
-                reqs.append(self.world.Isend(buf, dest=self.up.ptil.offset + p, tag=self.up.tag_r))
-        reqs += self.up_faces["rim_x"].send(self.world, self.t, self.U.all_values, self.loc)
-        reqs += self.up_faces["rim_y"].send(self.world, self.t, self.V.all_values, self.loc)
+                reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=self.up.tag_r))
+        reqs += self.up_faces["rim_x"].send(self.up.comm, self.t, self.U.all_values, self.loc)
+        reqs += self.up_faces["rim_y"].send(self.up.comm, self.t, self.V.all_values, self.loc)
         if fluxes:
             for (tt, p), (_, _, fk) in self.up.flx.items():
                 if tt == self.t:
                     vals = np.ascontiguousarray(self.reg[fk])
-                    reqs.append(self.world.Isend(vals, dest=self.up.ptil.offset + p, tag=self.up.tag_f))
+                    reqs.append(self.up.comm.Isend(vals, dest=self.up.poff + p, tag=self.up.tag_f))
             self.reg = np.zeros_like(self.reg)
         MPI.Request.Waitall(reqs)
 
@@ -343,9 +350,9 @@ class NestedBarotropic(Coupler):
             if p == self.t:
                 jj, ii = self.loc(pj, pi)
                 buf = np.ascontiguousarray(np.stack([z[jj, ii], sx[jj, ii], sy[jj, ii]]))
-                reqs.append(self.world.Isend(buf, dest=plan.ctil.offset + tt, tag=plan.tag_p))
-        reqs += faces["ring_x"].send(self.world, self.t, self.U.all_values, self.loc)
-        reqs += faces["ring_y"].send(self.world, self.t, self.V.all_values, self.loc)
+                reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=plan.tag_p))
+        reqs += faces["ring_x"].send(plan.comm, self.t, self.U.all_values, self.loc)
+        reqs += faces["ring_y"].send(plan.comm, self.t, self.V.all_values, self.loc)
         return reqs
 
     def _window_volumes(self, plan):
@@ -363,7 +370,7 @@ class NestedBarotropic(Coupler):
             for (tt, p), (k, a, b, _, _) in plan.res.items():
                 if p == self.t:
                     buf = np.empty((2, k.size))
-                    self.world.Recv(buf, source=plan.ctil.offset + tt, tag=plan.tag_r)
+                    plan.comm.Recv(buf, source=plan.coff + tt, tag=plan.tag_r)
                     blk[k, a, b] = buf[0]
                     wgt[k, a, b] = buf[1]
             if not self.break_rim:
@@ -374,8 +381,8 @@ class NestedBarotropic(Coupler):
                 ok = np.isfinite(vals)
                 self.z.all_values[jj[ok], ii[ok]] = vals[ok]
         # rim U, V (mean over child faces)
-        u = faces["rim_x"].recv(self.world, self.t)
-        v = faces["rim_y"].recv(self.world, self.t)
+        u = faces["rim_x"].recv(plan.comm, self.t)
+        v = faces["rim_y"].recv(plan.comm, self.t)
         if not self.break_rim:
             self.U.all_values[self.loc(*faces["rim_x"].points(self.t))] = u
             self.V.all_values[self.loc(*faces["rim_y"].points(self.t))] = v
@@ -390,7 +397,7 @@ class NestedBarotropic(Coupler):
         for (tt, p), (fpos, fa, _) in sorted(plan.flx.items()):
             if p == self.t:
                 buf = np.empty(fpos.size)
-                self.world.Recv(buf, source=plan.ctil.offset + tt, tag=plan.tag_f)
+                plan.comm.Recv(buf, source=plan.coff + tt, tag=plan.tag_f)
                 sub[fpos, fa] = buf
         fc = ops.face_sum(sub)
         wf = self.lev.wfaces[plan.child.name]
@@ -425,7 +432,7 @@ class NestedBarotropic(Coupler):
             if p == self.t:
                 jj, ii = self.loc(pj, pi)
                 buf = np.ascontiguousarray(np.stack([z[jj, ii], sx[jj, ii], sy[jj, ii]]))
-                reqs.append(self.world.Isend(buf, dest=plan.ctil.offset + tt, tag=plan.tag_p + TAG_CORRECTED))
+                reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=plan.tag_p + TAG_CORRECTED))
         return reqs
 
     def _couple_down(self, fps):
@@ -531,7 +538,7 @@ class NestedBarotropic(Coupler):
         parts = []
         for p, v in self._ring:
             buf = np.empty((3, v[2].size))
-            self.world.Recv(buf, source=self.up.ptil.offset + p, tag=self.up.tag_p + TAG_CORRECTED)
+            self.up.comm.Recv(buf, source=self.up.poff + p, tag=self.up.tag_p + TAG_CORRECTED)
             parts.append(buf)
         return np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
 

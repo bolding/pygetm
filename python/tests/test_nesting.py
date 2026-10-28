@@ -692,7 +692,7 @@ class TestNestingRuntime(unittest.TestCase):
 
 
 def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=True, children=True, active=None,
-                   time_ratio=None, dt_root=20.0):
+                   time_ratio=None, dt_root=20.0, interface_comms=True):
     """Closed basin, root (+ child), 2D barotropic; returns (volumes per
     output, gathered z of this level or None, level name, world)."""
     from pygetm.nesting import load_levels
@@ -709,7 +709,7 @@ def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=Tru
     levels = load_levels(cfg, root_band=0)
     world = parallel.MPI.COMM_WORLD
     ranks = {"root": nroot, "child": world.size - nroot} if children else {"root": world.size}
-    nest = NestingRun(levels, ranks)
+    nest = NestingRun(levels, ranks, interface_comms=interface_comms)
 
     def make_domain(lev, comm):
         lon, lat = lev.edges()
@@ -791,6 +791,15 @@ class TestNestingBarotropic(unittest.TestCase):
         })
         self.assertEqual([l.steps_per_root for l in levels], [1, 1, 4])
         self.assertEqual(levels[2].time_ratio, 4)
+
+    def test_interface_comms_identical(self):
+        # exchanges on per-interface communicators give the same result as
+        # on the shared nesting communicator, bit for bit
+        nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
+        _, z1, _, _ = run_barotropic(3, nroot, 30, interface_comms=True)
+        _, z0, _, _ = run_barotropic(3, nroot, 30, interface_comms=False)
+        if z1 is not None:
+            self.assertTrue(np.array_equal(z1, z0, equal_nan=True))
 
     def test_lake_at_rest(self):
         nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2

@@ -68,12 +68,17 @@ class NestingRun:
     exception on any process aborts all levels (:func:`install_abort_hook`)."""
 
     def __init__(self, levels: List[Level], ranks: Mapping[str, int], comm: Optional[MPI.Comm] = None,
-                 abort_on_error: bool = True):
+                 abort_on_error: bool = True, interface_comms: bool = True):
         self.levels = levels
         ctx = split_world({l.name: int(ranks[l.name]) for l in levels}, comm=comm)
         self.world = ctx.nesting_comm
         self.comm = ctx.comm
         self.offsets = ctx.offsets
+        self.sizes = ctx.sizes
+        #: exchanges between a parent and a child on a communicator of their
+        #: own (the parent's processes, then the child's); False: on the
+        #: shared nesting communicator (as before, for comparison)
+        self.interface_comms = interface_comms
         self.level = next(l for l in levels if l.name == ctx.name)
         if abort_on_error:
             install_abort_hook(self.world, self.level.name)
@@ -141,7 +146,32 @@ class NestingRun:
         if lev.parent is not None:
             self.up = Plan(lev, self.tilings[lev.parent.name], til, links[lev.name])
         self.down = [Plan(c, til, self.tilings[c.name], links[c.name]) for c in lev.children]
+        self._interface_comms()
         return self.grid
+
+    def _interface_comms(self):
+        """Give every plan of this process the communicator of its interface
+        (``plan.comm``) and the ranks of the parent's and the child's tile 0
+        in it (``plan.poff``, ``plan.coff``). Interfaces are created in the
+        same (layout) order on all processes; each creation is collective
+        over that interface's processes only."""
+        lev = self.level
+        if not self.interface_comms:
+            for plan in ([self.up] if self.up is not None else []) + self.down:
+                plan.comm, plan.poff, plan.coff = self.world, plan.ptil.offset, plan.ctil.offset
+            return
+        group = self.world.Get_group()
+        block = lambda name: list(range(self.offsets[name], self.offsets[name] + self.sizes[name]))
+        for k, child in enumerate(self.levels[1:]):
+            par = child.parent
+            if lev is not par and lev is not child:
+                continue
+            g = group.Incl(block(par.name) + block(child.name))
+            comm = self.world.Create_group(g, tag=k)
+            g.Free()
+            plan = self.up if lev is child else self.down[lev.children.index(child)]
+            plan.comm, plan.poff, plan.coff = comm, 0, self.sizes[par.name]
+        group.Free()
 
     @property
     def tile(self) -> Optional[int]:
@@ -242,7 +272,7 @@ class NestedTracer:
         parts = []
         for p, v in self._ring:
             buf = np.empty((3, v[2].size))
-            self.world.Recv(buf, source=self.up.ptil.offset + p, tag=self.up.tag_p)
+            self.up.comm.Recv(buf, source=self.up.poff + p, tag=self.up.tag_p)
             parts.append(buf)
         return np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
 
@@ -263,7 +293,7 @@ class NestedTracer:
             if p == self.t:
                 jj, ii = self.loc(pj, pi)
                 buf = np.ascontiguousarray(np.stack([f[jj, ii], sx[jj, ii], sy[jj, ii]]))
-                reqs.append(self.world.Isend(buf, dest=plan.ctil.offset + tt, tag=plan.tag_p))
+                reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=plan.tag_p))
         MPI.Request.Waitall(reqs)
 
     def _recv_restriction(self, plan):
@@ -277,7 +307,7 @@ class NestedTracer:
         for (tt, p), (k, a, b, _, _) in plan.res.items():
             if p == self.t:
                 buf = np.empty((2, k.size))
-                self.world.Recv(buf, source=plan.ctil.offset + tt, tag=plan.tag_r)
+                plan.comm.Recv(buf, source=plan.coff + tt, tag=plan.tag_r)
                 blk[k, a, b] = buf[0]
                 wgt[k, a, b] = buf[1]
         if self.break_rim:
@@ -304,7 +334,7 @@ class NestedTracer:
         for (tt, p), (fpos, fa, _) in sorted(plan.flx.items()):
             if p == self.t:
                 buf = np.empty(fpos.size)
-                self.world.Recv(buf, source=plan.ctil.offset + tt, tag=plan.tag_f)
+                plan.comm.Recv(buf, source=plan.coff + tt, tag=plan.tag_f)
                 sub[fpos, fa] = buf
         fc = ops.face_sum(sub)
         wf = self.lev.wfaces[plan.child.name]
@@ -335,12 +365,12 @@ class NestedTracer:
                 jj, ii = self.loc(cj, ci)
                 weight = np.where(self.wetmask[jj, ii], self.content[jj, ii], 0.0)
                 buf = np.ascontiguousarray(np.stack([np.where(weight > 0, f[jj, ii], 0.0), weight]))
-                reqs.append(self.world.Isend(buf, dest=self.up.ptil.offset + p, tag=self.up.tag_r))
+                reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=self.up.tag_r))
         if fluxes:
             for (tt, p), (_, _, fk) in self.up.flx.items():
                 if tt == self.t:
                     vals = np.ascontiguousarray(self.reg[fk])
-                    reqs.append(self.world.Isend(vals, dest=self.up.ptil.offset + p, tag=self.up.tag_f))
+                    reqs.append(self.up.comm.Isend(vals, dest=self.up.poff + p, tag=self.up.tag_f))
             self.reg = np.zeros_like(self.reg)
         MPI.Request.Waitall(reqs)
 
