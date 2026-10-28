@@ -243,7 +243,7 @@ class NestedBarotropic(Coupler):
     parent and children (see module documentation)."""
 
     def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False,
-                 replace_transport=True, schedule="sync", ring_time="extrapolate"):
+                 replace_transport=True, schedule="sync", ring_time="extrapolate", correct_late=False):
         self.nest, self.sim = nest, sim
         self.lev = lev = nest.level
         self.t = nest.tile
@@ -254,6 +254,11 @@ class NestedBarotropic(Coupler):
         #: after flux matching, set the parent's transport at each window face
         #: to the child's mean transport (stabilises the coupling in deep water)
         self.replace_transport = replace_transport
+        #: experimental (schedule "sync"): apply the flux-matching correction
+        #: after the snapshot for the children has been sent, so the children
+        #: see each correction one sync later (volume is conserved either way)
+        self.correct_late = correct_late
+        self._pending = []
         #: "sync" (default): all models step at the same time and exchange at
         #: the end of every parent step; the child holds its ring from the
         #: parent's state at the last sync. "sequential" (old, for comparison):
@@ -444,13 +449,18 @@ class NestedBarotropic(Coupler):
             fpi, fci = fp[ins], fc[ins]
             dz = wf["sign"][m_in] * (fpi - fci) / self.area[oj, oi]
             if not self.break_flux:
-                np.add.at(self.z.all_values, (oj, oi), dz)
-                if self.replace_transport:
-                    # the parent continues from the child's mean transport
-                    fj, fi = self.loc(wf["face"][0][m_in], wf["face"][1][m_in])
-                    x = wf["is_x"][m_in]
-                    self.U.all_values[fj[x], fi[x]] = fci[x] / (self.dyu[fj[x], fi[x]] * self._dt())
-                    self.V.all_values[fj[~x], fi[~x]] = fci[~x] / (self.dxv[fj[~x], fi[~x]] * self._dt())
+                def apply(oj=oj, oi=oi, dz=dz, m_in=m_in, fci=fci):
+                    np.add.at(self.z.all_values, (oj, oi), dz)
+                    if self.replace_transport:
+                        # the parent continues from the child's mean transport
+                        fj, fi = self.loc(wf["face"][0][m_in], wf["face"][1][m_in])
+                        x = wf["is_x"][m_in]
+                        self.U.all_values[fj[x], fi[x]] = fci[x] / (self.dyu[fj[x], fi[x]] * self._dt())
+                        self.V.all_values[fj[~x], fi[~x]] = fci[~x] / (self.dxv[fj[~x], fi[~x]] * self._dt())
+                if self.correct_late and self.schedule == "sync":
+                    self._pending.append(apply)
+                else:
+                    apply()
             k = int(np.argmax(np.abs(dz)))
             if abs(dz[k]) > self.max_correction:  # diagnostic
                 m = m_in[k]
@@ -519,6 +529,13 @@ class NestedBarotropic(Coupler):
         for plan, faces in zip(self.down, self.down_faces):
             reqs += self._send_snapshot(plan, faces)
         self.clock.waitall(reqs)
+        if self._pending:  # correct_late: the corrections after the snapshot
+            for apply in self._pending:
+                apply()
+            self._pending = []
+            self.z.update_halos()
+            self.U.update_halos()
+            self.V.update_halos()
 
     # --- Coupler hooks -------------------------------------------------------------
 
