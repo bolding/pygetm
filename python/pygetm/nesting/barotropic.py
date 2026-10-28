@@ -225,9 +225,23 @@ def rim_faces(child: Level, axis: str):
     return (pj, pf), (src_j, src_i), weights
 
 
+def edge_faces(child: Level, axis: str):
+    """The child's edge faces (between its ring and its active region) of one
+    axis and the parent's interface face each lies on (weight 1: the same
+    transport per unit width on every sub-face)."""
+    e = child.edge
+    wf = child.parent.wfaces[child.name]
+    r = child.ratio
+    sel = e["is_x"] if axis == "x" else ~e["is_x"]
+    k = np.nonzero(sel)[0]
+    dst = (e["face"][0][k], e["face"][1][k])
+    src = (wf["face"][0][k // r][:, None], wf["face"][1][k // r][:, None])
+    return dst, src, np.ones((k.size, 1))
+
+
 def face_transfers(child: Level, plan, link: int, tag_base: int = 600):
-    """U/V ring (parent -> child) and rim (child -> parent) transfers of the
-    interface of *plan* (on ``plan.comm``)."""
+    """U/V ring (parent -> child), rim (child -> parent) and edge (parent ->
+    child) transfers of the interface of *plan* (on ``plan.comm``)."""
     ptil, ctil, po, co = plan.ptil, plan.ctil, plan.poff, plan.coff
     out = {}
     for n, axis in enumerate("xy"):
@@ -235,6 +249,8 @@ def face_transfers(child: Level, plan, link: int, tag_base: int = 600):
         out[f"ring_{axis}"] = PointTransfer(ptil, ctil, dst, src, w, tag_base + 4 * link + n, "UV"[n] + "r", po, co)
         dst, src, w = rim_faces(child, axis)
         out[f"rim_{axis}"] = PointTransfer(ctil, ptil, dst, src, w, tag_base + 4 * link + 2 + n, "UV"[n] + "R", co, po)
+        dst, src, w = edge_faces(child, axis)
+        out[f"edge_{axis}"] = PointTransfer(ptil, ctil, dst, src, w, tag_base + 200 + 2 * link + n, "UV"[n] + "e", po, co)
     return out
 
 
@@ -243,7 +259,8 @@ class NestedBarotropic(Coupler):
     parent and children (see module documentation)."""
 
     def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False,
-                 replace_transport=True, schedule="sync", ring_time="extrapolate", correct_late=False):
+                 replace_transport=True, schedule="sync", ring_time="extrapolate", correct_late=False,
+                 edge_flux="child"):
         self.nest, self.sim = nest, sim
         self.lev = lev = nest.level
         self.t = nest.tile
@@ -259,6 +276,15 @@ class NestedBarotropic(Coupler):
         #: see each correction one sync later (volume is conserved either way)
         self.correct_late = correct_late
         self._pending = []
+        #: transports through the child's edge faces (its interface with the
+        #: parent): "child" (computed by the child's momentum equation) or
+        #: "parent" (the parent's interface-face transport per unit width,
+        #: extrapolated in time like the ring U; the child's response then
+        #: cannot feed back into the flux mismatch - stable with sub-stepping,
+        #: see IDEAL/scripts/coupling1d.py in pygetm-nesting)
+        if edge_flux not in ("child", "parent"):
+            raise ValueError(f"unknown edge_flux {edge_flux!r}")
+        self.edge_flux = edge_flux
         #: "sync" (default): all models step at the same time and exchange at
         #: the end of every parent step; the child holds its ring from the
         #: parent's state at the last sync. "sequential" (old, for comparison):
@@ -296,6 +322,8 @@ class NestedBarotropic(Coupler):
             self._rj, self._ri = self.loc(cat(2), cat(3))
             self._ru = self.loc(*self.up_faces["ring_x"].points(self.t))
             self._rv = self.loc(*self.up_faces["ring_y"].points(self.t))
+            self._eu = self.loc(*self.up_faces["edge_x"].points(self.t))
+            self._ev = self.loc(*self.up_faces["edge_y"].points(self.t))
         self._k = 0
         self._fps = []
         #: wall-clock monitoring (seconds, this process): time in the syncs
@@ -339,7 +367,9 @@ class NestedBarotropic(Coupler):
         z = np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
         u = self.up_faces["ring_x"].recv(self.up.comm, self.t, self.clock)
         v = self.up_faces["ring_y"].recv(self.up.comm, self.t, self.clock)
-        return z, u, v
+        eu = self.up_faces["edge_x"].recv(self.up.comm, self.t, self.clock)
+        ev = self.up_faces["edge_y"].recv(self.up.comm, self.t, self.clock)
+        return z, u, v, eu, ev
 
     def _set_ring_z(self, snap):
         if not self.break_ring and self._rj.size:
@@ -348,10 +378,13 @@ class NestedBarotropic(Coupler):
             self.z.all_values[self._rj[keep], self._ri[keep]] = vals[keep]
         self.z.update_halos()
 
-    def _set_ring_uv(self, u, v):
+    def _set_ring_uv(self, u, v, eu=None, ev=None):
         if not self.break_ring:
             self.U.all_values[self._ru] = u
             self.V.all_values[self._rv] = v
+            if self.edge_flux == "parent" and eu is not None:
+                self.U.all_values[self._eu] = eu
+                self.V.all_values[self._ev] = ev
         self.U.update_halos()
         self.V.update_halos()
 
@@ -393,6 +426,8 @@ class NestedBarotropic(Coupler):
                 reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=plan.tag_p))
         reqs += faces["ring_x"].send(plan.comm, self.t, self.U.all_values, self.loc)
         reqs += faces["ring_y"].send(plan.comm, self.t, self.V.all_values, self.loc)
+        reqs += faces["edge_x"].send(plan.comm, self.t, self.U.all_values, self.loc)
+        reqs += faces["edge_y"].send(plan.comm, self.t, self.V.all_values, self.loc)
         return reqs
 
     def _window_volumes(self, plan):
@@ -574,10 +609,9 @@ class NestedBarotropic(Coupler):
             if stage == "transports_2d" and self.up is not None:
                 if ex:  # parent U at n-1/2 and n-3/2 -> child half step n + (k+1/2)/r
                     a = 1.0 + (k + 0.5) / r
-                    self._set_ring_uv(ops_interp(self._snap_old[1], self._snap[1], a),
-                                      ops_interp(self._snap_old[2], self._snap[2], a))
+                    self._set_ring_uv(*(ops_interp(self._snap_old[m], self._snap[m], a) for m in (1, 2, 3, 4)))
                 else:
-                    self._set_ring_uv(self._snap[1], self._snap[2])
+                    self._set_ring_uv(*self._snap[1:5])
             elif stage == "elevation":
                 if self.up is not None:
                     if ex:  # parent z at n and n-1 -> child time n + (k+1)/r
@@ -591,7 +625,7 @@ class NestedBarotropic(Coupler):
             # parent U lives at n-1/2 and n+1/2: interpolate up to n+1/2,
             # hold beyond (extrapolation is unstable in deep water)
             a = min((k + 0.5) / r + 0.5, 1.0)
-            self._set_ring_uv(ops_interp(self._prev[1], self._new[1], a), ops_interp(self._prev[2], self._new[2], a))
+            self._set_ring_uv(*(ops_interp(self._prev[m], self._new[m], a) for m in (1, 2, 3, 4)))
         elif stage == "elevation":
             if self.up is not None:
                 self._set_ring_z(ops_interp(self._prev[0], self._new[0], (k + 1) / r))
