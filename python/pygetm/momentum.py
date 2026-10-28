@@ -669,7 +669,9 @@ class Momentum:
             attrs=dict(
                 _require_halos=True,
                 _time_varying=False,
-                _valid_at=(CellType.BOUNDARY,),
+                # EXTERNAL: valid in cells set from outside (nesting), so the
+                # damping at faces next to them (a child's interface) is defined
+                _valid_at=(CellType.BOUNDARY, CellType.EXTERNAL),
             ),
         )
         self.An.fill(self._An_const)
