@@ -260,7 +260,7 @@ class NestedBarotropic(Coupler):
 
     def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False,
                  replace_transport=True, schedule="sync", ring_time="extrapolate", correct_late=False,
-                 edge_flux="child", sponge_width=0.0, sponge_alpha=0.01):
+                 edge_flux="child", sponge_width=0.0, sponge_alpha=0.1):
         self.nest, self.sim = nest, sim
         self.lev = lev = nest.level
         self.t = nest.tile

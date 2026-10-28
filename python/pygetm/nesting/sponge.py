@@ -10,8 +10,9 @@ side.
 With sub-stepping (``time_ratio`` > 1) and flux matching, short waves in the
 child are pumped by the loop "flux mismatch -> correction of the parent's
 outside cell -> the child's ring"; the sponge damps them. IDEAL (tidal,
-time_ratio 3, 48 h): stable with a width of 1 parent cell and
-alpha = An dt / dx^2 = 0.01; alpha >= 0.02 blows up.
+time_ratio 3, 48 h, width 1 parent cell): stable for alpha = An dt / dx^2
+from 0.03 to 0.2 with the same elevations to 1 mm; 0.02 and less grow, 0.3
+exceeds the explicit diffusion limit (0.25). Default 0.1.
 """
 
 import numpy as np
