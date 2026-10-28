@@ -345,13 +345,15 @@ class NestedTracer:
                 sub[fpos, fa] = buf
         fc = ops.face_sum(sub)
         wf = self.lev.wfaces[plan.child.name]
-        for n, m in enumerate(faces):
-            if wf["inside"][m]:
-                if not self.break_flux:
-                    oj, oi = self.loc(wf["out"][0][m], wf["out"][1][m])
-                    self.f.all_values[oj, oi] += wf["sign"][m] * (fp[n] - fc[n]) / self.content[oj, oi]
-            elif wf["up"][m] >= 0:
-                self.reg[wf["up"][m]] += fc[n]
+        # all faces at once; np.add.at adds in face order, as a loop would
+        ins = wf["inside"][faces]
+        m_in = faces[ins]
+        if m_in.size and not self.break_flux:
+            oj, oi = self.loc(wf["out"][0][m_in], wf["out"][1][m_in])
+            np.add.at(self.f.all_values, (oj, oi), wf["sign"][m_in] * (fp[ins] - fc[ins]) / self.content[oj, oi])
+        up = ~ins & (wf["up"][faces] >= 0)
+        if up.any():
+            np.add.at(self.reg, wf["up"][faces][up], fc[up])
 
     def _couple_down(self, fps):
         for plan in self.down:

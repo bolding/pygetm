@@ -436,25 +436,30 @@ class NestedBarotropic(Coupler):
                 sub[fpos, fa] = buf
         fc = ops.face_sum(sub)
         wf = self.lev.wfaces[plan.child.name]
-        for n, m in enumerate(flist):
-            if wf["inside"][m]:
-                oj, oi = self.loc(wf["out"][0][m], wf["out"][1][m])
-                dz = wf["sign"][m] * (fp[n] - fc[n]) / self.area[oj, oi]
-                if not self.break_flux:
-                    self.z.all_values[oj, oi] += dz
-                    if self.replace_transport:
-                        # the parent continues from the child's mean transport
-                        fj, fi = self.loc(wf["face"][0][m], wf["face"][1][m])
-                        if wf["is_x"][m]:
-                            self.U.all_values[fj, fi] = fc[n] / (self.dyu[fj, fi] * self._dt())
-                        else:
-                            self.V.all_values[fj, fi] = fc[n] / (self.dxv[fj, fi] * self._dt())
-                if abs(dz) > self.max_correction:  # diagnostic
-                    self.max_correction = abs(dz)
-                    face = (wf["face"][0][m], wf["face"][1][m])
-                    self.max_correction_info = (self._k, "U" if wf["is_x"][m] else "V", face, float(fp[n]), float(fc[n]), float(dz))
-            elif wf["up"][m] >= 0:
-                self.reg[wf["up"][m]] += fc[n]
+        # all faces at once; np.add.at adds in face order, as a loop would
+        ins = wf["inside"][flist]
+        m_in = flist[ins]
+        if m_in.size:
+            oj, oi = self.loc(wf["out"][0][m_in], wf["out"][1][m_in])
+            fpi, fci = fp[ins], fc[ins]
+            dz = wf["sign"][m_in] * (fpi - fci) / self.area[oj, oi]
+            if not self.break_flux:
+                np.add.at(self.z.all_values, (oj, oi), dz)
+                if self.replace_transport:
+                    # the parent continues from the child's mean transport
+                    fj, fi = self.loc(wf["face"][0][m_in], wf["face"][1][m_in])
+                    x = wf["is_x"][m_in]
+                    self.U.all_values[fj[x], fi[x]] = fci[x] / (self.dyu[fj[x], fi[x]] * self._dt())
+                    self.V.all_values[fj[~x], fi[~x]] = fci[~x] / (self.dxv[fj[~x], fi[~x]] * self._dt())
+            k = int(np.argmax(np.abs(dz)))
+            if abs(dz[k]) > self.max_correction:  # diagnostic
+                m = m_in[k]
+                self.max_correction = abs(dz[k])
+                face = (wf["face"][0][m], wf["face"][1][m])
+                self.max_correction_info = (self._k, "U" if wf["is_x"][m] else "V", face, float(fpi[k]), float(fci[k]), float(dz[k]))
+        up = ~ins & (wf["up"][flist] >= 0)
+        if up.any():
+            np.add.at(self.reg, wf["up"][flist][up], fc[up])
 
     def _send_corrected_z(self, plan):
         """After the volume correction: the corrected z (with slopes) at the
