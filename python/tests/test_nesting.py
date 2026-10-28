@@ -877,5 +877,43 @@ class TestCoupler(unittest.TestCase):
         self.assertEqual(coupler.calls, expected)
 
 
+class TestNestingMPMD(unittest.TestCase):
+    """MPMD launch (one mpiexec component per level, NestedModel) against the
+    single-program NestingRun: identical z on both levels. Starts mpiexec
+    itself, so it runs only in a serial test session."""
+
+    def test_mpmd_equals_single_program(self):
+        import os
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        if parallel.MPI.COMM_WORLD.size > 1:
+            self.skipTest("starts its own mpiexec; run serially")
+        mpiexec = shutil.which("mpiexec")
+        if mpiexec is None:
+            self.skipTest("no mpiexec")
+        case = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nesting_mpmd_case.py")
+        env = dict(os.environ)
+        for k in list(env):  # a fresh MPI launch, not this process's singleton
+            if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
+                env.pop(k)
+        with tempfile.TemporaryDirectory() as out:
+            py = sys.executable
+            cmds = (
+                [mpiexec, "-n", "2", py, case, "mpmd", "root", out, ":", "-n", "1", py, case, "mpmd", "child", out],
+                [mpiexec, "-n", "3", py, case, "single", "-", out],
+            )
+            for cmd in cmds:
+                r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            for name in ("root", "child"):
+                a = np.load(os.path.join(out, f"mpmd_{name}.npy"))
+                b = np.load(os.path.join(out, f"single_{name}.npy"))
+                self.assertTrue(np.isfinite(a).any())
+                self.assertTrue(np.array_equal(a, b, equal_nan=True), name)
+
+
 if __name__ == "__main__":
     unittest.main()

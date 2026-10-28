@@ -24,6 +24,8 @@ This package currently provides:
 * :mod:`pygetm.nesting.masks`: child-led land/sea consistency between levels
 * :mod:`pygetm.nesting.operators`: conservative transfer operators (limited
   linear prolongation, weighted restriction, face sums for flux matching)
+* :mod:`pygetm.nesting.model`: :class:`NestedModel`, one model of a run
+  launched with one ``mpiexec`` component per level (MPMD)
 * :mod:`pygetm.nesting.plan`: the M:N exchange lists between a parent and a
   child on their pyGETM tilings (:class:`LevelTiling`, :class:`Plan`)
 
@@ -51,11 +53,13 @@ from .halo import CellSet, outer_halo, hole_rim
 from .variables import ExchangeGroup, EXCHANGE_GROUPS
 from .geometry import Level, active_region, load_levels
 from .plan import LevelTiling, Plan
+from .model import NestedModel
 
 __all__ = [
     "NestingContext",
     "split_world",
     "split_mpmd",
+    "NestedModel",
     "mpmd_blocks",
     "CellSet",
     "outer_halo",

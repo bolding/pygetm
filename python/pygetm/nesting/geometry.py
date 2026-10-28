@@ -368,14 +368,16 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
 
 
 def load_levels(config, halo: int = 2, root_band: Optional[int] = None,
-                wet: Optional[Mapping[str, np.ndarray]] = None) -> List[Level]:
+                wet: Optional[Mapping[str, np.ndarray]] = None, active: bool = True) -> List[Level]:
     """Levels from a nesting YAML file (path) or mapping, parents before
     children; keys other than levels (e.g. ``config``) are ignored.
     ``root_band``: width of the root's band (default ``halo``; 0 when the
     root's edges are pyGETM open boundaries, e.g. tides). ``wet``: wet masks
     per level (window or extended shape), needed for levels with an
     ``active`` entry (:func:`active_region`); an ``active`` entry may also be
-    an explicit mask of the window's parent cells."""
+    an explicit mask of the window's parent cells. ``active=False``: the
+    geometry only (windows, grids, bands), without active regions, e.g. to
+    build a level's bathymetry before the wet masks are known."""
     if not isinstance(config, Mapping):
         import yaml
 
@@ -401,7 +403,7 @@ def load_levels(config, halo: int = 2, root_band: Optional[int] = None,
             raise ValueError("cyclic or missing parent in nesting configuration")
     for lev in levels:
         spec = specs[lev.name].get("active")
-        if spec is None or lev.parent is None:
+        if spec is None or lev.parent is None or not active:
             continue
         if isinstance(spec, Mapping):
             if wet is None or lev.name not in wet:

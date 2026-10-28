@@ -34,7 +34,7 @@ import numpy as np
 from mpi4py import MPI
 
 from .geometry import Level
-from .hierarchy import split_world
+from .hierarchy import NestingContext, split_world
 from .plan import LevelTiling, Plan, gather_tilings
 from . import operators as ops
 
@@ -67,10 +67,17 @@ class NestingRun:
     per group of processes). With ``abort_on_error`` (default), an unhandled
     exception on any process aborts all levels (:func:`install_abort_hook`)."""
 
-    def __init__(self, levels: List[Level], ranks: Mapping[str, int], comm: Optional[MPI.Comm] = None,
-                 abort_on_error: bool = True, interface_comms: bool = True):
+    def __init__(self, levels: List[Level], ranks: Optional[Mapping[str, int]] = None, comm: Optional[MPI.Comm] = None,
+                 abort_on_error: bool = True, interface_comms: bool = True,
+                 context: Optional[NestingContext] = None):
         self.levels = levels
-        ctx = split_world({l.name: int(ranks[l.name]) for l in levels}, comm=comm)
+        if context is None:
+            ctx = split_world({l.name: int(ranks[l.name]) for l in levels}, comm=comm)
+        else:  # e.g. from split_mpmd (one mpiexec component per level)
+            ctx = context
+            missing = [l.name for l in levels if l.name not in ctx.sizes]
+            if missing:
+                raise ValueError(f"no processes for level(s) {missing}: {dict(ctx.sizes)}")
         self.world = ctx.nesting_comm
         self.comm = ctx.comm
         self.offsets = ctx.offsets
