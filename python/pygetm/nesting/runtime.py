@@ -294,12 +294,12 @@ class NestedTracer:
 
     def _send_snapshot(self, plan):
         f = self.f.all_values
-        sx, sy = ops.limited_slopes(f, self.wetmask)
         reqs = []
         for (p, tt), (pj, pi, *_rest) in plan.pro.items():
             if p == self.t:
                 jj, ii = self.loc(pj, pi)
-                buf = np.ascontiguousarray(np.stack([f[jj, ii], sx[jj, ii], sy[jj, ii]]))
+                sx, sy = ops.limited_slopes_at(f, self.wetmask, jj, ii)
+                buf = np.ascontiguousarray(np.stack([f[jj, ii], sx, sy]))
                 reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=plan.tag_p))
         MPI.Request.Waitall(reqs)
 

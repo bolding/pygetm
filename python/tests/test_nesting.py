@@ -526,6 +526,20 @@ class TestNestingOperators(unittest.TestCase):
         self.assertEqual(sx2[1, 2], 0.0)
         self.assertEqual(sx2[0, 2], 1.0)
 
+    def test_limited_slopes_at(self):
+        # the point version equals the full field everywhere (edges, land)
+        from pygetm.nesting.operators import limited_slopes, limited_slopes_at
+
+        rng = np.random.default_rng(1)
+        c = rng.normal(size=(9, 11))
+        wet = rng.random((9, 11)) > 0.25
+        j, i = (x.ravel() for x in np.meshgrid(np.arange(9), np.arange(11), indexing="ij"))
+        for w in (wet, None):
+            sx, sy = limited_slopes(c, w)
+            px, py = limited_slopes_at(c, w, j, i)
+            self.assertTrue(np.array_equal(px, sx[j, i]))
+            self.assertTrue(np.array_equal(py, sy[j, i]))
+
 
 class TestNestingMasks(unittest.TestCase):
     def test_child_led_consistency(self):

@@ -53,6 +53,33 @@ def limited_slopes(c: np.ndarray, wet: "np.ndarray | None" = None) -> "tuple[np.
     return sx, sy
 
 
+def limited_slopes_at(c: np.ndarray, wet: "np.ndarray | None", j, i) -> "tuple[np.ndarray, np.ndarray]":
+    """:func:`limited_slopes` at the cells (j, i) only, with the same
+    arithmetic (identical values), for the few cells a parent sends."""
+    j, i = np.asarray(j), np.asarray(i)
+    ny, nx = c.shape
+    if wet is None:
+        wet = np.ones(c.shape, dtype=bool)
+    wet = np.asarray(wet, dtype=bool)
+    sx = np.zeros(j.shape)
+    sy = np.zeros(j.shape)
+    x = (i > 0) & (i < nx - 1)
+    y = (j > 0) & (j < ny - 1)
+    jx, ix = j[x], i[x]
+    jy, iy = j[y], i[y]
+    with np.errstate(invalid="ignore"):
+        dw = np.where(wet[jx, ix] & wet[jx, ix - 1], c[jx, ix] - c[jx, ix - 1], 0.0)
+        de = np.where(wet[jx, ix] & wet[jx, ix + 1], c[jx, ix + 1] - c[jx, ix], 0.0)
+        ds = np.where(wet[jy, iy] & wet[jy - 1, iy], c[jy, iy] - c[jy - 1, iy], 0.0)
+        dn = np.where(wet[jy, iy] & wet[jy + 1, iy], c[jy + 1, iy] - c[jy, iy], 0.0)
+    sx[x] = minmod(dw, de)
+    sy[y] = minmod(ds, dn)
+    dry = ~wet[j, i]
+    sx[dry] = 0.0
+    sy[dry] = 0.0
+    return sx, sy
+
+
 def subcell_offset(k, r: int):
     """Centre of sub-cell k (0..r-1) relative to the parent cell centre, in
     parent-cell units."""
@@ -93,6 +120,7 @@ def face_sum(sub: np.ndarray) -> np.ndarray:
 __all__ = [
     "minmod",
     "limited_slopes",
+    "limited_slopes_at",
     "subcell_offset",
     "prolong",
     "restrict",
