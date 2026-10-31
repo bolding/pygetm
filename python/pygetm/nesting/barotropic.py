@@ -380,22 +380,24 @@ class NestedBarotropic(Coupler):
         ev = self.up_faces["edge_y"].recv(self.up.comm, self.t, self.clock)
         return z, u, v, eu, ev
 
-    def _set_ring_z(self, snap):
+    def _set_ring_z(self, snap, halos=True):
         if not self.break_ring and self._rj.size:
             vals = ops.prolong(snap[0], snap[1], snap[2], self._ring_a, self._ring_b, self.lev.ratio)
             keep = self.wetmask[self._rj, self._ri]
             self.z.all_values[self._rj[keep], self._ri[keep]] = vals[keep]
-        self.z.update_halos()
+        if halos:
+            self.z.update_halos()
 
-    def _set_ring_uv(self, u, v, eu=None, ev=None):
+    def _set_ring_uv(self, u, v, eu=None, ev=None, halos=True):
         if not self.break_ring:
             self.U.all_values[self._ru] = u
             self.V.all_values[self._rv] = v
             if self.edge_flux == "parent" and eu is not None:
                 self.U.all_values[self._eu] = eu
                 self.V.all_values[self._ev] = ev
-        self.U.update_halos()
-        self.V.update_halos()
+        if halos:
+            self.U.update_halos()
+            self.V.update_halos()
 
     def _send_up(self, fluxes=True):
         reqs = []
@@ -557,18 +559,22 @@ class NestedBarotropic(Coupler):
             self.t_sync += MPI.Wtime() - t0
 
     def _sync_inner(self, fps, with_parent: bool, fluxes: bool):
+        # the values from the children (rim, corrections) and from the parent
+        # (ring) are all set before one halo update of z, U and V: _send_up and
+        # _recv_snapshot use only cells this process owns, _send_snapshot (the
+        # slopes) needs the halos
         for plan, faces, fp in zip(self.down, self.down_faces, fps):
             self._recv_child(plan, faces, fp)
-        if self.down:
-            self.z.update_halos()
-            self.U.update_halos()
-            self.V.update_halos()
         if with_parent:
             self._send_up(fluxes=fluxes)
             self._snap_old = getattr(self, "_snap", None) if fluxes else None
             self._snap = self._recv_snapshot()
-            self._set_ring_z(self._snap[0])
-            self._set_ring_uv(self._snap[1], self._snap[2])
+            self._set_ring_z(self._snap[0], halos=False)
+            self._set_ring_uv(self._snap[1], self._snap[2], halos=False)
+        if self.down or with_parent:
+            self.z.update_halos()
+            self.U.update_halos()
+            self.V.update_halos()
         reqs = []
         for plan, faces in zip(self.down, self.down_faces):
             reqs += self._send_snapshot(plan, faces)
