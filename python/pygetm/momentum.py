@@ -91,6 +91,13 @@ class Momentum:
         "apply_bottom_friction",
         "_Am_const",
         "_An_const",
+        "_Cs",
+        "Am_uu",
+        "Am_uv",
+        "Am_vv",
+        "Amk_uu",
+        "Amk_uv",
+        "Amk_vv",
         "cnpar",
         "advection_scheme",
         "advection_split_2d",
@@ -122,6 +129,7 @@ class Momentum:
         self,
         Am: float = 0.0,
         An: float = 0.0,
+        Cs: float = 0.0,
         cnpar: float = 1.0,
         advection_scheme: Optional[operators.AdvectionScheme] = None,
         advection_split_2d: operators.AdvectionSplit = operators.AdvectionSplit.FULL,
@@ -132,11 +140,17 @@ class Momentum:
 
         Args:
             Am: horizontal viscosity (m2 s-1)
-                If provided, this must be a constant.
+                If provided, this must be a constant. With ``Cs > 0`` it is the
+                background viscosity added to the Smagorinsky viscosity.
             An: horizontal diffusivity (m2 s-1)
                 If provided, this must be a constant.
                 It can subsequently be changed through attribute :attr:`An`, which also
                 allows spatially varying diffusivities to be set.
+            Cs: Smagorinsky coefficient (-). If > 0, the horizontal viscosity is
+                ``Am + Cs**2 dx dy sqrt(DT**2 + DS**2)`` with tension
+                ``DT = du/dx - dv/dy`` and shear ``DS = du/dy + dv/dx``
+                (Griffies and Hallberg, 2000), computed every time step from
+                the velocities it diffuses. Typical values 0.1-0.2.
             cnpar: parameter for the Crank–Nicolson vertical diffusion solver
             advection_scheme: advection scheme
             advection_split_2d: directional splitting for advection solver
@@ -146,6 +160,7 @@ class Momentum:
         """
         self._Am_const = Am
         self._An_const = An
+        self._Cs = Cs
         self.cnpar = cnpar
         self.advection_scheme = advection_scheme
         self.advection_split_2d = advection_split_2d
@@ -325,9 +340,22 @@ class Momentum:
         self.vua = vgrid.ugrid.array(fill=np.nan)
         self.vva = vgrid.vgrid.array(fill=np.nan)
 
+        # Smagorinsky viscosity (m2 s-1) where the stresses are evaluated: uu, uv (= vu), vv
+        self.Am_uu = self.Am_uv = self.Am_vv = None
+        if self._Cs > 0.0:
+            self.Am_uu = ugrid.ugrid.array(fill=self._Am_const)
+            self.Am_uv = ugrid.vgrid.array(fill=self._Am_const)
+            self.Am_vv = vgrid.vgrid.array(fill=self._Am_const)
+
     def _create_depth_explicit_arrays(self, tgrid: core.Grid):
         ugrid = tgrid.ugrid
         vgrid = tgrid.vgrid
+
+        self.Amk_uu = self.Amk_uv = self.Amk_vv = None
+        if self._Cs > 0.0:
+            self.Amk_uu = ugrid.ugrid.array(fill=self._Am_const, z=CENTERS)
+            self.Amk_uv = ugrid.vgrid.array(fill=self._Am_const, z=CENTERS)
+            self.Amk_vv = vgrid.vgrid.array(fill=self._Am_const, z=CENTERS)
 
         self.pk = ugrid.array(
             name="pk",
@@ -572,10 +600,16 @@ class Momentum:
                 f" in {z0b_u.sum()} U points, {z0b_v.sum()} V points"
             )
 
-        self.diffuse_momentum = self._Am_const > 0.0
+        self.diffuse_momentum = self._Am_const > 0.0 or self._Cs > 0.0
         if not self.diffuse_momentum:
             self.logger.info(
                 "Disabling horizontal diffusion because horizontal viscosity Am is 0"
+                " and Smagorinsky coefficient Cs is 0"
+            )
+        elif self._Cs > 0.0:
+            self.logger.info(
+                f"Smagorinsky horizontal viscosity: Cs = {self._Cs}, background"
+                f" Am = {self._Am_const} m2 s-1"
             )
 
         ZERO_EVERYWHERE = MASK_ZERO_2D
@@ -1049,6 +1083,16 @@ class Momentum:
             # should be in sync with velocities uk and vk. This means they should lag
             # 1/2 a timestep behind the T grid (already the case for X, but for T we
             # use 1/2(ho+hn))
+            if self.Amk_uu is not None:
+                pygetm._pygetm.smagorinsky(
+                    self.uk,
+                    self.vk,
+                    self._Cs,
+                    self._Am_const,
+                    self.Amk_uu,
+                    self.Amk_uv,
+                    self.Amk_vv,
+                )
             pygetm._pygetm.momentum_diffusion(
                 self.uua.grid.hn,
                 self.uva.grid.hn,
@@ -1059,6 +1103,9 @@ class Momentum:
                 self._Am_const,
                 self.diffpk,
                 self.diffqk,
+                self.Amk_uu,
+                self.Amk_uv,
+                self.Amk_vv,
             )
 
         # Compute slow (3D) advection and diffusion contribution to to the
@@ -1127,6 +1174,16 @@ class Momentum:
             # This uses depth-averaged velocities u1 and v1, which therefore have to be
             # up to date. Water depths should be in sync with velocities, which means
             # they should lag 1/2 a timestep behind the tracer/T grid
+            if self.Am_uu is not None:
+                pygetm._pygetm.smagorinsky(
+                    self.u1,
+                    self.v1,
+                    self._Cs,
+                    self._Am_const,
+                    self.Am_uu,
+                    self.Am_uv,
+                    self.Am_vv,
+                )
             pygetm._pygetm.momentum_diffusion(
                 self.uua.grid.D,
                 self.uva.grid.D,
@@ -1137,6 +1194,9 @@ class Momentum:
                 self._Am_const,
                 diffU,
                 diffV,
+                self.Am_uu,
+                self.Am_uv,
+                self.Am_vv,
             )
 
         # Calculate bottom friction (ru and rv) using updated depth-averaged velocities

@@ -273,14 +273,18 @@ contains
    end subroutine
 
    subroutine c_momentum_diffusion(pugrid, pvgrid, puugrid, puvgrid, pvugrid, pvvgrid, nk, phuu, phuv, phvu, phvv, pu, pv, Am0, &
-         pdiffu, pdiffv) bind(c)
+         pAm_uu, pAm_uv, pAm_vv, pdiffu, pdiffv) bind(c)
+      ! Am0 is used everywhere if pAm_uu, pAm_uv, pAm_vv are null; otherwise these give the viscosity
+      ! on the UU, UV (also used for VU) and VV grids (e.g. from c_smagorinsky)
       integer(c_int), intent(in), value :: nk
       type(c_ptr),    intent(in), value :: pugrid, pvgrid, puugrid, puvgrid, pvugrid, pvvgrid, phuu, phuv, phvu, phvv, pu, pv
       real(c_double), intent(in), value :: Am0
+      type(c_ptr),    intent(in), value :: pAm_uu, pAm_uv, pAm_vv
       type(c_ptr),    intent(in), value :: pdiffu, pdiffv
 
       type (type_getm_grid),      pointer                   :: UG, VG, UUG, UVG, VUG, VVG
       real(c_double), contiguous, pointer, dimension(:,:,:) :: huu, huv, hvu, hvv, u, v, diffu, diffv
+      real(c_double), contiguous, pointer, dimension(:,:,:) :: Am_uu, Am_uv, Am_vv
       integer :: k
 
       call c_f_pointer(pugrid, UG)
@@ -297,13 +301,130 @@ contains
       call c_f_pointer(pv, v,   (/VG%u(1) - VG%l(1) + 1, VG%u(2) - VG%l(2) + 1, nk/))
       call c_f_pointer(pdiffu, diffu, (/UG%u(1) - UG%l(1) + 1, UG%u(2) - UG%l(2) + 1, nk/))
       call c_f_pointer(pdiffv, diffv, (/VG%u(1) - VG%l(1) + 1, VG%u(2) - VG%l(2) + 1, nk/))
+      if (c_associated(pAm_uu)) then
+         call c_f_pointer(pAm_uu, Am_uu, (/UUG%u(1) - UUG%l(1) + 1, UUG%u(2) - UUG%l(2) + 1, nk/))
+         call c_f_pointer(pAm_uv, Am_uv, (/UVG%u(1) - UVG%l(1) + 1, UVG%u(2) - UVG%l(2) + 1, nk/))
+         call c_f_pointer(pAm_vv, Am_vv, (/VVG%u(1) - VVG%l(1) + 1, VVG%u(2) - VVG%l(2) + 1, nk/))
+      else
+         allocate(Am_uu(UUG%u(1) - UUG%l(1) + 1, UUG%u(2) - UUG%l(2) + 1, 1))
+         allocate(Am_uv(UVG%u(1) - UVG%l(1) + 1, UVG%u(2) - UVG%l(2) + 1, 1))
+         allocate(Am_vv(VVG%u(1) - VVG%l(1) + 1, VVG%u(2) - VVG%l(2) + 1, 1))
+         Am_uu = Am0
+         Am_uv = Am0
+         Am_vv = Am0
+      end if
       do k = 1, nk
          call horizontal_momentum_diffusion(UG, VG, UUG, UVG, VUG, VVG, huu(:,:,k), huv(:,:,k), hvu(:,:,k), hvv(:,:,k), &
-            u(:,:,k), v(:,:,k), Am0, diffu(:,:,k), diffv(:,:,k))
+            u(:,:,k), v(:,:,k), Am_uu(:,:,min(k,size(Am_uu,3))), Am_uv(:,:,min(k,size(Am_uv,3))), &
+            Am_vv(:,:,min(k,size(Am_vv,3))), diffu(:,:,k), diffv(:,:,k))
+      end do
+      if (.not. c_associated(pAm_uu)) deallocate(Am_uu, Am_uv, Am_vv)
+   end subroutine
+
+   subroutine c_smagorinsky(pugrid, pvgrid, puugrid, puvgrid, pvvgrid, nk, pu, pv, Cs, Am0, pAm_uu, pAm_uv, pAm_vv) bind(c)
+      integer(c_int), intent(in), value :: nk
+      type(c_ptr),    intent(in), value :: pugrid, pvgrid, puugrid, puvgrid, pvvgrid, pu, pv
+      real(c_double), intent(in), value :: Cs, Am0
+      type(c_ptr),    intent(in), value :: pAm_uu, pAm_uv, pAm_vv
+
+      type (type_getm_grid),      pointer                   :: UG, VG, UUG, UVG, VVG
+      real(c_double), contiguous, pointer, dimension(:,:,:) :: u, v, Am_uu, Am_uv, Am_vv
+      integer :: k
+
+      call c_f_pointer(pugrid, UG)
+      call c_f_pointer(pvgrid, VG)
+      call c_f_pointer(puugrid, UUG)
+      call c_f_pointer(puvgrid, UVG)
+      call c_f_pointer(pvvgrid, VVG)
+      call c_f_pointer(pu, u,   (/UG%u(1) - UG%l(1) + 1, UG%u(2) - UG%l(2) + 1, nk/))
+      call c_f_pointer(pv, v,   (/VG%u(1) - VG%l(1) + 1, VG%u(2) - VG%l(2) + 1, nk/))
+      call c_f_pointer(pAm_uu, Am_uu, (/UUG%u(1) - UUG%l(1) + 1, UUG%u(2) - UUG%l(2) + 1, nk/))
+      call c_f_pointer(pAm_uv, Am_uv, (/UVG%u(1) - UVG%l(1) + 1, UVG%u(2) - UVG%l(2) + 1, nk/))
+      call c_f_pointer(pAm_vv, Am_vv, (/VVG%u(1) - VVG%l(1) + 1, VVG%u(2) - VVG%l(2) + 1, nk/))
+      do k = 1, nk
+         call smagorinsky(UG, VG, UUG, UVG, VVG, u(:,:,k), v(:,:,k), Cs, Am0, Am_uu(:,:,k), Am_uv(:,:,k), Am_vv(:,:,k))
       end do
    end subroutine
 
-   subroutine horizontal_momentum_diffusion(UG, VG, UUG, UVG, VUG, VVG, huu, huv, hvu, hvv, u, v, Am0, diffu, diffv)
+   subroutine smagorinsky(UG, VG, UUG, UVG, VVG, u, v, Cs, Am0, Am_uu, Am_uv, Am_vv)
+      ! Smagorinsky viscosity Am = Am0 + Cs**2 dx dy sqrt(DT**2 + DS**2), with tension DT = du/dx - dv/dy
+      ! and shear DS = du/dy + dv/dx (Griffies and Hallberg, 2000), on the grids where
+      ! horizontal_momentum_diffusion evaluates its fluxes: UU and VV (T-points; UU(i,j) = T(i+1,j),
+      ! VV(i,j) = T(i,j+1)) and UV (X-points, also used for VU). DS at T-points and DT at X-points are
+      ! means of the four surrounding values; masked points contribute 0.
+      type (type_getm_grid), intent(in) :: UG, VG, UUG, UVG, VVG
+      real(c_double), dimension(:,:), intent(in) :: u(UG%l(1):,UG%l(2):)
+      real(c_double), dimension(:,:), intent(in) :: v(VG%l(1):,VG%l(2):)
+      real(c_double),                 intent(in) :: Cs, Am0
+      real(c_double), dimension(:,:), intent(inout) :: Am_uu(UUG%l(1):,UUG%l(2):)
+      real(c_double), dimension(:,:), intent(inout) :: Am_uv(UVG%l(1):,UVG%l(2):)
+      real(c_double), dimension(:,:), intent(inout) :: Am_vv(VVG%l(1):,VVG%l(2):)
+
+      integer :: i,j
+      real(c_double) :: DT, DS
+      real(c_double), allocatable :: tension(:,:), shear(:,:)
+
+      allocate(tension(UUG%l(1):UUG%u(1), UUG%l(2):UUG%u(2)))  ! T-points, as UU
+      allocate(shear(UVG%l(1):UVG%u(1), UVG%l(2):UVG%u(2)))  ! X-points, as UV
+      tension = 0._c_double
+      shear = 0._c_double
+
+      ! du/dx - dv/dy on T-points: UU(i,j) lies between U(i,j) and U(i+1,j), and V(i+1,j-1) and V(i+1,j)
+      do j=UUG%l(2)+1,UUG%u(2)
+         do i=UUG%l(1),UUG%u(1)-1
+            if (UUG%mask(i,j) /= 0) then
+               tension(i,j) = (u(i+1,j) - u(i,j)) * UUG%idx(i,j) &
+                            - (v(i+1,j) - v(i+1,j-1)) * UUG%idy(i,j)
+            end if
+         end do
+      end do
+
+      ! du/dy + dv/dx on X-points: UV(i,j) lies between U(i,j) and U(i,j+1), and V(i,j) and V(i+1,j)
+      do j=UVG%l(2),UVG%u(2)-1
+         do i=UVG%l(1),UVG%u(1)-1
+            if (UVG%mask(i,j) /= 0) then
+               shear(i,j) = (u(i,j+1) - u(i,j)) * UVG%idy(i,j) + (v(i+1,j) - v(i,j)) * UVG%idx(i,j)
+            end if
+         end do
+      end do
+
+      Am_uu = Am0
+      Am_uv = Am0
+      Am_vv = Am0
+
+      ! UU (T-points): shear from the X-points UV(i:i+1,j-1:j)
+      do j=UUG%l(2)+1,UUG%u(2)-1
+         do i=UUG%l(1)+1,UUG%u(1)-2
+            if (UUG%mask(i,j) /= 0) then
+               DS = 0.25_c_double * (shear(i,j-1) + shear(i+1,j-1) + shear(i,j) + shear(i+1,j))
+               Am_uu(i,j) = Am0 + Cs**2 * UUG%dx(i,j) * UUG%dy(i,j) * sqrt(tension(i,j)**2 + DS**2)
+            end if
+         end do
+      end do
+
+      ! VV (T-points): VV(i,j) = UU(i-1,j+1); shear from the X-points UV(i-1:i,j:j+1)
+      do j=VVG%l(2)+1,VVG%u(2)-2
+         do i=VVG%l(1)+1,VVG%u(1)-1
+            if (VVG%mask(i,j) /= 0) then
+               DS = 0.25_c_double * (shear(i-1,j) + shear(i,j) + shear(i-1,j+1) + shear(i,j+1))
+               Am_vv(i,j) = Am0 + Cs**2 * VVG%dx(i,j) * VVG%dy(i,j) * sqrt(tension(i-1,j+1)**2 + DS**2)
+            end if
+         end do
+      end do
+
+      ! UV (X-points): tension from the T-points UU(i-1:i,j:j+1)
+      do j=UVG%l(2)+1,UVG%u(2)-1
+         do i=UVG%l(1)+1,UVG%u(1)-1
+            if (UVG%mask(i,j) /= 0) then
+               DT = 0.25_c_double * (tension(i-1,j) + tension(i,j) + tension(i-1,j+1) + tension(i,j+1))
+               Am_uv(i,j) = Am0 + Cs**2 * UVG%dx(i,j) * UVG%dy(i,j) * sqrt(DT**2 + shear(i,j)**2)
+            end if
+         end do
+      end do
+   end subroutine
+
+   subroutine horizontal_momentum_diffusion(UG, VG, UUG, UVG, VUG, VVG, huu, huv, hvu, hvv, u, v, Am_uu, Am_uv, Am_vv, &
+         diffu, diffv)
       type (type_getm_grid), intent(in) :: UG, VG, UUG, UVG, VUG, VVG
       real(c_double), dimension(:,:), intent(in) :: huu(UUG%l(1):,UUG%l(2):)
       real(c_double), dimension(:,:), intent(in) :: huv(UVG%l(1):,UVG%l(2):)
@@ -311,7 +432,9 @@ contains
       real(c_double), dimension(:,:), intent(in) :: hvv(VVG%l(1):,VVG%l(2):)
       real(c_double), dimension(:,:), intent(in) :: u(UG%l(1):,UG%l(2):)
       real(c_double), dimension(:,:), intent(in) :: v(VG%l(1):,VG%l(2):)
-      real(c_double),                 intent(in) :: Am0
+      real(c_double), dimension(:,:), intent(in) :: Am_uu(UUG%l(1):,UUG%l(2):)
+      real(c_double), dimension(:,:), intent(in) :: Am_uv(UVG%l(1):,UVG%l(2):)  ! also used for VU (same points)
+      real(c_double), dimension(:,:), intent(in) :: Am_vv(VVG%l(1):,VVG%l(2):)
       real(c_double), dimension(:,:), intent(inout) :: diffu(UG%l(1):,UG%l(2):)
       real(c_double), dimension(:,:), intent(inout) :: diffv(VG%l(1):,VG%l(2):)
 
@@ -325,7 +448,7 @@ contains
          do i=UUG%imin-1,UUG%imax ! shear defined on T-points
             flux(i,j)=0._real64
             if (UUG%mask(i,j) /= 0) then
-               flux(i,j) = 2._real64 * Am0 * UUG%dy(i,j) * huu(i,j) * (u(i+1,j) - u(i,j)) * UUG%idx(i,j)
+               flux(i,j) = 2._real64 * Am_uu(i,j) * UUG%dy(i,j) * huu(i,j) * (u(i+1,j) - u(i,j)) * UUG%idx(i,j)
             end if
          end do
       end do
@@ -343,7 +466,8 @@ contains
          do i=UVG%imin,UVG%imax
             flux(i,j)=0._real64
             if (UVG%mask(i,j) /= 0) then
-               flux(i,j) = Am0 * UVG%dx(i,j) * huv(i,j) * ((u(i,j+1) - u(i,j)) * UVG%idy(i,j) + (v(i+1,j) - v(i,j)) * UVG%idx(i,j))
+               flux(i,j) = Am_uv(i,j) * UVG%dx(i,j) * huv(i,j) &
+                         * ((u(i,j+1) - u(i,j)) * UVG%idy(i,j) + (v(i+1,j) - v(i,j)) * UVG%idx(i,j))
             end if
          end do
       end do
@@ -360,7 +484,8 @@ contains
          do i=VUG%imin-1,VUG%imax ! work2d defined on X-points
             flux(i,j)=0._real64
             if (VUG%mask(i,j) /= 0) then
-               flux(i,j) = Am0 * VUG%dy(i,j) * hvu(i,j) * ((u(i,j+1) - u(i,j)) * VUG%idy(i,j) + (v(i+1,j) - v(i,j)) * VUG%idx(i,j))
+               flux(i,j) = Am_uv(i,j) * VUG%dy(i,j) * hvu(i,j) &
+                         * ((u(i,j+1) - u(i,j)) * VUG%idy(i,j) + (v(i+1,j) - v(i,j)) * VUG%idx(i,j))
             end if
          end do
       end do
@@ -378,7 +503,7 @@ contains
          do i=VVG%imin,VVG%imax
             flux(i,j)=0._real64
             if (VVG%mask(i,j) /= 0) then
-               flux(i,j) = 2._real64 * Am0 * VVG%dx(i,j) * hvv(i,j) * (v(i,j+1) - v(i,j)) * VVG%idy(i,j)
+               flux(i,j) = 2._real64 * Am_vv(i,j) * VVG%dx(i,j) * hvv(i,j) * (v(i,j+1) - v(i,j)) * VVG%idy(i,j)
             end if
          end do
       end do
