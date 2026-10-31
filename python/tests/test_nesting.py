@@ -435,6 +435,26 @@ class TestNestingGeometry(unittest.TestCase):
         bj, bi = child.ring_cells()
         self.assertEqual(bj.size, child.extended_shape[0] * child.extended_shape[1] - child.nx * child.ny)
 
+    def test_tiling_mask(self):
+        # only hole cells nothing reads (the hole minus the rim) need no subdomain
+        root, child, gc = small_hierarchy()
+        tm = root.tiling_mask()
+        self.assertEqual(tm.shape, root.extended_shape)
+        self.assertTrue(tm[:2].all())
+        free = ~tm[2:-2, 2:-2]
+        self.assertTrue((root.hole[free]).all())
+        self.assertEqual(int(free.sum()), (12 - 2 * 2) * (16 - 2 * 2))
+        rim = root.rims["child"]
+        self.assertTrue(tm[2 + rim[:, 0], 2 + rim[:, 1]].all())
+        # a grandchild on the child's edge: the faces passed upwards keep their hole cells
+        tm = child.tiling_mask()
+        wf = child.wfaces["gc"]
+        hj, hi = wf["hole"]
+        up = ~wf["inside"]
+        self.assertTrue(up.any())
+        self.assertTrue(tm[2 + hj[up], 2 + hi[up]].all())
+        self.assertTrue(child.hole[~tm[2:-2, 2:-2]].all())
+
     def test_root_without_band(self):
         from pygetm.nesting.geometry import load_levels
 

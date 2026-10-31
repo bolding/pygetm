@@ -102,6 +102,7 @@ class NestingRun:
         lev = self.level
         domain = make_domain(lev, self.comm)
         domain.external = lev.external()
+        domain.tiling_mask = lev.tiling_mask()
         grid_kwargs.setdefault("velocity_grids", 1)
         with self._tiling_hint():
             grid = domain.create_grids(nz, halox=lev.halo, haloy=lev.halo, **grid_kwargs)
@@ -112,10 +113,12 @@ class NestingRun:
         comm)`` returns the level's domain including its band;
         ``make_simulation(level, domain)`` the simulation (its halo must equal
         ``level.halo``). The band and the hole are marked external before the
-        simulation builds its grids. Returns the simulation."""
+        simulation builds its grids; subdomains holding only hole cells that
+        nothing reads are removed. Returns the simulation."""
         lev = self.level
         domain = make_domain(lev, self.comm)
         domain.external = lev.external()
+        domain.tiling_mask = lev.tiling_mask()
         with self._tiling_hint():
             sim = make_simulation(lev, domain)
         if sim.T is not None and sim.T.halox != lev.halo:

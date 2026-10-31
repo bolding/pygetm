@@ -244,6 +244,22 @@ class Level:
         ext[h : h + self.ny, h : h + self.nx] = ~self.computed
         return ext
 
+    def tiling_mask(self) -> np.ndarray:
+        """Cells (including the band) that need a subdomain: all but the hole
+        cells nothing reads (not in a rim, not the hole cell of an interface
+        face passed upwards). Subdomains holding only those are removed like
+        all-land ones. For :attr:`pygetm.domain.Domain.tiling_mask`."""
+        h = self.band
+        unread = self.hole.copy()
+        for rim in self.rims.values():
+            unread[rim[:, 0], rim[:, 1]] = False
+        for wf in self.wfaces.values():
+            hj, hi = wf["hole"]
+            unread[hj[~wf["inside"]], hi[~wf["inside"]]] = False
+        tm = np.ones(self.extended_shape, dtype=bool)
+        tm[h : h + self.ny, h : h + self.nx] = ~unread
+        return tm
+
     def _ring_mask(self) -> np.ndarray:
         h = self.band
         act = np.zeros(self.extended_shape, dtype=bool)
