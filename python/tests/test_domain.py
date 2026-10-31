@@ -437,6 +437,8 @@ class TestDomain(unittest.TestCase):
         import north_sea
 
         setups_dir = os.environ.get("GETM_SETUPS_DIR", "../../../getm-setups")
+        if not (Path(setups_dir) / "NorthSea").is_dir():
+            self.skipTest("NorthSea setup not found (set GETM_SETUPS_DIR)")
         d = north_sea.create_domain(
             Path(setups_dir) / "NorthSea",
             logger=pygetm.parallel.get_logger(level="ERROR"),
