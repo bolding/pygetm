@@ -76,7 +76,13 @@ class TestSplitWorld(unittest.TestCase):
         self.assertEqual(mpmd_blocks(e), {"root": (0, 2), "child": (2, 1), "gc": (3, 2)})
         self.assertEqual(mpmd_blocks([("root", -1)] * 3), {"root": (0, 3)})
         with self.assertRaises(ValueError):  # two domains in one component
-            mpmd_blocks([("root", 0), ("child", 0)])
+            mpmd_blocks([("root", 0), ("child", 0), ("gc", 1)])
+        # one application (srun --multi-prog): the names define the components
+        e = [("root", 0), ("root", 0), ("child", 0), ("gc", 0)]
+        self.assertEqual(mpmd_blocks(e), {"root": (0, 2), "child": (2, 1), "gc": (3, 1)})
+        self.assertEqual(mpmd_blocks([("root", -1), ("child", -1)]), {"root": (0, 1), "child": (1, 1)})
+        with self.assertRaises(ValueError):  # not contiguous
+            mpmd_blocks([("root", 0), ("child", 0), ("root", 0)])
         with self.assertRaises(ValueError):  # one domain in two components
             mpmd_blocks([("root", 0), ("child", 1), ("root", 2)])
 

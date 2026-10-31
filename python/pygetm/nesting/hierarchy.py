@@ -73,7 +73,13 @@ def mpmd_blocks(entries) -> dict:
     """Domains of an MPMD launch from ``(name, appnum)`` of every rank, in
     rank order: ``{name: (offset, size)}`` in launch order. Each component
     (``appnum``) must hold one domain, each domain one component, and the
-    ranks of a domain must be contiguous."""
+    ranks of a domain must be contiguous.
+
+    If all ranks have the same ``appnum`` (one application, e.g. Slurm's
+    ``srun --multi-prog``, or no ``APPNUM`` at all), the domain names alone
+    define the components; their ranks must still be contiguous."""
+    if len({app for _, app in entries}) == 1:
+        entries = [(name, name) for name, _ in entries]
     blocks: dict = {}
     app_name: dict = {}
     for rank, (name, app) in enumerate(entries):
@@ -98,8 +104,9 @@ def split_mpmd(name: str, comm: Optional[MPI.Comm] = None) -> NestingContext:
 
     Every process names its own domain (*name*). The processes per domain are
     the sizes of the components (MPI attribute ``APPNUM``), so no rank counts
-    are given. Without ``APPNUM`` (not an MPMD launch) all processes must name
-    the same domain.
+    are given. With a single application (no ``APPNUM``, or ``srun
+    --multi-prog`` with one program line per domain) the domain names define
+    the components, each a contiguous block of ranks.
 
     Args:
         name: domain of the current process
