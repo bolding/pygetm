@@ -260,7 +260,7 @@ class NestedBarotropic(Coupler):
 
     def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False,
                  replace_transport=True, schedule="sync", ring_time="extrapolate", correct_late=False,
-                 edge_flux="child", sponge_width=0.0, sponge_alpha=0.1):
+                 edge_flux="child", sponge_width=0.0, sponge_alpha=0.1, exchange="up_first"):
         self.nest, self.sim = nest, sim
         self.lev = lev = nest.level
         self.t = nest.tile
@@ -276,6 +276,24 @@ class NestedBarotropic(Coupler):
         #: see each correction one sync later (volume is conserved either way)
         self.correct_late = correct_late
         self._pending = []
+        #: schedule "sync": the order of the messages in a sync.
+        #: "chain": a level receives from its children and corrects
+        #: before it sends up and before it sends its state down, so every sync
+        #: runs up through the hierarchy and down again while the others wait.
+        #: "cross" (experimental, unstable in IDEAL): every level first sends its state down (before this sync's
+        #: correction, which the children then see one sync later, as with
+        #: correct_late) and its rim and fluxes up, then receives; each process
+        #: waits only for its direct partners. Volume is conserved either way.
+        #: "up_first" (default; bit-identical to "chain"): every level sends its rim and fluxes up before it
+        #: receives its children, and its corrected state down before it
+        #: receives its parent's. The same arithmetic as "chain" (what goes up
+        #: does not depend on the children, what goes down not on the parent),
+        #: but the sweeps up and down no longer wait for each other. A level
+        #: whose children pass fluxes on up (a child touching its edge) sends
+        #: up after its children, as in "chain".
+        if exchange not in ("chain", "cross", "up_first"):
+            raise ValueError(f"unknown exchange {exchange!r}")
+        self.exchange = exchange
         #: transports through the child's edge faces (its interface with the
         #: parent): "child" (computed by the child's momentum equation) or
         #: "parent" (the parent's interface-face transport per unit width,
@@ -399,7 +417,7 @@ class NestedBarotropic(Coupler):
             self.U.update_halos()
             self.V.update_halos()
 
-    def _send_up(self, fluxes=True):
+    def _send_up(self, fluxes=True, wait=True):
         reqs = []
         z = self.z.all_values
         for (tt, p), (_, _, _, cj, ci) in self.up.res.items():
@@ -416,6 +434,8 @@ class NestedBarotropic(Coupler):
                     vals = np.ascontiguousarray(self.reg[fk])
                     reqs.append(self.up.comm.Isend(vals, dest=self.up.poff + p, tag=self.up.tag_f))
             self.reg = np.zeros_like(self.reg)
+        if not wait:
+            return reqs
         self.clock.waitall(reqs)
 
     def _own_edge_fluxes(self):
@@ -547,6 +567,54 @@ class NestedBarotropic(Coupler):
                 reqs += self._send_corrected_z(plan)
             self.clock.waitall(reqs)
 
+    def _sync_cross(self, fps, with_parent: bool, fluxes: bool):
+        """exchange "cross": all sends first (state down, rim and fluxes up),
+        then the receives; the children's corrections are applied after the
+        state has gone down."""
+        reqs = []
+        for plan, faces in zip(self.down, self.down_faces):
+            reqs += self._send_snapshot(plan, faces)
+        if with_parent:
+            reqs += self._send_up(fluxes=fluxes, wait=False)
+        for plan, faces, fp in zip(self.down, self.down_faces, fps):
+            self._recv_child(plan, faces, fp)
+        if with_parent:
+            self._snap_old = getattr(self, "_snap", None) if fluxes else None
+            self._snap = self._recv_snapshot()
+            self._set_ring_z(self._snap[0], halos=False)
+            self._set_ring_uv(self._snap[1], self._snap[2], halos=False)
+        if self.down or with_parent:
+            self.z.update_halos()
+            self.U.update_halos()
+            self.V.update_halos()
+        self.clock.waitall(reqs)
+
+    def _sync_up_first(self, fps, with_parent: bool, fluxes: bool):
+        """exchange "up_first": up first, then the children, the state down,
+        then the parent's state for the ring."""
+        if not hasattr(self, "_up_after_children"):
+            self._up_after_children = any(
+                bool((np.asarray(self.lev.wfaces[plan.child.name]["up"]) >= 0).any()) for plan in self.down)
+        reqs = []
+        if with_parent and not self._up_after_children:
+            reqs += self._send_up(fluxes=fluxes, wait=False)
+        for plan, faces, fp in zip(self.down, self.down_faces, fps):
+            self._recv_child(plan, faces, fp)
+        if with_parent and self._up_after_children:
+            reqs += self._send_up(fluxes=fluxes, wait=False)
+        if self.down:
+            self.z.update_halos()
+            self.U.update_halos()
+            self.V.update_halos()
+            for plan, faces in zip(self.down, self.down_faces):
+                reqs += self._send_snapshot(plan, faces)
+        if with_parent:
+            self._snap_old = getattr(self, "_snap", None) if fluxes else None
+            self._snap = self._recv_snapshot()
+            self._set_ring_z(self._snap[0])
+            self._set_ring_uv(self._snap[1], self._snap[2])
+        self.clock.waitall(reqs)
+
     def _sync(self, fps, with_parent: bool, fluxes: bool):
         """One sync point (schedule "sync"), in an order without cycles over
         the hierarchy: (a) from the children: halo in the hole and flux
@@ -554,7 +622,12 @@ class NestedBarotropic(Coupler):
         registers; (c) from the parent: its (corrected) state for the ring;
         (d) to the children: this level's state for their rings."""
         t0 = MPI.Wtime()
-        self._sync_inner(fps, with_parent, fluxes)
+        if self.exchange == "cross" and self._t_start is not None:  # the first sync in the chain order
+            self._sync_cross(fps, with_parent, fluxes)
+        elif self.exchange == "up_first":
+            self._sync_up_first(fps, with_parent, fluxes)
+        else:
+            self._sync_inner(fps, with_parent, fluxes)
         if self._t_start is not None:
             self.t_sync += MPI.Wtime() - t0
 
