@@ -42,7 +42,8 @@ cdef extern void* vertical_diffusion_create(void* tgrid) nogil
 cdef extern void vertical_diffusion_finalize(void* diffusion) nogil
 cdef extern void c_vertical_diffusion_prepare(void* diffusion, int nx, int ny, int nz, double molecular, double* pnuh, double timestep, double cnpar, int* pmask, double* pho, double* phn) nogil
 cdef extern void c_vertical_diffusion_apply(void* diffusion, int nx, int ny, int nz, int* pmask, double* pho, double* phn, double* pvar, double* pea2, double* pea4) nogil
-cdef extern void c_momentum_diffusion(void* ugrid, void* vgrid, void* uugrid, void* uvgrid, void* vugrid, void* vvgrid, int nk, const double* huu, const double* huv, const double* hvu, const double* hvv, const double* u, const double* v, double Am0, double* diffu, double* diffv) nogil
+cdef extern void c_momentum_diffusion(void* ugrid, void* vgrid, void* uugrid, void* uvgrid, void* vugrid, void* vvgrid, int nk, const double* huu, const double* huv, const double* hvu, const double* hvv, const double* u, const double* v, double Am0, const double* Am_uu, const double* Am_uv, const double* Am_vv, double* diffu, double* diffv) nogil
+cdef extern void c_smagorinsky(void* ugrid, void* vgrid, void* uugrid, void* uvgrid, void* vvgrid, int nk, const double* u, const double* v, double Cs, double Am0, double* Am_uu, double* Am_uv, double* Am_vv) nogil
 cdef extern void c_exponential_profile_1band_interfaces(int nx, int ny, int nz, int istart, int istop, int jstart, int jstop, int* mask, double* h, double* k, double* initial, int up, double* out) nogil
 cdef extern void c_exponential_profile_1band_centers(int nx, int ny, int nz, int istart, int istop, int jstart, int jstop, int* mask, double* h, double* k, double* top, double* out) nogil
 cdef extern void c_thickness2center_depth(int nx, int ny, int nz, int istart, int istop, int jstart, int jstop, int* mask, double* h, double* out) nogil
@@ -341,7 +342,8 @@ cdef class VerticalDiffusion:
         cdef Array ho = var.grid.ho if use_ho else hn
         c_vertical_diffusion_apply(self.p, var.grid.nx_, var.grid.ny_, var.grid.nz_, <int *>mask.p, <double *>ho.p, <double *>hn.p, <double *>var.p, pea2, pea4)
 
-def momentum_diffusion(Array huu not None, Array huv not None, Array hvu not None, Array hvv not None, Array u not None, Array v not None, double Am0, Array diffu not None, Array diffv not None):
+def momentum_diffusion(Array huu not None, Array huv not None, Array hvu not None, Array hvv not None, Array u not None, Array v not None, double Am0, Array diffu not None, Array diffv not None, Array Am_uu=None, Array Am_uv=None, Array Am_vv=None):
+    # Am0 everywhere, or (if given) the viscosity Am_uu, Am_uv, Am_vv on the uu, uv (also used for vu) and vv grids
     assert huu.grid is u.grid.ugrid
     assert huv.grid is u.grid.vgrid
     assert hvu.grid is v.grid.ugrid
@@ -349,7 +351,24 @@ def momentum_diffusion(Array huu not None, Array huv not None, Array hvu not Non
     assert diffu.grid is u.grid
     assert diffv.grid is v.grid
     cdef int nk = <int>u._array.shape[0] if u.z else 1
-    c_momentum_diffusion(u.grid.p, v.grid.p, huu.grid.p, huv.grid.p, hvu.grid.p, hvv.grid.p, nk, <double*> huu.p, <double*> huv.p, <double*> hvu.p, <double*> hvv.p, <double*> u.p, <double*> v.p, Am0, <double*> diffu.p, <double*> diffv.p)
+    cdef double* pAm_uu = NULL
+    cdef double* pAm_uv = NULL
+    cdef double* pAm_vv = NULL
+    if Am_uu is not None:
+        assert Am_uu.grid is u.grid.ugrid and Am_uv.grid is u.grid.vgrid and Am_vv.grid is v.grid.vgrid
+        assert Am_uu.z == u.z and Am_uv.z == u.z and Am_vv.z == u.z
+        pAm_uu = <double*> Am_uu.p
+        pAm_uv = <double*> Am_uv.p
+        pAm_vv = <double*> Am_vv.p
+    c_momentum_diffusion(u.grid.p, v.grid.p, huu.grid.p, huv.grid.p, hvu.grid.p, hvv.grid.p, nk, <double*> huu.p, <double*> huv.p, <double*> hvu.p, <double*> hvv.p, <double*> u.p, <double*> v.p, Am0, pAm_uu, pAm_uv, pAm_vv, <double*> diffu.p, <double*> diffv.p)
+
+def smagorinsky(Array u not None, Array v not None, double Cs, double Am0, Array Am_uu not None, Array Am_uv not None, Array Am_vv not None):
+    # Smagorinsky viscosity Am0 + Cs**2 dx dy sqrt(tension**2 + shear**2) on the uu, uv and vv grids (2D, or per layer)
+    assert v.z == u.z
+    assert Am_uu.grid is u.grid.ugrid and Am_uv.grid is u.grid.vgrid and Am_vv.grid is v.grid.vgrid
+    assert Am_uu.z == u.z and Am_uv.z == u.z and Am_vv.z == u.z
+    cdef int nk = <int>u._array.shape[0] if u.z else 1
+    c_smagorinsky(u.grid.p, v.grid.p, Am_uu.grid.p, Am_uv.grid.p, Am_vv.grid.p, nk, <double*> u.p, <double*> v.p, Cs, Am0, <double*> Am_uu.p, <double*> Am_uv.p, <double*> Am_vv.p)
 
 def exponential_profile_1band_interfaces(Array mask not None, Array h not None, Array k not None, Array initial not None, bint up=False, Array out=None):
     assert mask.grid is h.grid and h.z == CENTERS
