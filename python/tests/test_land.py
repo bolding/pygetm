@@ -53,6 +53,8 @@ class TestLandMask(unittest.TestCase):
     def setUp(self) -> None:
         setups_dir = os.environ.get("GETM_SETUPS_DIR", "../../../getm-setups")
         self.setup_dir = Path(setups_dir) / "NorthSea"
+        if not self.setup_dir.is_dir():
+            self.skipTest("NorthSea setup not found (set GETM_SETUPS_DIR)")
         self.domain = north_sea.create_domain(
             self.setup_dir, logger=pygetm.parallel.get_logger(level="ERROR")
         )
