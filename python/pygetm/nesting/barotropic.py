@@ -57,15 +57,65 @@ from . import operators as ops
 TAG_CORRECTED = 50
 
 
+class HaloWaitTimer:
+    """Time blocked in MPI_Waitall of pyGETM's halo updates (all of them: the
+    model's own and those the nesting calls), on this process.
+
+    pyGETM's :class:`pygetm.parallel.HaloUpdater` calls the module-level
+    ``Waitall`` of :mod:`pygetm.parallel`; :meth:`install` replaces it by a
+    timed version (two MPI.Wtime calls per halo update). Installed by
+    :class:`NestedBarotropic`, once per process."""
+
+    total = 0.0
+    _installed = False
+
+    @classmethod
+    def install(cls):
+        if cls._installed:
+            return
+        from .. import parallel
+
+        waitall = parallel.Waitall
+
+        def timed_waitall(reqs, *args, **kwargs):
+            t0 = MPI.Wtime()
+            try:
+                return waitall(reqs, *args, **kwargs)
+            finally:
+                cls.total += MPI.Wtime() - t0
+
+        parallel.Waitall = timed_waitall
+        cls._installed = True
+
+
 class ExchangeClock:
     """Wall-clock time of the nesting exchanges of one process, split into
     waiting (blocked until the partner's message is there: MPI_Probe before
     every receive, and the completion of sends) and transfer (the receive
-    itself)."""
+    itself); and the halo updates the nesting calls (``halo``: all of it,
+    ``halo_wait``: the part blocked in MPI_Waitall, i.e. waiting for the
+    neighbouring tiles of the same level)."""
 
     def __init__(self):
+        HaloWaitTimer.install()
         self.wait = 0.0
         self.transfer = 0.0
+        self.halo = 0.0
+        self.halo_wait = 0.0
+        self.halo_wait0 = HaloWaitTimer.total
+
+    def halos(self, *fields):
+        """Halo update of *fields* (pyGETM arrays), timed."""
+        t0, w0 = MPI.Wtime(), HaloWaitTimer.total
+        for f in fields:
+            f.update_halos()
+        self.halo += MPI.Wtime() - t0
+        self.halo_wait += HaloWaitTimer.total - w0
+
+    def model_halo_wait(self) -> float:
+        """Time blocked in the model's own halo updates (not the nesting's)
+        since the last reset."""
+        return max(HaloWaitTimer.total - self.halo_wait0 - self.halo_wait, 0.0)
 
     def recv(self, comm, buf, source: int, tag: int):
         t0 = MPI.Wtime()
@@ -81,7 +131,8 @@ class ExchangeClock:
         self.wait += MPI.Wtime() - t0
 
     def reset(self):
-        self.wait = self.transfer = 0.0
+        self.wait = self.transfer = self.halo = self.halo_wait = 0.0
+        self.halo_wait0 = HaloWaitTimer.total
 
 
 class PointTransfer:
@@ -404,7 +455,7 @@ class NestedBarotropic(Coupler):
             keep = self.wetmask[self._rj, self._ri]
             self.z.all_values[self._rj[keep], self._ri[keep]] = vals[keep]
         if halos:
-            self.z.update_halos()
+            self.clock.halos(self.z)
 
     def _set_ring_uv(self, u, v, eu=None, ev=None, halos=True):
         if not self.break_ring:
@@ -414,8 +465,7 @@ class NestedBarotropic(Coupler):
                 self.U.all_values[self._eu] = eu
                 self.V.all_values[self._ev] = ev
         if halos:
-            self.U.update_halos()
-            self.V.update_halos()
+            self.clock.halos(self.U, self.V)
 
     def _send_up(self, fluxes=True, wait=True):
         reqs = []
@@ -558,9 +608,7 @@ class NestedBarotropic(Coupler):
         self.clock.waitall(reqs)
         for plan, faces, fp in zip(self.down, self.down_faces, fps):
             self._recv_child(plan, faces, fp)
-        self.z.update_halos()
-        self.U.update_halos()
-        self.V.update_halos()
+        self.clock.halos(self.z, self.U, self.V)
         if any(fp is not None for fp in fps):
             reqs = []
             for plan in self.down:
@@ -584,9 +632,7 @@ class NestedBarotropic(Coupler):
             self._set_ring_z(self._snap[0], halos=False)
             self._set_ring_uv(self._snap[1], self._snap[2], halos=False)
         if self.down or with_parent:
-            self.z.update_halos()
-            self.U.update_halos()
-            self.V.update_halos()
+            self.clock.halos(self.z, self.U, self.V)
         self.clock.waitall(reqs)
 
     def _sync_up_first(self, fps, with_parent: bool, fluxes: bool):
@@ -603,9 +649,7 @@ class NestedBarotropic(Coupler):
         if with_parent and self._up_after_children:
             reqs += self._send_up(fluxes=fluxes, wait=False)
         if self.down:
-            self.z.update_halos()
-            self.U.update_halos()
-            self.V.update_halos()
+            self.clock.halos(self.z, self.U, self.V)
             for plan, faces in zip(self.down, self.down_faces):
                 reqs += self._send_snapshot(plan, faces)
         if with_parent:
@@ -645,9 +689,7 @@ class NestedBarotropic(Coupler):
             self._set_ring_z(self._snap[0], halos=False)
             self._set_ring_uv(self._snap[1], self._snap[2], halos=False)
         if self.down or with_parent:
-            self.z.update_halos()
-            self.U.update_halos()
-            self.V.update_halos()
+            self.clock.halos(self.z, self.U, self.V)
         reqs = []
         for plan, faces in zip(self.down, self.down_faces):
             reqs += self._send_snapshot(plan, faces)
@@ -656,9 +698,7 @@ class NestedBarotropic(Coupler):
             for apply in self._pending:
                 apply()
             self._pending = []
-            self.z.update_halos()
-            self.U.update_halos()
-            self.V.update_halos()
+            self.clock.halos(self.z, self.U, self.V)
 
     # --- Coupler hooks -------------------------------------------------------------
 
@@ -783,21 +823,30 @@ class NestedBarotropic(Coupler):
         """Wall-clock monitoring of this process since the start (seconds):
 
         * ``elapsed``;
-        * ``compute``: the model's own step (elapsed - sync - stage);
+        * ``compute``: the model's own step (elapsed - sync - stage),
+          including the model's own halo updates;
+        * ``model_halo_wait``: of ``compute``, the time blocked in the
+          model's own halo updates (waiting for the other tiles of the same
+          level; ``compute - model_halo_wait`` is the computation itself);
         * ``work``: the nesting's own computations (restriction, flux
-          matching, ring values; sync - wait - transfer + stage);
+          matching, ring values; sync + stage - wait - transfer - halo);
+        * ``halo``: the halo updates the nesting calls (``halo_wait`` of it
+          blocked in MPI, i.e. waiting for the other tiles of the level);
         * ``transfer``: receiving the exchanged data;
         * ``wait``: blocked until a partner's data is there (idle);
-        * ``sync``: all time in the syncs (wait + transfer + part of work);
+        * ``sync``: all time in the syncs (wait + transfer + part of work
+          and halo);
         * ``idle``: wait / elapsed.
 
-        Schedule "sync"; ``wait`` and ``transfer`` exclude the initial sync."""
+        compute + work + halo + transfer + wait = elapsed. Schedule "sync";
+        everything excludes the initial sync."""
         elapsed = MPI.Wtime() - self._t_start if self._t_start is not None else 0.0
-        wait, transfer = self.clock.wait, self.clock.transfer
-        work = max(self.t_sync - wait - transfer, 0.0) + self.t_stage
+        c = self.clock
+        work = max(self.t_sync + self.t_stage - c.wait - c.transfer - c.halo, 0.0)
         return dict(level=self.lev.name, tile=self.t, elapsed=elapsed, sync=self.t_sync,
-                    compute=max(elapsed - self.t_sync - self.t_stage, 0.0), work=work,
-                    transfer=transfer, wait=wait, idle=wait / elapsed if elapsed > 0 else 0.0)
+                    compute=max(elapsed - self.t_sync - self.t_stage, 0.0), model_halo_wait=c.model_halo_wait(),
+                    work=work, halo=c.halo, halo_wait=c.halo_wait,
+                    transfer=c.transfer, wait=c.wait, idle=c.wait / elapsed if elapsed > 0 else 0.0)
 
     def describe(self) -> List[str]:
         """Messages of the U/V transfers of this process."""
