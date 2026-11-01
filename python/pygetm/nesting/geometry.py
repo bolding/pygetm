@@ -333,7 +333,8 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
     """Active region of a child from its YAML ``active`` entry::
 
         active:
-          seed: [3.0, 55.0]                 # lon, lat of a wet point
+          seed: [3.0, 55.0]                 # lon, lat of a wet point (or a list of
+                                            # points: water connected to any of them)
           barriers:                         # every key must hold
             - {lat_gt: 61.0, lon_lt: 8.0}   # also lon_gt, lat_lt
 
@@ -365,12 +366,17 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
         barred |= sel
     ok &= ~barred
     lab, _ = ndimage.label(ok)
-    sx, sy = spec["seed"]
-    seed = lab[int(np.argmin(abs(lat - float(sy)))), int(np.argmin(abs(lon - float(sx))))]
-    if seed == 0:
-        raise ValueError(f"{level.name}: seed {spec['seed']} is on land or behind a barrier")
+    seeds = spec["seed"]
+    if np.ndim(seeds) == 1:  # one point [lon, lat], or a list of points
+        seeds = [seeds]
+    ids = []
+    for sx, sy in seeds:
+        seed = lab[int(np.argmin(abs(lat - float(sy)))), int(np.argmin(abs(lon - float(sx))))]
+        if seed == 0:
+            raise ValueError(f"{level.name}: seed {[sx, sy]} is on land or behind a barrier")
+        ids.append(seed)
     r = level.ratio
-    connected = lab == seed
+    connected = np.isin(lab, ids)
     # water the parent keeps: not connected to the seed, and continuing into
     # the parent's area (touching the window edge) or behind a barrier; water
     # cut off at this resolution (lagoons, fjord ends) counts as land

@@ -528,6 +528,10 @@ class TestNestingGeometry(unittest.TestCase):
         self.assertTrue(act[:6, :7].all())
         with self.assertRaises(ValueError):
             active_region(child, dict(seed=[15.0, 4.0], barriers=[]), wet & False)
+        # a list of seeds: the water behind the wall becomes active too
+        act2 = active_region(child, dict(seed=[[3.0, 4.0], [15.0, 4.0]], barriers=[{"lat_gt": 7.0, "lon_lt": 6.0}]), wet)
+        self.assertTrue(act2[:, 8:].all())
+        self.assertTrue((act2[:, :8] == act[:, :8]).all())
 
 
 class TestNestingSponge(unittest.TestCase):
