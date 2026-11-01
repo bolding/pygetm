@@ -839,14 +839,22 @@ class NestedBarotropic(Coupler):
         * ``idle``: wait / elapsed.
 
         compute + work + halo + transfer + wait = elapsed. Schedule "sync";
-        everything excludes the initial sync."""
+        everything excludes the initial sync.
+
+        For cost models: ``steps`` (model steps), ``cells`` (interior cells
+        of this subdomain, land included), ``wet`` (of them unmasked) and
+        ``open_boundary`` (open boundary points of this subdomain)."""
         elapsed = MPI.Wtime() - self._t_start if self._t_start is not None else 0.0
         c = self.clock
+        T = self.sim.T
+        mask = T.mask.all_values[T.haloy:T.haloy + T.ny, T.halox:T.halox + T.nx]
         work = max(self.t_sync + self.t_stage - c.wait - c.transfer - c.halo, 0.0)
         return dict(level=self.lev.name, tile=self.t, elapsed=elapsed, sync=self.t_sync,
                     compute=max(elapsed - self.t_sync - self.t_stage, 0.0), model_halo_wait=c.model_halo_wait(),
                     work=work, halo=c.halo, halo_wait=c.halo_wait,
-                    transfer=c.transfer, wait=c.wait, idle=c.wait / elapsed if elapsed > 0 else 0.0)
+                    transfer=c.transfer, wait=c.wait, idle=c.wait / elapsed if elapsed > 0 else 0.0,
+                    steps=self._k, cells=int(mask.size), wet=int((mask != 0).sum()),
+                    open_boundary=int(getattr(self.sim.open_boundaries, "np", 0)))
 
     def describe(self) -> List[str]:
         """Messages of the U/V transfers of this process."""
