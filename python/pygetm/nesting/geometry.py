@@ -22,6 +22,14 @@ Other non-active cells are not used (dry). A parent does not compute in its
 hole (the union of its children's active regions); the hole cells that
 something reads form the rim, filled from the child.
 
+A child of the root whose window reaches the root's outer edge has *outer
+sides* there (:attr:`Level.outer_sides`): its band beyond them lies outside
+the root, nothing fills it (it is not part of the ring and must be dry), and
+its faces on the root's edge are not interface faces. The child's cells on
+that edge are its own open boundary: the model sets it like the root's open
+boundaries (e.g. Flather from a boundary file at the child's points), and the
+root leaves it to the child (it does not compute its hole).
+
 Face convention: the U face with index (j, i) is the east face of T cell
 (j, i), the V face (j, i) its north face. Interface faces are kept as flat
 arrays (see :func:`boundary_faces`): x faces first, then y faces, row-major.
@@ -93,6 +101,7 @@ class Level:
         if parent is not None and self.band != halo:
             raise ValueError(f"{name}: a child needs a band of {halo} cells")
         if parent is None:
+            self.outer_sides = ""
             self.ratio, self.window, self.time_ratio = 1, None, 1
             self.nx, self.ny = int(cfg["nx"]), int(cfg["ny"])
             self.lon0, self.lat0 = float(cfg["lon0"]), float(cfg["lat0"])
@@ -111,6 +120,11 @@ class Level:
                 raise ValueError(f"{name}: time_ratio must be >= 1")
             self.nx, self.ny = (i1 - i0) * r, (j1 - j0) * r
             self.dlon, self.dlat = parent.dlon / r, parent.dlat / r
+            #: sides ("W", "E", "S", "N") where the window reaches the root's
+            #: outer edge: the child's own open boundary there
+            self.outer_sides = ""
+            if parent.parent is None:
+                self.outer_sides = "".join(s for s, at in zip(SIDES, (i0 == 0, i1 == parent.nx, j0 == 0, j1 == parent.ny)) if at)
             self.lon0 = parent.lon0 + i0 * parent.dlon
             self.lat0 = parent.lat0 + j0 * parent.dlat
             parent.children.append(self)
@@ -216,6 +230,12 @@ class Level:
             f = boundary_faces(self.hole_of(c))
             oj, oi = f["other"]
             in_dom = (oj >= 0) & (oj < self.ny) & (oi >= 0) & (oi < self.nx)
+            if self.parent is None and not in_dom.all():
+                # faces on the root's outer edge: the child's own open boundary
+                # (its outer sides), not interface faces
+                f = {k: (tuple(x[in_dom] for x in v) if isinstance(v, tuple) else v[in_dom]) for k, v in f.items()}
+                oj, oi = f["other"]
+                in_dom = in_dom[in_dom]
             ojc, oic = np.clip(oj, 0, self.ny - 1), np.clip(oi, 0, self.nx - 1)
             inside = in_dom & self.computed[ojc, oic]
             if (in_dom & ~inside & self.cactive[ojc, oic]).any():
@@ -223,7 +243,7 @@ class Level:
             up = -np.ones(inside.size, dtype=int)
             for n in np.nonzero(~inside)[0]:
                 if self.parent is None:
-                    continue  # the root's open boundary: nothing to pass on
+                    continue
                 key = (bool(f["is_x"][n]), int(f["face"][0][n]), int(f["face"][1][n]),
                        int(f["inner"][0][n]), int(f["inner"][1][n]))
                 if key not in lookup:
@@ -260,11 +280,26 @@ class Level:
         tm[h : h + self.ny, h : h + self.nx] = ~unread
         return tm
 
+    def outer_mask(self) -> np.ndarray:
+        """Cells of the extended shape beyond the outer sides (outside the
+        root): not filled from the parent, must be dry."""
+        h = self.band
+        out = np.zeros(self.extended_shape, dtype=bool)
+        if "W" in self.outer_sides:
+            out[:, :h] = True
+        if "E" in self.outer_sides:
+            out[:, h + self.nx :] = True
+        if "S" in self.outer_sides:
+            out[:h, :] = True
+        if "N" in self.outer_sides:
+            out[h + self.ny :, :] = True
+        return out
+
     def _ring_mask(self) -> np.ndarray:
         h = self.band
         act = np.zeros(self.extended_shape, dtype=bool)
         act[h : h + self.ny, h : h + self.nx] = self.cactive
-        return dilate(act, h) & ~act
+        return dilate(act, h) & ~act & ~self.outer_mask()
 
     def ring_cells(self):
         """Global (j, i) of all ring cells, row-major (for a full window: the

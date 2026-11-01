@@ -534,6 +534,47 @@ class TestNestingGeometry(unittest.TestCase):
         self.assertTrue((act2[:, :8] == act[:, :8]).all())
 
 
+    def test_outer_sides(self):
+        """A child whose window reaches the root's edge owns that part of the
+        open boundary: no ring and no interface faces beyond it, and its band
+        there is dry after the mask consistency."""
+        from pygetm.nesting.geometry import load_levels
+        from pygetm.nesting import masks
+
+        cfg = dict(
+            root=dict(nx=10, ny=8, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
+            east=dict(parent="root", istart=6, istop=10, jstart=0, jstop=5, ratio=2),
+            inner=dict(parent="root", istart=1, istop=4, jstart=2, jstop=6, ratio=2),
+        )
+        levels = {l.name: l for l in load_levels(cfg, halo=2, root_band=0)}
+        east, inner = levels["east"], levels["inner"]
+        self.assertEqual(east.outer_sides, "ES")
+        self.assertEqual(inner.outer_sides, "")
+        h = east.band
+        ring = east._ring_mask()
+        self.assertFalse(ring[:, h + east.nx :].any())  # nothing beyond the east edge
+        self.assertFalse(ring[:h, :].any())  # nor beyond the south edge
+        self.assertTrue(ring[h:, :h].any())  # the west and north bands are ring
+        self.assertTrue(ring[h + east.ny :, h:].any())
+        self.assertTrue(east.outer_mask()[:, h + east.nx :].all())
+        # the ring's parent cells all lie inside the root
+        pj, pi, _, _ = east.ring_source(*east.ring_cells())
+        self.assertTrue(((pj >= 0) & (pj < 8) & (pi >= 0) & (pi < 10)).all())
+        # interface faces: only the west and north sides of the window
+        wf = levels["root"].wfaces["east"]
+        oj, oi = wf["out"]
+        self.assertTrue(((oj >= 0) & (oj < 8) & (oi >= 0) & (oi < 10)).all())
+        self.assertEqual(wf["is_x"].size, 5 + 4)
+        self.assertEqual(east.edge["is_x"].size, 2 * (5 + 4))
+        # an all-wet setup: the band beyond the outer sides becomes dry
+        wet = {n: np.ones(l.extended_shape, dtype=bool) for n, l in levels.items()}
+        H = {n: np.full(l.extended_shape, 10.0) for n, l in levels.items()}
+        wet2, _, changes = masks.make_consistent(levels.values(), wet, H)
+        self.assertFalse(wet2["east"][east.outer_mask()].any())
+        self.assertTrue(wet2["east"][h : h + east.ny, h : h + east.nx].all())
+        self.assertFalse(any(masks.check_consistent(levels.values(), wet2)["east"].values()))
+
+
 class TestNestingSponge(unittest.TestCase):
     def test_water_distance_and_weight(self):
         from pygetm.nesting.sponge import sponge_weight, water_distance
