@@ -22,13 +22,14 @@ Other non-active cells are not used (dry). A parent does not compute in its
 hole (the union of its children's active regions); the hole cells that
 something reads form the rim, filled from the child.
 
-A child of the root whose window reaches the root's outer edge has *outer
-sides* there (:attr:`Level.outer_sides`): its band beyond them lies outside
+A child whose window reaches the root's outer edge has *outer sides* there
+(:attr:`Level.outer_sides`; a child of the root at the root's edge, a
+grandchild at an outer side of its parent, and so on): its band beyond them lies outside
 the root, nothing fills it (it is not part of the ring and must be dry), and
 its faces on the root's edge are not interface faces. The child's cells on
 that edge are its own open boundary: the model sets it like the root's open
 boundaries (e.g. Flather from a boundary file at the child's points), and the
-root leaves it to the child (it does not compute its hole).
+parent leaves it to the child (it does not compute its hole).
 
 Face convention: the U face with index (j, i) is the east face of T cell
 (j, i), the V face (j, i) its north face. Interface faces are kept as flat
@@ -121,10 +122,10 @@ class Level:
             self.nx, self.ny = (i1 - i0) * r, (j1 - j0) * r
             self.dlon, self.dlat = parent.dlon / r, parent.dlat / r
             #: sides ("W", "E", "S", "N") where the window reaches the root's
-            #: outer edge: the child's own open boundary there
-            self.outer_sides = ""
-            if parent.parent is None:
-                self.outer_sides = "".join(s for s, at in zip(SIDES, (i0 == 0, i1 == parent.nx, j0 == 0, j1 == parent.ny)) if at)
+            #: outer edge (the root's edge, or an outer side of the parent):
+            #: the child's own open boundary there
+            at_edge = (i0 == 0, i1 == parent.nx, j0 == 0, j1 == parent.ny)
+            self.outer_sides = "".join(s for s, at in zip(SIDES, at_edge) if at and parent.is_outer(s))
             self.lon0 = parent.lon0 + i0 * parent.dlon
             self.lat0 = parent.lat0 + j0 * parent.dlat
             parent.children.append(self)
@@ -134,6 +135,11 @@ class Level:
         self.set_active(None)
         self.index = -1
         self.steps_per_root = 1 if parent is None else parent.steps_per_root * self.time_ratio
+
+    def is_outer(self, side: str) -> bool:
+        """Whether this level's side ("W", "E", "S", "N") lies on the root's
+        outer edge: every side of the root, the outer sides of a child."""
+        return self.parent is None or side in self.outer_sides
 
     def set_active(self, mask: Optional[np.ndarray]):
         """Set the active region: a boolean mask of the window's parent cells
@@ -230,12 +236,17 @@ class Level:
             f = boundary_faces(self.hole_of(c))
             oj, oi = f["other"]
             in_dom = (oj >= 0) & (oj < self.ny) & (oi >= 0) & (oi < self.nx)
-            if self.parent is None and not in_dom.all():
-                # faces on the root's outer edge: the child's own open boundary
-                # (its outer sides), not interface faces
-                f = {k: (tuple(x[in_dom] for x in v) if isinstance(v, tuple) else v[in_dom]) for k, v in f.items()}
+            # faces on the root's outer edge (beyond an outer side of this
+            # level): the child's own open boundary there, not interface faces
+            outer = np.zeros(in_dom.shape, dtype=bool)
+            for s, beyond in zip(SIDES, (oi < 0, oi >= self.nx, oj < 0, oj >= self.ny)):
+                if self.is_outer(s):
+                    outer |= beyond
+            if outer.any():
+                keep = ~outer
+                f = {k: (tuple(x[keep] for x in v) if isinstance(v, tuple) else v[keep]) for k, v in f.items()}
                 oj, oi = f["other"]
-                in_dom = in_dom[in_dom]
+                in_dom = in_dom[keep]
             ojc, oic = np.clip(oj, 0, self.ny - 1), np.clip(oi, 0, self.nx - 1)
             inside = in_dom & self.computed[ojc, oic]
             if (in_dom & ~inside & self.cactive[ojc, oic]).any():
@@ -415,13 +426,22 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
     # water the parent keeps: not connected to the seed, and continuing into
     # the parent's area (touching the window edge) or behind a barrier; water
     # cut off at this resolution (lagoons, fjord ends) counts as land
+    # (an outer side is the root's edge: water touching it does not continue
+    # into the parent's area)
     other, _ = ndimage.label(wet & ~connected)
-    edge = np.unique(np.concatenate([other[0], other[-1], other[:, 0], other[:, -1], other[barred & wet]]))
+    sides = {"W": other[:, 0], "E": other[:, -1], "S": other[0], "N": other[-1]}
+    edge = np.unique(np.concatenate([v for s, v in sides.items() if s not in level.outer_sides] + [other[barred & wet]]))
     kept = np.isin(other, edge[edge > 0])
     blocks = lambda m: m.reshape(level.ny // r, r, level.nx // r, r).any(axis=(1, 3))
     # every parent cell without water the parent keeps is active: land always
-    # belongs to the child (it costs nothing; nested active regions then fit)
-    return blocks(connected) | ~blocks(kept)
+    # belongs to the child (it costs nothing; nested active regions then fit),
+    # as far as it lies in the parent's active region (land at this resolution
+    # may be water the parent keeps, e.g. a grandparent's at a narrow channel)
+    land = ~blocks(kept)
+    if level.parent is not None and level.parent.cactive is not None:
+        i0, i1, j0, j1 = level.window
+        land &= level.parent.cactive[j0:j1, i0:i1]
+    return blocks(connected) | land
 
 
 def load_levels(config, halo: int = 2, root_band: Optional[int] = None,

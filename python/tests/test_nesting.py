@@ -574,6 +574,41 @@ class TestNestingGeometry(unittest.TestCase):
         self.assertTrue(wet2["east"][h : h + east.ny, h : h + east.nx].all())
         self.assertFalse(any(masks.check_consistent(levels.values(), wet2)["east"].values()))
 
+    def test_outer_sides_grandchild(self):
+        """A grandchild at an outer side of its parent owns that part of the
+        open boundary too; on the parent's other sides it has interface faces
+        on the parent's interface."""
+        from pygetm.nesting.geometry import load_levels
+        from pygetm.nesting import masks
+
+        cfg = dict(
+            root=dict(nx=10, ny=8, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
+            east=dict(parent="root", istart=5, istop=10, jstart=1, jstop=6, ratio=2),
+            # reaches east's east edge (outer) and its south edge (not outer)
+            gc=dict(parent="east", istart=4, istop=10, jstart=0, jstop=6, ratio=3),
+        )
+        levels = {l.name: l for l in load_levels(cfg, halo=2, root_band=0)}
+        east, gc = levels["east"], levels["gc"]
+        self.assertEqual(east.outer_sides, "E")
+        self.assertEqual(gc.outer_sides, "E")
+        h = gc.band
+        ring = gc._ring_mask()
+        self.assertFalse(ring[:, h + gc.nx :].any())
+        self.assertTrue(ring[:h, h:].any())  # south: ring from east's band (over the root)
+        wf = east.wfaces["gc"]
+        oj, oi = wf["out"]
+        self.assertTrue((oi < east.nx).all())  # no interface faces beyond the outer side
+        self.assertEqual(wf["is_x"].size, 6 + 6 + 6)  # west, south, north
+        south = oj < 0
+        self.assertEqual(int(south.sum()), 6)
+        self.assertTrue((wf["up"][south] >= 0).all())  # on east's interface with the root
+        self.assertTrue((wf["up"][~south] < 0).all())
+        wet = {n: np.ones(l.extended_shape, dtype=bool) for n, l in levels.items()}
+        H = {n: np.full(l.extended_shape, 10.0) for n, l in levels.items()}
+        wet2, _, _ = masks.make_consistent(levels.values(), wet, H)
+        self.assertFalse(wet2["gc"][gc.outer_mask()].any())
+        self.assertFalse(any(masks.check_consistent(levels.values(), wet2)["gc"].values()))
+
 
 class TestNestingSponge(unittest.TestCase):
     def test_water_distance_and_weight(self):
