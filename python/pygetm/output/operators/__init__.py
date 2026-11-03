@@ -10,7 +10,6 @@ from typing import (
     NamedTuple,
     TypeVar,
 )
-import collections
 import enum
 import functools
 
@@ -135,7 +134,7 @@ class Base:
 
 
 class WrappedArray(Base):
-    __slots__ = ("_name", "values", "_global_field")
+    __slots__ = ("_name", "values", "_global_field", "_coords")
 
     def __init__(
         self,
@@ -143,14 +142,19 @@ class WrappedArray(Base):
         name: str,
         dims: tuple[str, ...],
         global_field: Optional[Base] = None,
+        coords: Iterable[Base] = (),
         **kwargs,
     ):
-        super().__init__(
-            name, values.shape, dims, values.dtype, time_varying=False, **kwargs
-        )
+        dtype = values.dtype
+        if dtype == object and all(isinstance(v, str) for v in values.ravel()):
+            # The array has object dtype but all elements are strings. Present as str
+            # instead, which is understood by both netCDF4 and zarr.
+            dtype = str
+        super().__init__(name, values.shape, dims, dtype, time_varying=False, **kwargs)
         self._name = name
         self.values = values
         self._global_field = global_field or self
+        self._coords = tuple(coords)
 
     def gather(self) -> Base:
         return self._global_field
@@ -161,7 +165,7 @@ class WrappedArray(Base):
 
     @property
     def coords(self) -> Iterable[Base]:
-        return ()
+        yield from self._coords
 
     def get(
         self, out: Optional[ArrayLike] = None, slice_spec: tuple[int, ...] = ()
@@ -185,7 +189,7 @@ class FieldCollection(Mapping[str, Base]):
         default_dtype: Optional[DTypeLike] = None,
         sub: bool = False,
     ):
-        self.fields: MutableMapping[str, Base] = collections.OrderedDict()
+        self.fields: MutableMapping[str, Base] = {}
         self.expression2name: MutableMapping[str, str] = {}
         self.available_fields = available_fields
         self.default_dtype = default_dtype
@@ -338,8 +342,12 @@ class FieldCollection(Mapping[str, Base]):
         return final_name
 
     def add_coordinates(self):
-        for field in list(self.fields.values()):
-            field.coordinates.extend(self.require(f) for f in field.coords)
+        todo = list(self.fields.values())
+        while todo:
+            previous = frozenset(self.fields.keys())
+            for field in todo:
+                field.coordinates.extend(self.require(f) for f in field.coords)
+            todo = [v for n, v in self.fields.items() if n not in previous]
 
     def require(self, field: Base) -> str:
         """Ensure that the specified variable (or expression of variables) is included

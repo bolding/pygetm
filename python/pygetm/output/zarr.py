@@ -135,7 +135,9 @@ class ZarrGroup(File):
             included_fields = self.select_nonempty_fields()
             if included_fields:
                 self.root = self._run(
-                    zarr.create_group(store=self.store, overwrite=True)
+                    zarr.create_group(
+                        store=self.store, overwrite=True, attributes=self.attrs
+                    )
                 )
 
                 needs_time = False
@@ -199,9 +201,15 @@ class ZarrGroup(File):
         for field, cache in self._varying_fields:
             field.get(cache[self._ncache, ...])
         self.itime += 1
-        self._ncache += 1
+        if self.root is not None:
+            self._ncache += 1
         if self._ncache == self._chunk_size:
             self._empty_cache()
+
+    def update_attributes(self, **new_attrs):
+        super().update_attributes(**new_attrs)
+        if self.root is not None:
+            self._schedule(self.root.update_attributes(new_attrs))
 
     def close_now(self, seconds_passed: float, time: Optional[cftime.datetime]):
         if self._ncache > 0:
