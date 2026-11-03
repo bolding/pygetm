@@ -169,3 +169,17 @@ def test_gather_scatter_columns():
     ref = arr.copy()
     ref[::-1, jj[sel], ii[sel]] = vals.T
     assert np.array_equal(dst, ref)
+
+
+def test_numpy_switch(monkeypatch):
+    """PYGETM_NESTING_REMAP=numpy: the pure numpy path, the same results."""
+    zs = vr.interfaces(rng.uniform(0.5, 2.0, (30, 8)))
+    zd = vr.interfaces(rng.uniform(0.5, 2.0, (30, 12)))
+    zd *= (zs[:, -1] / zd[:, -1])[:, None]
+    c = rng.normal(size=(2, 30, 8))
+    h = np.diff(zs, axis=-1)
+    a = vr.contents(zs, zd, c, h, "ppm")
+    monkeypatch.setenv("PYGETM_NESTING_REMAP", "numpy")
+    assert vr._kernel("vertical_remap") is None
+    b = vr.contents(zs, zd, c, h, "ppm")
+    assert np.abs(a - b).max() < 1e-12

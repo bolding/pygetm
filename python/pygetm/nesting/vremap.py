@@ -254,12 +254,7 @@ def contents(zs, zd, c, h, scheme="pcm"):
     target interfaces ``zd [..., nd+1]`` (depths below the surface), concentrations ``c [(tracers,)
     ..., ns]`` and source thicknesses ``h [..., ns]``: the same as ``apply(prepare(zs, zd), c, h,
     scheme)``, with the compiled kernel (``_pygetm.vertical_remap``) when it is available."""
-    try:
-        from .. import _pygetm
-
-        kernel = _pygetm.vertical_remap
-    except (ImportError, AttributeError):
-        kernel = None
+    kernel = _kernel("vertical_remap")
     zs = np.asarray(zs, dtype=float)
     zd = np.asarray(zd, dtype=float)
     h = np.asarray(h, dtype=float)
@@ -281,6 +276,13 @@ def contents(zs, zd, c, h, scheme="pcm"):
 
 
 def _kernel(name):
+    """A compiled routine of pyGETM, or None: then the numpy versions are used. Set the environment variable
+    PYGETM_NESTING_REMAP=numpy to use numpy anyway (a simpler, pure-Python path, e.g. for debugging or
+    for changes to the remap that are easier to try in numpy first)."""
+    import os
+
+    if os.environ.get("PYGETM_NESTING_REMAP", "").lower() == "numpy":
+        return None
     try:
         from .. import _pygetm
 
