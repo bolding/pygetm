@@ -14,7 +14,7 @@
 ! depths below the surface (zs(1) = zd(1) = 0); h is the thickness the content refers to
 ! (the source layer's content is c * h, spread over zs(k)..zs(k+1)).
 
-module c_vertical_remap
+module vertical_remap_kernel
 
    use iso_c_binding, only: c_int, c_double
 

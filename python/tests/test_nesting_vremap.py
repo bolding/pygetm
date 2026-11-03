@@ -128,3 +128,29 @@ def test_ppm_more_accurate_than_pcm():
     e_pcm = np.abs(vr.remap(hs, means(vr.interfaces(hs)), hd, "pcm") - ref).max()
     e_ppm = np.abs(vr.remap(hs, means(vr.interfaces(hs)), hd, "ppm") - ref).max()
     assert e_ppm < 0.2 * e_pcm
+
+
+@pytest.mark.parametrize("scheme", ["pcm", "ppm"])
+def test_compiled_kernel_matches_numpy(scheme):
+    """vremap.contents (compiled kernel) against prepare + apply (numpy)."""
+    pytest.importorskip("pygetm._pygetm")
+    from pygetm import _pygetm
+
+    if not hasattr(_pygetm, "vertical_remap"):
+        pytest.skip("kernel not built")
+    n, ns, nd = 400, 13, 21
+    hs = rng.uniform(0.0, 2.0, (n, ns))
+    hs[rng.uniform(size=hs.shape) < 0.1] = 0.0  # empty layers
+    hs[:, 0] += 0.1
+    zs = vr.interfaces(hs)
+    hd = rng.uniform(0.1, 2.0, (n, nd))
+    zd = vr.interfaces(hd) * (zs[:, -1] / vr.interfaces(hd)[:, -1])[:, None]
+    zd[:50] = zs[:50, :1] + np.linspace(0, 1, nd + 1)[None] * zs[:50, -1:] * 1.3  # beyond the source
+    zd[50:100, : ns + 1] = zs[50:100]  # coinciding interfaces
+    zd[50:100, ns + 1:] = zs[50:100, -1:]
+    zd[50:100] = np.maximum.accumulate(zd[50:100], axis=1)
+    c = rng.normal(size=(3, n, ns))
+    ref = vr.apply(vr.prepare(zs, zd), c, hs, scheme)
+    out = vr.contents(zs, zd, c, hs, scheme)
+    assert out.shape == ref.shape
+    assert np.abs(out - ref).max() < 1e-11

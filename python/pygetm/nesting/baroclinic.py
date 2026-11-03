@@ -93,10 +93,10 @@ def remap_amounts(F, h_src, h_dst, keep=0.0):
     h_src = np.where(dry[..., None], 1.0 / h_src.shape[-1], h_src)
     F = np.where(dry[..., None], 0.0, F)
     zs = vremap.stretch(vremap.interfaces(h_src), h_src.sum(axis=-1), h_dst.sum(axis=-1), keep)
-    prep = vremap.prepare(zs, vremap.interfaces(h_dst))
+    zd = np.broadcast_to(vremap.interfaces(h_dst), zs.shape[:-1] + (h_dst.shape[-1] + 1,))
     with np.errstate(invalid="ignore", divide="ignore"):
         c = np.where(h_src > 0.0, F / h_src, 0.0)
-    return vremap.apply(prep, c, h_src)
+    return vremap.contents(zs, zd, c, h_src)
 
 
 def remap_conc_z(c, h_src, h_dst, w=None, scheme="ppm"):
@@ -113,10 +113,9 @@ def remap_conc_z(c, h_src, h_dst, w=None, scheme="ppm"):
     zs[..., -1] = Dd[..., 0]
     h_eff = np.diff(zs, axis=-1)
     zd = np.broadcast_to(vremap.interfaces(h_dst)[..., None, :], zs.shape[:-1] + (h_dst.shape[-1] + 1,))
-    prep = vremap.prepare(zs, zd)
     w = np.ones(h_src.shape[:-1]) if w is None else w
-    C = (w[..., None] * vremap.apply(prep, c, h_eff, scheme)).sum(axis=-2)
-    V = (w[..., None] * vremap.apply(prep, np.ones_like(h_eff), h_eff)).sum(axis=-2)
+    C = (w[..., None] * vremap.contents(zs, zd, c, h_eff, scheme)).sum(axis=-2)
+    V = (w[..., None] * vremap.contents(zs, zd, np.ones(h_eff.shape), h_eff)).sum(axis=-2)
     with np.errstate(invalid="ignore", divide="ignore"):
         return np.where(V > 0.0, C / V, 0.0)
 
