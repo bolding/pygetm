@@ -99,6 +99,39 @@ def remap_amounts(F, h_src, h_dst, keep=0.0):
     return vremap.apply(prep, c, h_src)
 
 
+def remap_conc_z(c, h_src, h_dst, w=None):
+    """Concentrations ``c [nt, ..., m, ns]`` of source columns (thicknesses ``h_src
+    [..., m, ns]``, surface first) onto target layers ``h_dst [..., nd]``, with every
+    source interface kept at its depth below the surface: only the bottom source
+    layer is cut or extended to the target's depth. Concentrations by the volume each
+    target layer receives, the m source columns weighted by ``w [..., m]`` (default
+    1): a horizontally uniform field (flat isopycnals) stays exactly so, whatever the
+    depths, and a uniform field uniform."""
+    zs = vremap.interfaces(h_src)
+    Dd = h_dst.sum(axis=-1)[..., None, None]
+    zs = np.minimum(zs, Dd)
+    zs[..., -1] = Dd[..., 0]
+    h_eff = np.diff(zs, axis=-1)
+    zd = np.broadcast_to(vremap.interfaces(h_dst)[..., None, :], zs.shape[:-1] + (h_dst.shape[-1] + 1,))
+    prep = vremap.prepare(zs, zd)
+    w = np.ones(h_src.shape[:-1]) if w is None else w
+    C = (w[..., None] * vremap.apply(prep, c, h_eff)).sum(axis=-2)
+    V = (w[..., None] * vremap.apply(prep, np.ones_like(h_eff), h_eff)).sum(axis=-2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(V > 0.0, C / V, 0.0)
+
+
+def remap_column(c, h_src, h_dst, keep=0.0, z=False):
+    if z:
+        return remap_conc_z(c[:, :, None, :], h_src[:, None, :], h_dst)
+    """Concentrations ``c [nt, n, ns]`` of columns with thicknesses ``h_src`` onto
+    the layers ``h_dst [n, nd]`` (surface first), the source stretched to the
+    target's depth below ``keep`` x min(depths), by volume (uniform stays uniform);
+    ``z``: interfaces kept at their depths (:func:`remap_conc_z`)."""
+    shared = vremap.rim_columns_prepare(h_src[:, None, :], np.ones((h_src.shape[0], 1)), h_dst, keep=keep)
+    return vremap.rim_columns_apply(shared, c[:, :, None, :], h_src[:, None, :], h_dst, by_volume=True)
+
+
 class NestedTracers3D(Coupler):
     """Exchange of 3D tracers (T-grid arrays ``(nz, ny, nx)``) with the parent
     and the children, at every macro time step.
@@ -115,7 +148,8 @@ class NestedTracers3D(Coupler):
 
     def __init__(self, nest: NestingRun, sim, tracers: Optional[Sequence] = None, keep: float = 0.8,
                  break_ring: bool = False, break_rim: bool = False, flux_matching: bool = True,
-                 flux_form: str = "consistent", replace_transport: bool = True, ring_velocities: bool = True):
+                 flux_form: str = "consistent", replace_transport: bool = True, ring_velocities: bool = True,
+                 ring_detail: bool = True, vertical_map: str = "z"):
         self.nest, self.sim = nest, sim
         self.lev = nest.level
         self.t = nest.tile
@@ -149,6 +183,24 @@ class NestedTracers3D(Coupler):
         #: the child's 3D transports at its ring faces from the parent's (sent
         #: at every sync, set at the child's next momentum_3d stage)
         self.ring_velocities = ring_velocities
+        #: the ring's profile = the parent's, remapped, + the child's own vertical
+        #: detail: (child's adjacent interior column remapped onto the ring cell's
+        #: layers) - (the same column through the parent's layers and back). The
+        #: parent's layer means cannot carry the child's finer vertical structure;
+        #: without this the ring's stepped profile next to the child's smooth one
+        #: is a horizontal density gradient at the interface (IDEAL V2: spurious
+        #: currents of 1-2 cm/s in a lake at rest, 10x the single-model error)
+        self.ring_detail = ring_detail
+        #: remap of concentrations (ring, rim): "z" (default) keeps every interface at
+        #: its depth below the surface and cuts or extends only the bottom layer, so
+        #: flat isopycnals stay flat over a sloping bottom; "stretch": the upper
+        #: ``keep`` of the column at its depth, the rest stretched (the amounts of the
+        #: flux register and the transports are always remapped with the stretch,
+        #: which keeps their sums exactly). IDEAL V2 (lake at rest over a slope):
+        #: "stretch" displaces the pycnocline where the column is shallow
+        if vertical_map not in ("z", "stretch"):
+            raise ValueError(f"vertical_map {vertical_map!r}")
+        self.zmap = vertical_map == "z"
         self._ring_uv = None
         self.t_transport = 0.0
         self.max_correction = 0.0
@@ -254,8 +306,18 @@ class NestedTracers3D(Coupler):
         if not ok.any():
             return
         hs, cs, hd = hs[ok], cs[:, ok], hd[ok]
-        shared = vremap.rim_columns_prepare(hs[:, None, :], np.ones((hs.shape[0], 1)), hd, keep=self.keep)
-        c = vremap.rim_columns_apply(shared, cs[:, :, None, :], hs[:, None, :], hd, by_volume=True)
+        c = remap_column(cs, hs, hd, self.keep, self.zmap)
+        if self.ring_detail:
+            ij, ii_ = self._rin_j[ok], self._rin_i[ok]
+            m = self._rin_ok[ok].copy()
+            if m.any():
+                hin = self.sim.T.hn.all_values[::-1, ij, ii_].T
+                cin = np.stack([f.all_values[::-1, ij, ii_].T for f in self.tracers])
+                m &= np.isfinite(hin).all(axis=1) & (hin.sum(axis=1) > 0.0)
+                z = self.zmap
+                direct = remap_column(cin[:, m], hin[m], hd[m], self.keep, z)
+                back = remap_column(remap_column(cin[:, m], hin[m], hs[m], self.keep, z), hs[m], hd[m], self.keep, z)
+                c[:, m] += direct - back
         for f, cf in zip(self.tracers, c):
             new = cf.T[::-1]  # pyGETM: layer 0 at the bottom
             old = f.all_values[:, rj[ok], ri[ok]]
@@ -307,6 +369,11 @@ class NestedTracers3D(Coupler):
         dry = (W <= 0.0) | (H.sum(axis=-1) <= 0.0)
         W = np.where(dry, 0.0, W)
         H = np.where(dry[..., None], hp.sum(axis=-1)[:, None, None] / nzc, H)
+        if self.zmap:
+            c = remap_conc_z(C, H, hp, W)
+            for f, cf in zip(self.tracers, c):
+                f.all_values[:, jj[ok], ii[ok]] = cf.T[::-1]
+            return
         shared = vremap.rim_columns_prepare(H, W, hp, keep=self.keep)
         # concentrations by the child volume each parent layer receives: the
         # child columns' content per child volume. Their total volume differs
@@ -538,6 +605,9 @@ class NestedTracers3D(Coupler):
                 if self.ring_velocities:
                     reqs += self._send_ring_uv(plan, tx)
         if self.up is not None:
+            if self.ring_detail:
+                for f in self.tracers:  # the interior cells next to the ring may lie in the halo
+                    f.update_halos()
             self._recv_ring()
             if self.ring_velocities:
                 self._recv_ring_uv()
@@ -581,6 +651,11 @@ class NestedTracers3D(Coupler):
             self._ring = [(p, v) for (p, tt), v in sorted(self.up.pro.items()) if tt == self.t]
             cat = lambda k: np.concatenate([v[k] for _, v in self._ring]) if self._ring else np.zeros(0, int)
             self._rj, self._ri = self.loc(cat(2), cat(3))
+            # the child's interior cell next to each ring cell (within the halo)
+            gj = np.clip(cat(2), 0, self.lev.ny - 1)
+            gi = np.clip(cat(3), 0, self.lev.nx - 1)
+            self._rin_ok = self.lev.computed[gj, gi]
+            self._rin_j, self._rin_i = self.loc(gj, gi)
         self.fluxes = []
         if self.flux_matching:
             U, V = sim.U, sim.V
