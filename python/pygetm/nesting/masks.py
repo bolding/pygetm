@@ -14,6 +14,14 @@ child overlap they are reconciled, the child's finer bathymetry leading:
    tracer through a face for which the parent has no value - the one
    mismatch flux matching cannot repair. Child cells that are neither active
    nor ring (parts of the window the parent keeps) are made dry.
+3. faces: a parent interface face between two wet cells whose r child
+   sub-faces are all closed (the child's cells along the face dry, or its
+   ring cells) is closed in the parent too. Flux matching would set its
+   transport to zero anyway, but the parent's momentum equation would keep a
+   transport there and the parent's advection would use it. The faces are
+   stored per level (:attr:`Level.closed_faces`) and closed in the level's
+   domain mask before its grids are built
+   (:meth:`pygetm.nesting.runtime.NestingRun.build`).
 """
 
 from typing import Dict, Iterable
@@ -65,7 +73,59 @@ def make_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict
         changes[lev.name]["unused_dried"] += int(unused.sum())
         wet[lev.name][unused] = False
         H[lev.name][unused] = np.nan
+
+    for lev in levels:
+        lev.closed_faces = closed_faces(lev, wet)  # rule 3 (masks are unchanged)
     return wet, H, changes
+
+
+def _open_without_subfaces(lev: Level, c: Level, wet: Dict[str, np.ndarray]) -> np.ndarray:
+    """Per interface face of child ``c`` in ``lev`` (``lev.wfaces[c.name]``):
+    open in ``lev`` (both cells wet, the outside one computed by ``lev``)
+    while all r sub-faces of the child are closed."""
+    f = lev.wfaces[c.name]
+    hp, h, r = lev.band, c.band, c.ratio
+    (hj, hi), (oj, oi) = f["hole"], f["out"]
+    ins = f["inside"]
+    oj, oi = np.clip(oj, -hp, lev.ny - 1 + hp), np.clip(oi, -hp, lev.nx - 1 + hp)
+    pw = wet[lev.name]
+    popen = ins & pw[hj + hp, hi + hp] & pw[oj + hp, oi + hp]
+    e = c.edge
+    (cj, ci), s = e["inner"], np.asarray(e["sign"]).astype(int)
+    rj = np.where(e["is_x"], cj, cj + s)
+    ri = np.where(e["is_x"], ci + s, ci)
+    cw = wet[c.name]
+    sub = cw[cj + h, ci + h] & cw[rj + h, ri + h]
+    return popen & ~sub.reshape(-1, r).any(axis=1)
+
+
+def closed_faces(lev: Level, wet: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Interface faces of ``lev``'s children to close in ``lev`` (rule 3):
+    ``is_x`` (U face) and ``face`` (j, i) as in
+    :func:`pygetm.nesting.geometry.boundary_faces` (U point (j, i) between
+    cells (j, i) and (j, i + 1), V point between (j, i) and (j + 1, i))."""
+    is_x, fj, fi = [np.zeros(0, bool)], [np.zeros(0, int)], [np.zeros(0, int)]
+    for c in lev.children:
+        bad = _open_without_subfaces(lev, c, wet)
+        f = lev.wfaces[c.name]
+        is_x.append(f["is_x"][bad])
+        fj.append(f["face"][0][bad])
+        fi.append(f["face"][1][bad])
+    return dict(is_x=np.concatenate(is_x), face=(np.concatenate(fj), np.concatenate(fi)))
+
+
+def close_faces(lev: Level, domain) -> None:
+    """Close :attr:`Level.closed_faces` in ``domain`` (the level's domain
+    including its band; its supergrid mask, before the grids are built)."""
+    cf = getattr(lev, "closed_faces", None)
+    if cf is None or cf["is_x"].size == 0 or domain.mask is None:
+        return
+    h = lev.band
+    fj, fi = cf["face"][0] + h, cf["face"][1] + h
+    x = cf["is_x"]
+    # supergrid: T (j, i) at (2j + 1, 2i + 1); U east of it at (2j + 1, 2i + 2), V north at (2j + 2, 2i + 1)
+    domain.mask[2 * fj[x] + 1, 2 * fi[x] + 2] = 0
+    domain.mask[2 * fj[~x] + 2, 2 * fi[~x] + 1] = 0
 
 
 def check_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray]):
@@ -84,5 +144,19 @@ def check_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray]):
             "hole_mismatch": int((lev.active & (hole != cw.any(axis=(1, 3)))).sum()),
             "unused_wet": int((lev.unused() & wet[lev.name]).sum()),
             "band_wet_over_dry_parent": int((wet[lev.name][bj + h, bi + h] & ~wet[p.name][pj + p.band, pi + p.band]).sum()),
+            # open in the parent with all sub-faces closed and not closed by rule 3
+            "face_open_over_closed": int(_open_without_subfaces(p, lev, wet).sum()) - _n_closed(p, lev, wet),
         }
     return out
+
+
+def _n_closed(p: Level, c: Level, wet: Dict[str, np.ndarray]) -> int:
+    """How many of the faces rule 3 finds for child ``c`` are in ``p.closed_faces``."""
+    cf = getattr(p, "closed_faces", None)
+    if cf is None or cf["is_x"].size == 0:
+        return 0
+    bad = _open_without_subfaces(p, c, wet)
+    f = p.wfaces[c.name]
+    have = set(zip(cf["is_x"].tolist(), cf["face"][0].tolist(), cf["face"][1].tolist()))
+    want = zip(f["is_x"][bad].tolist(), f["face"][0][bad].tolist(), f["face"][1][bad].tolist())
+    return sum(k in have for k in want)

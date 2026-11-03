@@ -697,6 +697,40 @@ class TestNestingMasks(unittest.TestCase):
         np.testing.assert_array_equal(wet2["root"][2 + 14 : 2 + 20, 2 + 18 : 2 + 26], wet["root"][2 + 14 : 2 + 20, 2 + 18 : 2 + 26])
 
 
+    def test_faces_closed_over_closed_subfaces(self):
+        # rule 3: a parent interface face between two wet cells whose child
+        # sub-faces are all closed is closed in the parent, and in its domain mask
+        from pygetm.nesting.masks import make_consistent, check_consistent, close_faces
+
+        levels = small_hierarchy()
+        root, child = levels[0], levels[1]
+        wet = {l.name: np.ones(l.extended_shape, bool) for l in levels}
+        H = {l.name: np.full(l.extended_shape, 10.0) for l in levels}
+        f = root.wfaces[child.name]
+        n = int(np.nonzero(f["inside"] & f["is_x"])[0][0])  # one x interface face
+        e = child.edge
+        r, h = child.ratio, child.band
+        cj, ci = e["inner"]
+        k = slice(n * r, (n + 1) * r)
+        wet[child.name][cj[k] + h, ci[k] + h] = False  # the child's cells along it dry
+        wet2, H2, _ = make_consistent(levels, wet, H)
+        cf = root.closed_faces
+        self.assertEqual(cf["is_x"].size, 1)
+        self.assertTrue(cf["is_x"][0])
+        self.assertEqual((cf["face"][0][0], cf["face"][1][0]), (f["face"][0][n], f["face"][1][n]))
+        self.assertTrue(all(v == 0 for d in check_consistent(levels, wet2).values() for v in d.values()))
+        # in the domain mask: the U point closed, its T neighbours still wet
+        import types
+        hb = root.band
+        dom = types.SimpleNamespace(mask=np.ones((2 * root.extended_shape[0] + 1, 2 * root.extended_shape[1] + 1), int))
+        close_faces(root, dom)
+        fj, fi = f["face"][0][n] + hb, f["face"][1][n] + hb
+        self.assertEqual(dom.mask[2 * fj + 1, 2 * fi + 2], 0)
+        self.assertEqual(dom.mask[2 * fj + 1, 2 * fi + 1], 1)
+        self.assertEqual(dom.mask[2 * fj + 1, 2 * fi + 3], 1)
+        self.assertEqual(int((dom.mask == 0).sum()), 1)
+
+
 class TestNestingPlan(unittest.TestCase):
     def _check(self, levels, layouts):
         from pygetm.nesting.plan import LevelTiling, Plan

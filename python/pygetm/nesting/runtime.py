@@ -37,6 +37,7 @@ from .geometry import Level
 from .hierarchy import NestingContext, split_world
 from .plan import LevelTiling, Plan, gather_tilings
 from . import operators as ops
+from . import masks
 
 
 def install_abort_hook(comm: MPI.Comm, label: str):
@@ -103,6 +104,7 @@ class NestingRun:
         domain = make_domain(lev, self.comm)
         domain.external = lev.external()
         domain.tiling_mask = lev.tiling_mask()
+        masks.close_faces(lev, domain)  # interface faces with all child sub-faces closed
         grid_kwargs.setdefault("velocity_grids", 1)
         with self._tiling_hint():
             grid = domain.create_grids(nz, halox=lev.halo, haloy=lev.halo, **grid_kwargs)
@@ -119,6 +121,7 @@ class NestingRun:
         domain = make_domain(lev, self.comm)
         domain.external = lev.external()
         domain.tiling_mask = lev.tiling_mask()
+        masks.close_faces(lev, domain)  # interface faces with all child sub-faces closed
         with self._tiling_hint():
             sim = make_simulation(lev, domain)
         if sim.T is not None and sim.T.halox != lev.halo:
