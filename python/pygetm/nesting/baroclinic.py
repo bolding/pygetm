@@ -51,9 +51,16 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
   every layer of the interface, and the flux correction conserves the
   content exactly while keeping uniform fields uniform.
 
-Not yet: the ring's 3D velocities (the child computes its own at the
-interface faces), limited slopes in the ring, time interpolation of the
-ring.
+* **ring velocities (parent -> child, ``ring_velocities=True``):** at every
+  sync the parent sends its layer transports and face thicknesses at the
+  faces around the child's ring faces (2 per face, linear across and
+  constant along the parent faces, as the 2D ring). At its next
+  ``momentum_3d`` stage the child remaps them onto its own face layers,
+  shifts them to its own column total (the ring's 2D transport, which its
+  elevation used) and sets pk, qk there, then recomputes ww, uk, vk. Held
+  over the 3D step.
+
+Not yet: limited slopes in the ring, time interpolation of the ring.
 """
 
 from typing import List, Optional, Sequence
@@ -108,7 +115,7 @@ class NestedTracers3D(Coupler):
 
     def __init__(self, nest: NestingRun, sim, tracers: Optional[Sequence] = None, keep: float = 0.8,
                  break_ring: bool = False, break_rim: bool = False, flux_matching: bool = True,
-                 flux_form: str = "consistent", replace_transport: bool = True):
+                 flux_form: str = "consistent", replace_transport: bool = True, ring_velocities: bool = True):
         self.nest, self.sim = nest, sim
         self.lev = nest.level
         self.t = nest.tile
@@ -139,6 +146,10 @@ class NestedTracers3D(Coupler):
         #: layer of the interface, and the tracer correction is exact and keeps
         #: uniform fields uniform
         self.replace_transport = replace_transport
+        #: the child's 3D transports at its ring faces from the parent's (sent
+        #: at every sync, set at the child's next momentum_3d stage)
+        self.ring_velocities = ring_velocities
+        self._ring_uv = None
         self.t_transport = 0.0
         self.max_correction = 0.0
         self._tracer_spec = tracers
@@ -369,7 +380,7 @@ class NestedTracers3D(Coupler):
             h = np.where(np.isfinite(h), h, 0.0)
             q = self._volume_profiles(*args) / self.sim.macrotimestep  # m3 s-1 per layer
             buf = np.ascontiguousarray(np.concatenate([h.T, q.T], axis=0))
-            reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=self.up.tag_f + TAG_3D + 1))
+            reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=self.up.tag_f + TAG_3D + 300))
         return reqs
 
     def _recv_transports(self, plan, nzc: int) -> bool:
@@ -383,7 +394,7 @@ class NestedTracers3D(Coupler):
             if p != self.t:
                 continue
             buf = np.empty((2 * nzc, fpos.size))
-            self._recv(plan.comm, buf, plan.coff + tt, plan.tag_f + TAG_3D + 1)
+            self._recv(plan.comm, buf, plan.coff + tt, plan.tag_f + TAG_3D + 300)
             H[fpos, fa] = buf[:nzc].T
             Q[fpos, fa] = buf[nzc:].T
         wf = self.lev.wfaces[plan.child.name]
@@ -413,14 +424,87 @@ class NestedTracers3D(Coupler):
         mom.qk.all_values[kk[None, :], jj[~x][:, None], ii[~x][:, None]] = new[~x]
         return True
 
+    # --- 3D transports in the child's ring (parent -> child) ------------------------
+
+    def _ring_transfers(self, plan, link_tag):
+        from .barotropic import PointTransfer, ring_faces
+
+        out = {}
+        for n, axis in enumerate("xy"):
+            dst, src, w = ring_faces(plan.child, axis)
+            out[axis] = PointTransfer(plan.ptil, plan.ctil, dst, src, w, link_tag + 2 + n, "3D" + "UV"[n] + "r",
+                                      plan.poff, plan.coff)
+        return out
+
+    def _send_ring_uv(self, plan, tx) -> List[MPI.Request]:
+        reqs = []
+        mom = self.sim.momentum
+        for axis, grid, tp in (("x", self.sim.U, mom.pk), ("y", self.sim.V, mom.qk)):
+            for (p, t), (_, _, sj, si) in tx[axis].pairs.items():
+                if p != self.t:
+                    continue
+                jj, ii = self.loc(sj, si)
+                buf = np.concatenate([grid.hn.all_values[::-1, jj, ii], tp.all_values[::-1, jj, ii]], axis=0)
+                buf = np.ascontiguousarray(np.where(np.isfinite(buf), buf, 0.0))
+                reqs.append(plan.comm.Isend(buf, dest=plan.coff + t, tag=tx[axis].tag))
+        return reqs
+
+    def _recv_ring_uv(self):
+        nzp = self.parent_nz
+        out = {}
+        for axis in "xy":
+            tx = self._ring_tx[axis]
+            dj, di, w = tx.dst_of.get(self.t, (np.zeros(0, int), np.zeros(0, int), np.zeros((0, tx.K))))
+            vals = np.zeros((dj.size, tx.K, 2 * nzp))
+            for (p, t), (pos, k, sj, _) in sorted(tx.pairs.items()):
+                if t != self.t:
+                    continue
+                buf = np.empty((2 * nzp, sj.size))
+                self._recv(self.up.comm, buf, self.up.poff + p, tx.tag)
+                vals[pos, k] = buf.T
+            # weights of the source faces with water, normalised
+            wet = vals[:, :, :nzp].sum(axis=2) > 0.0
+            ww = np.where(wet, w, 0.0)
+            tot = ww.sum(axis=1, keepdims=True)
+            ww = np.where(tot > 0.0, ww / np.where(tot > 0.0, tot, 1.0), 0.0)
+            hs = (ww[:, :, None] * vals[:, :, :nzp]).sum(axis=1)
+            qs = (ww[:, :, None] * vals[:, :, nzp:]).sum(axis=1)
+            out[axis] = (dj, di, hs, qs)
+        self._ring_uv = out
+
+    def _set_ring_uv(self, sim):
+        mom = sim.momentum
+        kk = np.arange(self.nz)[::-1]
+        for axis, grid, tp in (("x", sim.U, mom.pk), ("y", sim.V, mom.qk)):
+            dj, di, hs, qs = self._ring_uv[axis]
+            if not dj.size:
+                continue
+            jj, ii = self.loc(dj, di)
+            hd = grid.hn.all_values[::-1, jj, ii].T
+            hd = np.where(np.isfinite(hd), hd, 0.0)
+            own = tp.all_values[::-1, jj, ii].T
+            own = np.where(np.isfinite(own), own, 0.0)
+            ok = (hd.sum(axis=1) > 0.0) & (hs.sum(axis=1) > 0.0)
+            if not ok.any():
+                continue
+            hd, hs_, qs_, own = hd[ok], hs[ok], qs[ok], own[ok]
+            new = remap_amounts(qs_, hs_, hd, self.keep)
+            D = hd.sum(axis=1, keepdims=True)
+            new = new + (own.sum(axis=1, keepdims=True) - new.sum(axis=1, keepdims=True)) * hd / D
+            tp.all_values[kk[None, :], jj[ok][:, None], ii[ok][:, None]] = new
+
     def _sync_transports(self, sim):
         t0 = MPI.Wtime()
-        reqs = self._send_transports_up() if self.up is not None else []
+        reqs = self._send_transports_up() if (self.up is not None and self.replace_transport) else []
         changed = False
-        for plan, nzc in zip(self.down, self.child_nz):
-            changed |= self._recv_transports(plan, nzc)
+        if self.replace_transport:
+            for plan, nzc in zip(self.down, self.child_nz):
+                changed |= self._recv_transports(plan, nzc)
         MPI.Request.Waitall(reqs)
-        if self.down:
+        ring = self.ring_velocities and self.up is not None and self._ring_uv is not None
+        if ring:
+            self._set_ring_uv(sim)
+        if (self.down and self.replace_transport) or ring:
             mom = sim.momentum
             mom.pk.update_halos()
             mom.qk.update_halos()
@@ -449,10 +533,14 @@ class NestedTracers3D(Coupler):
         if self.down:
             for f in self.tracers:
                 f.update_halos()
-            for plan in self.down:
+            for plan, tx in zip(self.down, self._ring_tx_down):
                 reqs += self._send_down(plan)
+                if self.ring_velocities:
+                    reqs += self._send_ring_uv(plan, tx)
         if self.up is not None:
             self._recv_ring()
+            if self.ring_velocities:
+                self._recv_ring_uv()
             for f in self.tracers:
                 f.update_halos()
         MPI.Request.Waitall(reqs)
@@ -506,6 +594,8 @@ class NestedTracers3D(Coupler):
             # this level's register: amount per tracer, edge face and layer (surface first)
             nedge = self.lev.edge["is_x"].size if self.up is not None else 0
             self.reg = np.zeros((len(self.tracers) + 1, nedge, self.nz))  # tracers, then the water
+        self._ring_tx_down = [self._ring_transfers(plan, plan.tag_p + TAG_3D + 500) for plan in self.down]
+        self._ring_tx = self._ring_transfers(self.up, self.up.tag_p + TAG_3D + 500) if self.up is not None else None
         self._sync()  # initial: no fluxes yet
         self._fluxes_ready = True
         self.max_ring_change = 0.0
@@ -513,7 +603,7 @@ class NestedTracers3D(Coupler):
         self.n_sync = 0
 
     def on_stage(self, sim, stage, macro_active):
-        if stage == "momentum_3d" and macro_active and self.replace_transport:
+        if stage == "momentum_3d" and macro_active and (self.replace_transport or self.ring_velocities):
             self._sync_transports(sim)
         elif stage == "tracers" and macro_active:
             self._sync()
