@@ -31,11 +31,29 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
   (first version), held over the child's next macro step (the parent's
   state of the last sync).
 
-Not yet: 3D flux matching (the parent's tracer fluxes through the
-interface faces are not corrected to the child's, so the composite content
-is not conserved exactly), the ring's 3D velocities (the child computes
-its own at the interface faces; pyGETM adjusts them to the 2D transports),
-limited slopes in the ring, time interpolation of the ring.
+* **flux matching (child -> parent, ``flux_matching=True``):** pyGETM's
+  tracer advection adds the amount through every face and layer to arrays
+  of this coupler (:attr:`pygetm.tracer.TracerCollection.face_fluxes`).
+  The child sends, with the rim, the profiles through its edge faces (r
+  sub-faces per parent interface face) over the 3D step, with its face
+  layer thicknesses. The parent remaps every sub-face profile onto the
+  layers of its own face (the same stretch; the amounts are kept exactly),
+  adds the r sub-faces, and corrects the parent cell next to the face layer
+  by layer by (parent - child) amount. Faces of a child that lie on the
+  parent's own interface are passed upwards, in the parent's layers, as in
+  2D.
+
+* **3D transports (child -> parent, ``replace_transport=True``):** at the
+  ``momentum_3d`` stage the child sends its layer transports through its
+  edge faces; the parent remaps them onto its face layers, keeps its own
+  column total (which its elevation used) and sets pk, qk there, then
+  recomputes ww, uk, vk. Parent and child then move the same water through
+  every layer of the interface, and the flux correction conserves the
+  content exactly while keeping uniform fields uniform.
+
+Not yet: the ring's 3D velocities (the child computes its own at the
+interface faces), limited slopes in the ring, time interpolation of the
+ring.
 """
 
 from typing import List, Optional, Sequence
@@ -43,6 +61,7 @@ from typing import List, Optional, Sequence
 import numpy as np
 from mpi4py import MPI
 
+from ..constants import CENTERS
 from ..simulation import Coupler
 from .runtime import NestingRun
 from . import vremap
@@ -52,6 +71,25 @@ TAG_3D = 1000
 
 # pyGETM's layers run from the bottom (0) to the surface (nz - 1); vremap's
 # columns from the surface down: the messages hold columns surface first.
+
+
+def remap_amounts(F, h_src, h_dst, keep=0.0):
+    """Amounts per layer (``F [..., ns]``, e.g. the tracer amount through a
+    face) of a column with thicknesses ``h_src`` onto the layers ``h_dst``
+    (surface first), the source column stretched to the target's depth below
+    ``keep`` x min(depths). The sum over the layers is kept exactly. Columns
+    with no thickness carry nothing."""
+    Ds, Dd = h_src.sum(axis=-1), h_dst.sum(axis=-1)
+    dry = (Ds <= 0.0) | (Dd <= 0.0)
+    nd = h_dst.shape[-1]
+    h_dst = np.where(dry[..., None], 1.0 / nd, h_dst)
+    h_src = np.where(dry[..., None], 1.0 / h_src.shape[-1], h_src)
+    F = np.where(dry[..., None], 0.0, F)
+    zs = vremap.stretch(vremap.interfaces(h_src), h_src.sum(axis=-1), h_dst.sum(axis=-1), keep)
+    prep = vremap.prepare(zs, vremap.interfaces(h_dst))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        c = np.where(h_src > 0.0, F / h_src, 0.0)
+    return vremap.apply(prep, c, h_src)
 
 
 class NestedTracers3D(Coupler):
@@ -69,7 +107,8 @@ class NestedTracers3D(Coupler):
     """
 
     def __init__(self, nest: NestingRun, sim, tracers: Optional[Sequence] = None, keep: float = 0.8,
-                 break_ring: bool = False, break_rim: bool = False):
+                 break_ring: bool = False, break_rim: bool = False, flux_matching: bool = True,
+                 flux_form: str = "consistent", replace_transport: bool = True):
         self.nest, self.sim = nest, sim
         self.lev = nest.level
         self.t = nest.tile
@@ -77,8 +116,34 @@ class NestedTracers3D(Coupler):
         self.up, self.down = nest.up, nest.down
         self.keep = keep
         self.break_ring, self.break_rim = break_ring, break_rim
+        self.break_flux = False
+        self.flux_matching = flux_matching
+        #: correction of the parent cell next to an interface face, layer k
+        #: (amounts F of tracer and V of water through the face, parent p and
+        #: child c over the 3D step; the 2D coupling adds the column's volume
+        #: difference dV = sum_k (V_p - V_c)_k to the parent cell at its own
+        #: concentrations):
+        #: "content": dc_k = sign ((F_p - F_c)_k - c_k dV h_k / D) / vol_k -
+        #: the composite content is conserved, a uniform field does not stay
+        #: uniform (the layers' volume fluxes differ); "consistent" (default):
+        #: dc_k = sign ((F_p - F_c)_k - c_k (V_p - V_c)_k) / vol_k - a uniform
+        #: field stays uniform, the content is conserved up to
+        #: sum_k c_k ((V_p - V_c)_k - dV h_k / D)
+        if flux_form not in ("content", "consistent"):
+            raise ValueError(f"flux_form {flux_form!r}")
+        self.flux_form = flux_form
+        #: at the momentum_3d stage, the parent's layer transports at the window
+        #: faces become the child's (remapped onto the parent's face layers, the
+        #: parent's column total kept), and its vertical velocity is
+        #: recomputed: parent and child then move the same water through every
+        #: layer of the interface, and the tracer correction is exact and keeps
+        #: uniform fields uniform
+        self.replace_transport = replace_transport
+        self.t_transport = 0.0
+        self.max_correction = 0.0
         self._tracer_spec = tracers
         self.t_sync = 0.0
+        self._fluxes_ready = False
         self.t_wait = 0.0
         self.n_sync = 0
         self.max_ring_change = 0.0
@@ -101,10 +166,47 @@ class NestedTracers3D(Coupler):
 
     # --- child side ------------------------------------------------------------
 
+    def _face_profiles(self, arrays, is_x, j, i):
+        """(n, nz) profiles, surface first, of a U array and a V array at faces (j, i)."""
+        jj, ii = self.loc(j, i)
+        out = np.empty((np.size(is_x), self.nz))
+        out[is_x] = arrays[0].all_values[::-1, jj[is_x], ii[is_x]].T
+        out[~is_x] = arrays[1].all_values[::-1, jj[~is_x], ii[~is_x]].T
+        return out
+
+    def _own_edge_fluxes(self):
+        e = self.lev.edge
+        keep = self._own_edge & self.lev.computed[e["inner"]]
+        if keep.any():
+            args = (e["is_x"][keep], e["face"][0][keep], e["face"][1][keep])
+            for n, fl in enumerate(self.fluxes):
+                self.reg[n, keep] += self._face_profiles(fl, *args)
+            self.reg[-1, keep] += self._volume_profiles(*args)
+
+    def _volume_profiles(self, is_x, j, i):
+        """Water through faces (j, i) over the 3D step per layer, surface first
+        (layer transports pk, qk at the half step, as the tracer advection)."""
+        m = self.sim.momentum
+        vol = self._face_profiles((m.pk, m.qk), is_x, j, i)
+        jj, ii = self.loc(j, i)
+        w = np.where(is_x, self.sim.U.dy.all_values[jj, ii], self.sim.V.dx.all_values[jj, ii])
+        return np.where(np.isfinite(vol), vol, 0.0) * (w * self.sim.macrotimestep)[:, None]
+
     def _send_up(self) -> List[MPI.Request]:
         """Rim: the child columns of every parent rim cell (h, c per tracer,
-        area or 0 for land)."""
+        area or 0 for land); with flux matching, the register of every edge
+        face (its layer thicknesses and the amounts per tracer and layer)."""
         reqs = []
+        if self.flux_matching and self._fluxes_ready:
+            e = self.lev.edge
+            for (tt, p), (_, _, fk) in self.up.flx.items():
+                if tt != self.t:
+                    continue
+                hface = self._face_profiles((self.sim.U.hn, self.sim.V.hn), e["is_x"][fk], e["face"][0][fk], e["face"][1][fk])
+                hface = np.where(np.isfinite(hface), hface, 0.0)
+                buf = np.ascontiguousarray(np.concatenate([hface.T] + [r[fk].T for r in self.reg], axis=0))
+                reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=self.up.tag_f + TAG_3D))
+            self.reg[...] = 0.0
         T = self.sim.T
         h = T.hn.all_values
         a = T.area.all_values
@@ -204,15 +306,144 @@ class NestedTracers3D(Coupler):
         for f, cf in zip(self.tracers, c):
             f.all_values[:, jj[ok], ii[ok]] = cf.T[::-1]
 
+    def _match_fluxes(self, plan, nzc: int):
+        flist = plan.faces_of[self.t]
+        if not flist.size:
+            return
+        r = plan.child.ratio
+        nt = len(self.tracers) + 1  # the tracers and the water
+        H = np.zeros((flist.size, r, nzc))
+        F = np.zeros((nt, flist.size, r, nzc))
+        for (tt, p), (fpos, fa, _) in sorted(plan.flx.items()):
+            if p != self.t:
+                continue
+            buf = np.empty(((1 + nt) * nzc, fpos.size))
+            self._recv(plan.comm, buf, plan.coff + tt, plan.tag_f + TAG_3D)
+            H[fpos, fa] = buf[:nzc].T
+            F[:, fpos, fa] = buf[nzc:].reshape(nt, nzc, -1).transpose(0, 2, 1)
+        wf = self.lev.wfaces[plan.child.name]
+        args = (wf["is_x"][flist], wf["face"][0][flist], wf["face"][1][flist])
+        hp = self._face_profiles((self.sim.U.hn, self.sim.V.hn), *args)  # (nf, nzp)
+        hp = np.where(np.isfinite(hp), hp, 0.0)
+        # child amounts on the parent face's layers, r sub-faces added
+        fc = remap_amounts(F, H, np.broadcast_to(hp[:, None, :], H.shape[:2] + hp.shape[-1:]), self.keep).sum(axis=-2)
+        ins = wf["inside"][flist]
+        m_in = flist[ins]
+        if m_in.size and not self.break_flux:
+            oj, oi = self.loc(wf["out"][0][m_in], wf["out"][1][m_in])
+            T = self.sim.T
+            vol = (T.hn.all_values[::-1, oj, oi] * T.area.all_values[oj, oi]).T  # (n, nz), surface first
+            sign = wf["sign"][m_in][:, None]
+            kk = np.arange(self.nz)[::-1]
+            dV = self._volume_profiles(*(a[ins] for a in args)) - fc[-1][ins]  # water, parent - child (n, nz)
+            hT = T.hn.all_values[::-1, oj, oi].T
+            frac = hT / np.maximum(hT.sum(axis=1, keepdims=True), 1e-30)
+            for n, (f, fl) in enumerate(zip(self.tracers, self.fluxes)):
+                fp = self._face_profiles(fl, *(a[ins] for a in args))
+                c = f.all_values[::-1, oj, oi].T
+                if self.flux_form == "consistent":
+                    amount = fp - fc[n][ins] - c * dV
+                else:
+                    amount = fp - fc[n][ins] - c * dV.sum(axis=1, keepdims=True) * frac
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    dc = np.where(vol > 0.0, sign * amount / vol, 0.0)
+                self.max_correction = max(self.max_correction, float(np.abs(dc).max(initial=0.0)))
+                # np.add.at in face order (several faces may share a cell)
+                np.add.at(f.all_values, (kk[None, :], oj[:, None], oi[:, None]), dc)
+        up = ~ins & (wf["up"][flist] >= 0)
+        if up.any():
+            for n in range(nt):  # tracers and water, in this level's layers
+                np.add.at(self.reg[n], wf["up"][flist][up], fc[n][up])
+
+    # --- 3D transports at the interface (momentum_3d stage) ------------------------
+
+    def _send_transports_up(self) -> List[MPI.Request]:
+        reqs = []
+        e = self.lev.edge
+        m = self.sim.momentum
+        for (tt, p), (_, _, fk) in self.up.flx.items():
+            if tt != self.t:
+                continue
+            args = (e["is_x"][fk], e["face"][0][fk], e["face"][1][fk])
+            h = self._face_profiles((self.sim.U.hn, self.sim.V.hn), *args)
+            h = np.where(np.isfinite(h), h, 0.0)
+            q = self._volume_profiles(*args) / self.sim.macrotimestep  # m3 s-1 per layer
+            buf = np.ascontiguousarray(np.concatenate([h.T, q.T], axis=0))
+            reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=self.up.tag_f + TAG_3D + 1))
+        return reqs
+
+    def _recv_transports(self, plan, nzc: int) -> bool:
+        flist = plan.faces_of[self.t]
+        if not flist.size:
+            return False
+        r = plan.child.ratio
+        H = np.zeros((flist.size, r, nzc))
+        Q = np.zeros((flist.size, r, nzc))
+        for (tt, p), (fpos, fa, _) in sorted(plan.flx.items()):
+            if p != self.t:
+                continue
+            buf = np.empty((2 * nzc, fpos.size))
+            self._recv(plan.comm, buf, plan.coff + tt, plan.tag_f + TAG_3D + 1)
+            H[fpos, fa] = buf[:nzc].T
+            Q[fpos, fa] = buf[nzc:].T
+        wf = self.lev.wfaces[plan.child.name]
+        ins = wf["inside"][flist]
+        if not ins.any():
+            return False
+        m_in = flist[ins]
+        is_x, fj, fi = wf["is_x"][m_in], wf["face"][0][m_in], wf["face"][1][m_in]
+        hp = self._face_profiles((self.sim.U.hn, self.sim.V.hn), is_x, fj, fi)
+        hp = np.where(np.isfinite(hp), hp, 0.0)
+        qc = remap_amounts(Q[ins], H[ins], np.broadcast_to(hp[:, None, :], H[ins].shape[:2] + hp.shape[-1:]),
+                           self.keep).sum(axis=-2)  # (n, nzp) m3 s-1
+        mom = self.sim.momentum
+        jj, ii = self.loc(fj, fi)
+        width = np.where(is_x, self.sim.U.dy.all_values[jj, ii], self.sim.V.dx.all_values[jj, ii])
+        own = self._face_profiles((mom.pk, mom.qk), is_x, fj, fi)  # m2 s-1
+        own = np.where(np.isfinite(own), own, 0.0)
+        D = hp.sum(axis=1, keepdims=True)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            new = qc / width[:, None]
+            # keep the parent's column total (its elevation used it)
+            new = new + (own.sum(axis=1, keepdims=True) - new.sum(axis=1, keepdims=True)) * np.where(D > 0, hp / D, 0.0)
+        new = np.where(D > 0, new, own)
+        kk = np.arange(self.nz)[::-1]
+        x = is_x
+        mom.pk.all_values[kk[None, :], jj[x][:, None], ii[x][:, None]] = new[x]
+        mom.qk.all_values[kk[None, :], jj[~x][:, None], ii[~x][:, None]] = new[~x]
+        return True
+
+    def _sync_transports(self, sim):
+        t0 = MPI.Wtime()
+        reqs = self._send_transports_up() if self.up is not None else []
+        changed = False
+        for plan, nzc in zip(self.down, self.child_nz):
+            changed |= self._recv_transports(plan, nzc)
+        MPI.Request.Waitall(reqs)
+        if self.down:
+            mom = sim.momentum
+            mom.pk.update_halos()
+            mom.qk.update_halos()
+            # as Momentum.update_diagnostics: w from the transports, velocities
+            from .. import _pygetm
+            _pygetm.w_momentum_3d(mom.pk, mom.qk, sim.macrotimestep, mom.ww)
+            np.divide(mom.pk.all_values, mom.pk.grid.hn.all_values, out=mom.uk.all_values)
+            np.divide(mom.qk.all_values, mom.qk.grid.hn.all_values, out=mom.vk.all_values)
+        self.t_transport += MPI.Wtime() - t0
+
     # --- sync --------------------------------------------------------------------
 
     def _sync(self):
         t0 = MPI.Wtime()
         reqs = []
+        if self.flux_matching and self._fluxes_ready and self.up is not None:
+            self._own_edge_fluxes()
         if self.up is not None and not self._up_after_children:
             reqs += self._send_up()
         for plan, nzc in zip(self.down, self.child_nz):
             self._recv_rim(plan, nzc)
+            if self.flux_matching and self._fluxes_ready:
+                self._match_fluxes(plan, nzc)
         if self.up is not None and self._up_after_children:
             reqs += self._send_up()
         if self.down:
@@ -225,6 +456,10 @@ class NestedTracers3D(Coupler):
             for f in self.tracers:
                 f.update_halos()
         MPI.Request.Waitall(reqs)
+        if self.flux_matching:
+            for fl in self.fluxes:
+                fl[0].all_values[...] = 0.0
+                fl[1].all_values[...] = 0.0
         self.t_sync += MPI.Wtime() - t0
         self.n_sync += 1
 
@@ -258,13 +493,29 @@ class NestedTracers3D(Coupler):
             self._ring = [(p, v) for (p, tt), v in sorted(self.up.pro.items()) if tt == self.t]
             cat = lambda k: np.concatenate([v[k] for _, v in self._ring]) if self._ring else np.zeros(0, int)
             self._rj, self._ri = self.loc(cat(2), cat(3))
-        self._sync()
+        self.fluxes = []
+        if self.flux_matching:
+            U, V = sim.U, sim.V
+            for f in self.tracers:
+                fl = (U.array(z=CENTERS, fill=0.0), V.array(z=CENTERS, fill=0.0))
+                sim.tracers.face_fluxes[f.name] = fl
+                self.fluxes.append(fl)
+            if self.up is not None:
+                e = self.lev.edge
+                self._own_edge = self.til.owner(*e["inner"]) == self.t
+            # this level's register: amount per tracer, edge face and layer (surface first)
+            nedge = self.lev.edge["is_x"].size if self.up is not None else 0
+            self.reg = np.zeros((len(self.tracers) + 1, nedge, self.nz))  # tracers, then the water
+        self._sync()  # initial: no fluxes yet
+        self._fluxes_ready = True
         self.max_ring_change = 0.0
         self.t_sync = self.t_wait = 0.0
         self.n_sync = 0
 
     def on_stage(self, sim, stage, macro_active):
-        if stage == "tracers" and macro_active:
+        if stage == "momentum_3d" and macro_active and self.replace_transport:
+            self._sync_transports(sim)
+        elif stage == "tracers" and macro_active:
             self._sync()
 
     # --- diagnostics -----------------------------------------------------------------
@@ -277,4 +528,5 @@ class NestedTracers3D(Coupler):
         return np.array([float((f.all_values[:, h:-h, h:-h] * vol)[:, self.computed].sum()) for f in self.tracers])
 
     def timing(self) -> dict:
-        return dict(sync=self.t_sync, wait=self.t_wait, n_sync=self.n_sync, max_ring_change=self.max_ring_change)
+        return dict(sync=self.t_sync, wait=self.t_wait, n_sync=self.n_sync, max_ring_change=self.max_ring_change,
+                    max_correction=self.max_correction, transport=self.t_transport)

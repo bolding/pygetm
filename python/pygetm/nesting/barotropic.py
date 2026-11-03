@@ -571,8 +571,17 @@ class NestedBarotropic(Coupler):
                         # the parent continues from the child's mean transport
                         fj, fi = self.loc(wf["face"][0][m_in], wf["face"][1][m_in])
                         x = wf["is_x"][m_in]
-                        self.U.all_values[fj[x], fi[x]] = fci[x] / (self.dyu[fj[x], fi[x]] * self._dt())
-                        self.V.all_values[fj[~x], fi[~x]] = fci[~x] / (self.dxv[fj[~x], fi[~x]] * self._dt())
+                        newU = fci[x] / (self.dyu[fj[x], fi[x]] * self._dt())
+                        newV = fci[~x] / (self.dxv[fj[~x], fi[~x]] * self._dt())
+                        # 3D runs: the transports summed over the macro step for the
+                        # 3D momentum (Ui, Vi) hold this step's own U, V; the volume
+                        # that moved is the child's (the z correction above)
+                        mom = self.sim.momentum
+                        if getattr(mom, "_U_cum", None) is not None and self.sim.runtype > 1:
+                            mom._U_cum[fj[x], fi[x]] += newU - self.U.all_values[fj[x], fi[x]]
+                            mom._V_cum[fj[~x], fi[~x]] += newV - self.V.all_values[fj[~x], fi[~x]]
+                        self.U.all_values[fj[x], fi[x]] = newU
+                        self.V.all_values[fj[~x], fi[~x]] = newV
                 if self.correct_late and self.schedule == "sync":
                     self._pending.append(apply)
                 else:

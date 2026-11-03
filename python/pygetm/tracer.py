@@ -152,6 +152,10 @@ class TracerCollection(Sequence[Tracer]):
         self._advection = operators.Advection(grid, scheme=advection_scheme)
         self._vertical_diffusion = operators.VerticalDiffusion(grid, cnpar=cnpar)
         self._w = grid.array(fill=0.0, z=INTERFACES)
+        #: optional per tracer name: (flux_u, flux_v), 3D arrays on the U and V
+        #: grid to which advection adds the amount through every face and layer
+        #: (nesting flux matching, :class:`pygetm.nesting.baroclinic.NestedTracers3D`)
+        self.face_fluxes: dict = {}
 
         self.Ah = grid.array(
             name="Ah",
@@ -253,6 +257,7 @@ class TracerCollection(Sequence[Tracer]):
             get_w=combined_w,
             Ah_u=self.Ah_u,
             Ah_v=self.Ah_v,
+            get_flux=(lambda t: self.face_fluxes.get(t.name)) if self.face_fluxes else None,
         )
 
         # Vertical diffusion and time-integration of optional source terms

@@ -1,5 +1,5 @@
 import enum
-from typing import Optional, Iterable, Callable
+from typing import Optional, Iterable, Callable, Tuple
 import functools
 
 from . import _pygetm
@@ -157,7 +157,20 @@ class Advection(_pygetm.Advection):
         new_h: bool = False,
         skip_initial_halo_exchange: bool = False,
         get_w: Optional[Callable[[core.Array], core.Array]] = None,
+        get_flux: Optional[
+            Callable[[core.Array], Optional[Tuple[core.Array, core.Array]]]
+        ] = None,
     ):
+        """Advect several 3D tracers over one time step (Strang splitting).
+
+        Args:
+            get_flux: optional; for each tracer None or a pair of 3D arrays on
+                the U and V grid (layer centres) to which the tracer amount
+                transported through every face and layer (timestep * face
+                flux) is added, summed over all sweeps of this step. Used to
+                match the fluxes at nesting interfaces.
+        """
+
         def get_default_w(tracer: core.Array) -> core.Array:
             return w
 
@@ -169,8 +182,19 @@ class Advection(_pygetm.Advection):
         for var in vars:
             assert var.grid is self.grid and var.z == CENTERS
 
-        adv1 = functools.partial(self.u_3d, u, 0.5 * timestep, Ah=Ah_u)
-        adv2 = functools.partial(self.v_3d, v, 0.5 * timestep, Ah=Ah_v)
+        def flux_of(var, k):
+            if get_flux is None:
+                return None
+            f = get_flux(var)
+            return None if f is None else f[k]
+
+        def adv_u(var):
+            self.u_3d(u, 0.5 * timestep, var, Ah=Ah_u, flux=flux_of(var, 0))
+
+        def adv_v(var):
+            self.v_3d(v, 0.5 * timestep, var, Ah=Ah_v, flux=flux_of(var, 1))
+
+        adv1, adv2 = adv_u, adv_v
         if not self._ufirst:
             adv1, adv2 = adv2, adv1
 
