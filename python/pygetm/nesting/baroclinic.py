@@ -305,8 +305,15 @@ class NestedTracers3D(Coupler):
                 continue
             jj, ii = self.loc(cj, ci)
             w = np.where(self.wet[jj, ii], a[jj, ii], 0.0)
-            parts = [h[::-1, jj, ii]] + [np.where(w > 0, f.all_values[::-1, jj, ii], 0.0) for f in self.tracers]
-            buf = np.ascontiguousarray(np.concatenate(parts + [w[None, :]], axis=0))
+            # column by column, surface first: (1 + nt, k, nz) then the k weights
+            k, nt, nz = jj.size, len(self.tracers), h.shape[0]
+            buf = np.empty((1 + nt) * k * nz + k)
+            B = buf[: (1 + nt) * k * nz].reshape(1 + nt, k, nz)
+            vremap.gather_columns(h, jj, ii, out=B[0])
+            for n, f in enumerate(self.tracers):
+                vremap.gather_columns(f.all_values, jj, ii, out=B[1 + n])
+            B[1:, w <= 0.0] = 0.0
+            buf[-k:] = w
             reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=self.up.tag_r + TAG_3D))
         return reqs
 
@@ -319,16 +326,16 @@ class NestedTracers3D(Coupler):
         nt = len(self.tracers)
         parts = []
         for p, v in self._ring:
-            buf = np.empty(((1 + nt) * nzp, v[2].size))
+            buf = np.empty((1 + nt, v[2].size, nzp))  # column by column, surface first
             self._recv(self.up.comm, buf, self.up.poff + p, self.up.tag_p + TAG_3D)
             parts.append(buf)
         buf = np.concatenate(parts, axis=1)
         if self.break_ring:
             return
-        hs = buf[:nzp].T  # (n, nzp)
-        cs = buf[nzp:].reshape(nt, nzp, -1).transpose(0, 2, 1)  # (nt, n, nzp)
+        hs = buf[0]  # (n, nzp)
+        cs = buf[1:]  # (nt, n, nzp)
         rj, ri = self._rj, self._ri
-        hd = self.sim.T.hn.all_values[::-1, rj, ri].T  # (n, nzc), surface first
+        hd = vremap.gather_columns(self.sim.T.hn.all_values, rj, ri)  # (n, nzc), surface first
         ok = self.wet[rj, ri] & (hs.sum(axis=1) > 0.0) & (hd.sum(axis=1) > 0.0)
         if not ok.any():
             return
@@ -338,8 +345,10 @@ class NestedTracers3D(Coupler):
             ij, ii_ = self._rin_j[ok], self._rin_i[ok]
             m = self._rin_ok[ok].copy()
             if m.any():
-                hin = self.sim.T.hn.all_values[::-1, ij, ii_].T
-                cin = np.stack([f.all_values[::-1, ij, ii_].T for f in self.tracers])
+                hin = vremap.gather_columns(self.sim.T.hn.all_values, ij, ii_)
+                cin = np.empty((len(self.tracers),) + hin.shape)
+                for n, f in enumerate(self.tracers):
+                    vremap.gather_columns(f.all_values, ij, ii_, out=cin[n])
                 m &= np.isfinite(hin).all(axis=1) & (hin.sum(axis=1) > 0.0)
                 z = self.zmap
                 sc = self.scheme
@@ -349,11 +358,11 @@ class NestedTracers3D(Coupler):
                 # (layer by layer): the correction adds no new extrema (IDEAL V6)
                 c0 = c[:, m]
                 c[:, m] = np.clip(c0 + direct - back, np.minimum(c0, direct), np.maximum(c0, direct))
+        jo, io = rj[ok], ri[ok]
         for f, cf in zip(self.tracers, c):
-            new = cf.T[::-1]  # pyGETM: layer 0 at the bottom
-            old = f.all_values[:, rj[ok], ri[ok]]
-            self.max_ring_change = max(self.max_ring_change, float(np.abs(new - old).max(initial=0.0)))
-            f.all_values[:, rj[ok], ri[ok]] = new
+            old = vremap.gather_columns(f.all_values, jo, io)
+            self.max_ring_change = max(self.max_ring_change, float(np.abs(cf - old).max(initial=0.0)))
+            vremap.scatter_columns(f.all_values, jo, io, cf)
 
     # --- parent side -------------------------------------------------------------
 
@@ -364,8 +373,10 @@ class NestedTracers3D(Coupler):
             if p != self.t:
                 continue
             jj, ii = self.loc(pj, pi)
-            parts = [h[::-1, jj, ii]] + [f.all_values[::-1, jj, ii] for f in self.tracers]
-            buf = np.ascontiguousarray(np.concatenate(parts, axis=0))
+            buf = np.empty((1 + len(self.tracers), jj.size, h.shape[0]))  # column by column, surface first
+            vremap.gather_columns(h, jj, ii, out=buf[0])
+            for n, f in enumerate(self.tracers):
+                vremap.gather_columns(f.all_values, jj, ii, out=buf[1 + n])
             reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=plan.tag_p + TAG_3D))
         return reqs
 
@@ -382,16 +393,18 @@ class NestedTracers3D(Coupler):
         for (tt, p), (k, a, b, _, _) in plan.res.items():
             if p != self.t:
                 continue
-            buf = np.empty(((1 + nt) * nzc + 1, k.size))
+            nk = k.size
+            buf = np.empty((1 + nt) * nk * nzc + nk)
             self._recv(plan.comm, buf, plan.coff + tt, plan.tag_r + TAG_3D)
             m = a * r + b
-            H[k, m] = buf[:nzc].T
-            C[:, k, m] = buf[nzc:(1 + nt) * nzc].reshape(nt, nzc, -1).transpose(0, 2, 1)
-            W[k, m] = buf[-1]
+            B = buf[: (1 + nt) * nk * nzc].reshape(1 + nt, nk, nzc)
+            H[k, m] = B[0]
+            C[:, k, m] = B[1:]
+            W[k, m] = buf[-nk:]
         if self.break_rim:
             return
         jj, ii = self.loc(mine[:, 0], mine[:, 1])
-        hp = self.sim.T.hn.all_values[::-1, jj, ii].T  # (n, nzp), surface first
+        hp = vremap.gather_columns(self.sim.T.hn.all_values, jj, ii)  # (n, nzp), surface first
         ok = (W.sum(axis=1) > 0.0) & self.wet[jj, ii] & (hp.sum(axis=1) > 0.0)
         if not ok.any():
             return
@@ -402,8 +415,9 @@ class NestedTracers3D(Coupler):
         H = np.where(dry[..., None], hp.sum(axis=-1)[:, None, None] / nzc, H)
         if self.zmap:
             c = remap_conc_z(C, H, hp, W, self.scheme)
+            jo, io = jj[ok], ii[ok]
             for f, cf in zip(self.tracers, c):
-                f.all_values[:, jj[ok], ii[ok]] = cf.T[::-1]
+                vremap.scatter_columns(f.all_values, jo, io, cf)
             return
         shared = vremap.rim_columns_prepare(H, W, hp, keep=self.keep)
         # concentrations by the child volume each parent layer receives: the

@@ -143,4 +143,38 @@ contains
       end do
    end subroutine
 
+   ! Columns of a 3D array (pyGETM's all_values: C order (nz, ny, nx), Fortran (nx, ny, nz), layer 1 at
+   ! the bottom) at n cells (0-based local indices jj, ii), surface first: out(k, m) = arr(i, j, nz + 1 - k),
+   ! that is numpy's arr[::-1, jj, ii].T as one C-contiguous (n, nz) block, without temporaries.
+   subroutine c_gather_columns(nx, ny, nz, arr, n, jj, ii, out) bind(c)
+      integer(c_int), intent(in), value :: nx, ny, nz, n
+      real(c_double), intent(in) :: arr(nx, ny, nz)
+      integer(c_int), intent(in) :: jj(n), ii(n)
+      real(c_double), intent(inout) :: out(nz, n)
+
+      integer :: m, k
+
+      do m = 1, n
+         do k = 1, nz
+            out(k, m) = arr(ii(m) + 1, jj(m) + 1, nz + 1 - k)
+         end do
+      end do
+   end subroutine
+
+   ! The reverse: arr(i, j, nz + 1 - k) = vals(k, m) (vals C order (n, nz), surface first).
+   subroutine c_scatter_columns(nx, ny, nz, arr, n, jj, ii, vals) bind(c)
+      integer(c_int), intent(in), value :: nx, ny, nz, n
+      real(c_double), intent(inout) :: arr(nx, ny, nz)
+      integer(c_int), intent(in) :: jj(n), ii(n)
+      real(c_double), intent(in) :: vals(nz, n)
+
+      integer :: m, k
+
+      do m = 1, n
+         do k = 1, nz
+            arr(ii(m) + 1, jj(m) + 1, nz + 1 - k) = vals(k, m)
+         end do
+      end do
+   end subroutine
+
 end module

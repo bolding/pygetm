@@ -32,6 +32,8 @@ cdef extern void grid_interp_xy(int nx1, int ny1, int nx2, int ny2, int nz, cons
 cdef extern void c_horizontal_filter(int nx, int ny, int nz, int halox, int haloy, int* mask, double w, const double* var) nogil
 cdef extern void c_vertical_filter(int nx, int ny, int nz, int halox, int haloy, int n, int* mask, double w, const double* var) nogil
 cdef extern void c_vertical_remap(int n, int ns, int nd, int nt, int scheme, const double* zs, const double* zd, const double* h, const double* c, double* out) nogil
+cdef extern void c_gather_columns(int nx, int ny, int nz, const double* arr, int n, const int* jj, const int* ii, double* out) nogil
+cdef extern void c_scatter_columns(int nx, int ny, int nz, double* arr, int n, const int* jj, const int* ii, const double* vals) nogil
 cdef extern void c_gradient_x(int nx1, int ny1, int nx2, int ny2, int nz, const double* source, const double* idx, double* target, int ioffset, int joffset) nogil
 cdef extern void c_gradient_y(int nx1, int ny1, int nx2, int ny2, int nz, const double* source, const double* idy, double* target, int ioffset, int joffset) nogil
 cdef extern void get_array(int source_type, void* grid, const char* name, int* grid_type, int* sub_type, int* data_type, void** p) nogil
@@ -231,6 +233,30 @@ def vertical_remap(const double[:,::1] zs not None, const double[:,::1] zd not N
         return
     with nogil:
         c_vertical_remap(n, ns, nd, nt, scheme, &zs[0,0], &zd[0,0], &h[0,0], &c[0,0,0], &out[0,0,0])
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def gather_columns(const double[:,:,::1] arr not None, const int[::1] jj not None, const int[::1] ii not None, double[:,::1] out not None):
+    """out (n, nz) = arr[::-1, jj, ii].T: the columns of a (nz, ny, nx) array at n cells, surface first."""
+    cdef int n = <int>jj.shape[0]
+    if ii.shape[0] != n or out.shape[0] != n or out.shape[1] != arr.shape[0]:
+        raise ValueError("gather_columns: inconsistent shapes")
+    if n == 0:
+        return
+    with nogil:
+        c_gather_columns(<int>arr.shape[2], <int>arr.shape[1], <int>arr.shape[0], &arr[0,0,0], n, &jj[0], &ii[0], &out[0,0])
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def scatter_columns(double[:,:,::1] arr not None, const int[::1] jj not None, const int[::1] ii not None, const double[:,::1] vals not None):
+    """arr[::-1, jj, ii] = vals.T: write n columns (n, nz), surface first, into a (nz, ny, nx) array."""
+    cdef int n = <int>jj.shape[0]
+    if ii.shape[0] != n or vals.shape[0] != n or vals.shape[1] != arr.shape[0]:
+        raise ValueError("scatter_columns: inconsistent shapes")
+    if n == 0:
+        return
+    with nogil:
+        c_scatter_columns(<int>arr.shape[2], <int>arr.shape[1], <int>arr.shape[0], &arr[0,0,0], n, &jj[0], &ii[0], &vals[0,0])
 
 def gradient_x(const double[:,::1] idx not None, const double[:,:,::1] source not None, double[:,:,::1] target not None, int ioffset=0, int joffset=0):
     c_gradient_x(<int>source.shape[2], <int>source.shape[1], <int>target.shape[2], <int>target.shape[1], <int>source.shape[0], &source[0,0,0], &idx[0,0], &target[0,0,0], ioffset, joffset)

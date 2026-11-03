@@ -278,3 +278,40 @@ def contents(zs, zd, c, h, scheme="pcm"):
     out = np.empty((nt, n, nd))
     kernel(zs2, zd2, h2, c2, out, 1 if scheme == "ppm" else 0)
     return out.reshape(extra + lead + (nd,))
+
+
+def _kernel(name):
+    try:
+        from .. import _pygetm
+
+        return getattr(_pygetm, name)
+    except (ImportError, AttributeError):
+        return None
+
+
+def gather_columns(arr, jj, ii, out=None):
+    """The columns of a pyGETM 3D array ``arr (nz, ny, nx)`` (layer 0 at the bottom) at the cells
+    (jj, ii), surface first, as one C-contiguous ``(n, nz)`` block: ``arr[::-1, jj, ii].T``, compiled
+    when available (no temporaries)."""
+    jj = np.ascontiguousarray(jj, dtype=np.intc)
+    ii = np.ascontiguousarray(ii, dtype=np.intc)
+    if out is None:
+        out = np.empty((jj.size, arr.shape[0]))
+    k = _kernel("gather_columns")
+    if k is not None and arr.flags.c_contiguous and arr.dtype == np.float64:
+        k(arr, jj, ii, out)
+    else:
+        out[...] = arr[::-1, jj, ii].T
+    return out
+
+
+def scatter_columns(arr, jj, ii, vals):
+    """``arr[::-1, jj, ii] = vals.T`` for columns ``vals (n, nz)``, surface first, compiled when available."""
+    jj = np.ascontiguousarray(jj, dtype=np.intc)
+    ii = np.ascontiguousarray(ii, dtype=np.intc)
+    vals = np.ascontiguousarray(vals, dtype=float)
+    k = _kernel("scatter_columns")
+    if k is not None and arr.flags.c_contiguous and arr.dtype == np.float64:
+        k(arr, jj, ii, vals)
+    else:
+        arr[::-1, jj, ii] = vals.T

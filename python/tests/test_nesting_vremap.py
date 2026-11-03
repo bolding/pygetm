@@ -154,3 +154,18 @@ def test_compiled_kernel_matches_numpy(scheme):
     out = vr.contents(zs, zd, c, hs, scheme)
     assert out.shape == ref.shape
     assert np.abs(out - ref).max() < 1e-11
+
+
+def test_gather_scatter_columns():
+    arr = rng.normal(size=(12, 9, 11))
+    jj = rng.integers(0, 9, 40)
+    ii = rng.integers(0, 11, 40)
+    out = vr.gather_columns(arr, jj, ii)
+    assert np.array_equal(out, arr[::-1, jj, ii].T)
+    dst = arr.copy()
+    sel = np.unique(jj * 11 + ii, return_index=True)[1]  # distinct cells
+    vals = rng.normal(size=(sel.size, 12))
+    vr.scatter_columns(dst, jj[sel], ii[sel], vals)
+    ref = arr.copy()
+    ref[::-1, jj[sel], ii[sel]] = vals.T
+    assert np.array_equal(dst, ref)
