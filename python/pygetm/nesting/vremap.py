@@ -86,27 +86,95 @@ def prepare(z_src, z_dst):
     return j, np.clip(f, 0.0, 1.0)
 
 
-def apply(prep, c_src, h_src):
+def ppm_edges(c, h):
+    """Left (upper) and right (lower) edge values of the limited piecewise-parabolic
+    reconstruction (Colella and Woodward 1984, eqs. 1.6-1.10, for layers of unequal
+    thickness) of layer means ``c [..., n]`` with thicknesses ``h [..., n]``. The
+    outermost two layers and layers next to empty ones are piecewise constant. The
+    parabola in each layer keeps its mean, and the limiter adds no new extrema."""
+    c = np.asarray(c, dtype=float)
+    h = np.broadcast_to(np.asarray(h, dtype=float), c.shape)
+    n = c.shape[-1]
+    aL = c.copy()
+    aR = c.copy()
+    if n < 4:
+        return aL, aR
+    with np.errstate(invalid="ignore", divide="ignore"):
+        hm, h0, hp = h[..., :-2], h[..., 1:-1], h[..., 2:]
+        cm, c0, cp = c[..., :-2], c[..., 1:-1], c[..., 2:]
+        # slopes of the inner layers (1.7), monotonised (1.8)
+        da = h0 / (hm + h0 + hp) * ((2 * hm + h0) / (hp + h0) * (cp - c0) + (h0 + 2 * hp) / (hm + h0) * (c0 - cm))
+        ok = (cp - c0) * (c0 - cm) > 0.0
+        dm = np.where(ok, np.sign(da) * np.minimum(np.abs(da), 2 * np.minimum(np.abs(c0 - cm), np.abs(cp - c0))), 0.0)
+        dm = np.where(np.isfinite(dm), dm, 0.0)
+        d = np.zeros_like(c)
+        d[..., 1:-1] = dm
+        # edge between layer j and j+1 (1.6), for j = 1 .. n-3 (needs j-1 .. j+2)
+        hj_1, hj, hj1, hj2 = h[..., :-3], h[..., 1:-2], h[..., 2:-1], h[..., 3:]
+        cj, cj1 = c[..., 1:-2], c[..., 2:-1]
+        dj, dj1 = d[..., 1:-2], d[..., 2:-1]
+        z1 = (hj_1 + hj) / (2 * hj + hj1)
+        z2 = (hj2 + hj1) / (2 * hj1 + hj)
+        e = (cj + hj / (hj + hj1) * (cj1 - cj)
+             + 1.0 / (hj_1 + hj + hj1 + hj2) * (2 * hj1 * hj / (hj + hj1) * (z1 - z2) * (cj1 - cj)
+                                                 - hj * z1 * dj1 + hj1 * z2 * dj))
+        good = np.isfinite(e) & (hj_1 > 0) & (hj > 0) & (hj1 > 0) & (hj2 > 0)
+        e = np.where(good, e, 0.5 * (cj + cj1))
+    # inner layers 2 .. n-3 get both edges from e; the outer two layers stay constant
+    aR[..., 2:-2] = e[..., 1:]       # lower edge of layer j = edge j+1/2
+    aL[..., 2:-2] = e[..., :-1]      # upper edge of layer j = edge j-1/2
+    inner = np.zeros(n, dtype=bool)
+    inner[2:-2] = True
+    # limiter (1.10)
+    a = c
+    flat = ((aR - a) * (a - aL) <= 0.0) | ~inner
+    aL = np.where(flat, a, aL)
+    aR = np.where(flat, a, aR)
+    dA = aR - aL
+    a6 = 6.0 * (a - 0.5 * (aL + aR))
+    aL = np.where(dA * a6 > dA * dA, 3.0 * a - 2.0 * aR, aL)
+    aR = np.where(-dA * dA > dA * a6, 3.0 * a - 2.0 * aL, aR)
+    empty = ~(h > 0.0)
+    return np.where(empty, a, aL), np.where(empty, a, aR)
+
+
+def apply(prep, c_src, h_src, scheme="pcm"):
     """Contents of the target layers (per unit area) from source concentrations
     ``c_src [..., ns]`` with thicknesses ``h_src``; ``c_src`` may carry extra
-    leading tracer axes (broadcast against the prepared positions)."""
+    leading tracer axes (broadcast against the prepared positions).
+
+    ``scheme``: the reconstruction inside each source layer, "pcm" (constant) or
+    "ppm" (limited parabola, :func:`ppm_edges`). Both keep the column content
+    exactly and add no new extrema."""
     j, f = prep
-    q = np.asarray(c_src, dtype=float) * h_src
+    c_src = np.asarray(c_src, dtype=float)
+    q = c_src * h_src
     Q = np.concatenate([np.zeros(q.shape[:-1] + (1,)), np.cumsum(q, axis=-1)], axis=-1)
     jj = np.broadcast_to(j, q.shape[:-1] + j.shape[-1:])
     ff = np.broadcast_to(f, jj.shape)
-    Qz = np.take_along_axis(Q, jj, axis=-1) + ff * np.take_along_axis(q, jj, axis=-1)
+    if scheme == "ppm":
+        aL, aR = ppm_edges(c_src, h_src)
+        dA = aR - aL
+        a6 = 6.0 * (c_src - 0.5 * (aL + aR))
+        hh = np.broadcast_to(h_src, q.shape)
+        g = lambda x: np.take_along_axis(x, jj, axis=-1)
+        part = g(aL) * ff + g(dA) * ff ** 2 / 2 + g(a6) * (ff ** 2 / 2 - ff ** 3 / 3)
+        Qz = np.take_along_axis(Q, jj, axis=-1) + g(hh) * part
+    elif scheme == "pcm":
+        Qz = np.take_along_axis(Q, jj, axis=-1) + ff * np.take_along_axis(q, jj, axis=-1)
+    else:
+        raise ValueError(f"unknown remap scheme {scheme!r}")
     # the outer interfaces exactly: no content lost to round-off at the bottom
     Qz[..., 0] = 0.0
     Qz[..., -1] = Q[..., -1]
     return np.diff(Qz, axis=-1)
 
 
-def remap(h_src, c_src, h_dst):
+def remap(h_src, c_src, h_dst, scheme="pcm"):
     """Concentrations on the target layers (one call, no sharing)."""
     prep = prepare(interfaces(h_src), interfaces(h_dst))
     with np.errstate(invalid="ignore", divide="ignore"):
-        return apply(prep, c_src, h_src) / h_dst
+        return apply(prep, c_src, h_src, scheme) / h_dst
 
 
 # --- the rim (child -> parent) --------------------------------------------------------------

@@ -106,3 +106,25 @@ def test_ring_uniform():
     shared = vr.rim_columns_prepare(hs[:, None, :], np.ones((n, 1)), hd, keep=0.8)
     c = vr.rim_columns_apply(shared, np.full((1, n, 1, nzp), 3.0), hs[:, None, :], hd, by_volume=True)
     assert np.abs(c - 3.0).max() < 1e-12
+
+
+def test_ppm_conserves_and_is_monotone():
+    h = rng.uniform(0.2, 3.0, (300, 17))
+    c = rng.normal(size=(300, 17))
+    hd = rng.uniform(0.1, 2.0, (300, 23))
+    hd *= (h.sum(-1) / hd.sum(-1))[:, None]
+    out = vr.remap(h, c, hd, "ppm")
+    assert np.abs((out * hd).sum(-1) - (c * h).sum(-1)).max() < 1e-12
+    assert (out.max(-1) - c.max(-1)).max() < 1e-12 and (c.min(-1) - out.min(-1)).max() < 1e-12
+    assert np.abs(vr.remap(h, np.full_like(c, 4.2), hd, "ppm") - 4.2).max() < 1e-12
+
+
+def test_ppm_more_accurate_than_pcm():
+    """Layer means of a thin pycnocline (tanh) from 10 onto 20 layers in 35 m."""
+    lnc = lambda x: np.abs(x) + np.log1p(np.exp(-2 * np.abs(x))) - np.log(2)
+    means = lambda z: 12 - 3 * np.diff(3 * lnc((z - 15) / 3), axis=-1) / np.diff(z, axis=-1)
+    hs, hd = np.full((1, 10), 3.5), np.full((1, 20), 1.75)
+    ref = means(vr.interfaces(hd))
+    e_pcm = np.abs(vr.remap(hs, means(vr.interfaces(hs)), hd, "pcm") - ref).max()
+    e_ppm = np.abs(vr.remap(hs, means(vr.interfaces(hs)), hd, "ppm") - ref).max()
+    assert e_ppm < 0.2 * e_pcm

@@ -99,7 +99,7 @@ def remap_amounts(F, h_src, h_dst, keep=0.0):
     return vremap.apply(prep, c, h_src)
 
 
-def remap_conc_z(c, h_src, h_dst, w=None):
+def remap_conc_z(c, h_src, h_dst, w=None, scheme="ppm"):
     """Concentrations ``c [nt, ..., m, ns]`` of source columns (thicknesses ``h_src
     [..., m, ns]``, surface first) onto target layers ``h_dst [..., nd]``, with every
     source interface kept at its depth below the surface: only the bottom source
@@ -115,15 +115,15 @@ def remap_conc_z(c, h_src, h_dst, w=None):
     zd = np.broadcast_to(vremap.interfaces(h_dst)[..., None, :], zs.shape[:-1] + (h_dst.shape[-1] + 1,))
     prep = vremap.prepare(zs, zd)
     w = np.ones(h_src.shape[:-1]) if w is None else w
-    C = (w[..., None] * vremap.apply(prep, c, h_eff)).sum(axis=-2)
+    C = (w[..., None] * vremap.apply(prep, c, h_eff, scheme)).sum(axis=-2)
     V = (w[..., None] * vremap.apply(prep, np.ones_like(h_eff), h_eff)).sum(axis=-2)
     with np.errstate(invalid="ignore", divide="ignore"):
         return np.where(V > 0.0, C / V, 0.0)
 
 
-def remap_column(c, h_src, h_dst, keep=0.0, z=False):
+def remap_column(c, h_src, h_dst, keep=0.0, z=False, scheme="ppm"):
     if z:
-        return remap_conc_z(c[:, :, None, :], h_src[:, None, :], h_dst)
+        return remap_conc_z(c[:, :, None, :], h_src[:, None, :], h_dst, scheme=scheme)
     """Concentrations ``c [nt, n, ns]`` of columns with thicknesses ``h_src`` onto
     the layers ``h_dst [n, nd]`` (surface first), the source stretched to the
     target's depth below ``keep`` x min(depths), by volume (uniform stays uniform);
@@ -149,7 +149,7 @@ class NestedTracers3D(Coupler):
     def __init__(self, nest: NestingRun, sim, tracers: Optional[Sequence] = None, keep: float = 0.8,
                  break_ring: bool = False, break_rim: bool = False, flux_matching: bool = True,
                  flux_form: str = "consistent", replace_transport: bool = True, ring_velocities: bool = True,
-                 ring_detail: bool = True, vertical_map: str = "z"):
+                 ring_detail: bool = True, vertical_map: str = "z", remap_scheme: str = "ppm"):
         self.nest, self.sim = nest, sim
         self.lev = nest.level
         self.t = nest.tile
@@ -201,6 +201,14 @@ class NestedTracers3D(Coupler):
         if vertical_map not in ("z", "stretch"):
             raise ValueError(f"vertical_map {vertical_map!r}")
         self.zmap = vertical_map == "z"
+        #: reconstruction inside each source layer when concentrations are remapped
+        #: (ring, rim; with vertical_map "z"): "ppm" (default, limited parabola,
+        #: Colella and Woodward 1984) or "pcm" (constant). PPM carries a thin
+        #: pycnocline from coarse layers onto finer ones 5-20x more accurately;
+        #: both keep the content exactly and add no new extrema
+        if remap_scheme not in ("ppm", "pcm"):
+            raise ValueError(f"remap_scheme {remap_scheme!r}")
+        self.scheme = remap_scheme
         self._ring_uv = None
         self.t_transport = 0.0
         self.max_correction = 0.0
@@ -306,7 +314,7 @@ class NestedTracers3D(Coupler):
         if not ok.any():
             return
         hs, cs, hd = hs[ok], cs[:, ok], hd[ok]
-        c = remap_column(cs, hs, hd, self.keep, self.zmap)
+        c = remap_column(cs, hs, hd, self.keep, self.zmap, self.scheme)
         if self.ring_detail:
             ij, ii_ = self._rin_j[ok], self._rin_i[ok]
             m = self._rin_ok[ok].copy()
@@ -315,8 +323,9 @@ class NestedTracers3D(Coupler):
                 cin = np.stack([f.all_values[::-1, ij, ii_].T for f in self.tracers])
                 m &= np.isfinite(hin).all(axis=1) & (hin.sum(axis=1) > 0.0)
                 z = self.zmap
-                direct = remap_column(cin[:, m], hin[m], hd[m], self.keep, z)
-                back = remap_column(remap_column(cin[:, m], hin[m], hs[m], self.keep, z), hs[m], hd[m], self.keep, z)
+                sc = self.scheme
+                direct = remap_column(cin[:, m], hin[m], hd[m], self.keep, z, sc)
+                back = remap_column(remap_column(cin[:, m], hin[m], hs[m], self.keep, z, sc), hs[m], hd[m], self.keep, z, sc)
                 c[:, m] += direct - back
         for f, cf in zip(self.tracers, c):
             new = cf.T[::-1]  # pyGETM: layer 0 at the bottom
@@ -370,7 +379,7 @@ class NestedTracers3D(Coupler):
         W = np.where(dry, 0.0, W)
         H = np.where(dry[..., None], hp.sum(axis=-1)[:, None, None] / nzc, H)
         if self.zmap:
-            c = remap_conc_z(C, H, hp, W)
+            c = remap_conc_z(C, H, hp, W, self.scheme)
             for f, cf in zip(self.tracers, c):
                 f.all_values[:, jj[ok], ii[ok]] = cf.T[::-1]
             return
