@@ -1107,6 +1107,16 @@ class Simulation(BaseSimulation):
 
         keep_ho = "hot" in initialized_variables
         keep_hn = "hnt" in initialized_variables
+        if self.runtype == RunType.BAROTROPIC_2D:
+            # Restore elevation from before the open boundary condition was applied
+            # (as zin in 3D): the restart holds z after the boundary update at the end
+            # of the last step, but the water depths of the next step's start are
+            # computed (in start, by update_depth) before that update, from the
+            # boundary elevations of the previous one - which are in zo (copied from
+            # z at the start of the step). The update in start then gives the
+            # restarted boundary elevations again: the run continues bit-identically.
+            bdy = self.T.mask.all_values == CellType.BOUNDARY
+            self.T.z.all_values[bdy] = self.T.zo.all_values[bdy]
         self.initialize_depth(keep_all_z=True, keep_ho=keep_ho, keep_hn=keep_hn)
 
     def _start(self):

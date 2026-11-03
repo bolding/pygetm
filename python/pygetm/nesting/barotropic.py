@@ -404,6 +404,7 @@ class NestedBarotropic(Coupler):
             self._ev = self.loc(*self.up_faces["edge_y"].points(self.t))
         self._k = 0
         self._fps = []
+        self._restart_arrays()
         #: wall-clock monitoring (seconds, this process): time in the syncs
         #: with parent and children (waiting in MPI + the exchange itself)
         #: and the elapsed time since the end of on_start
@@ -417,6 +418,56 @@ class NestedBarotropic(Coupler):
         #: largest elevation correction (m) by flux matching so far (diagnostic)
         self.max_correction = 0.0
         self.max_correction_info = None
+
+    # --- restart ----------------------------------------------------------------
+
+    #: the parent's ring state at the sync before the last one (``_snap_old``,
+    #: for ring_time "extrapolate"): z with its slopes on the T grid at the
+    #: ring cells, U/V at the ring faces and at the edge faces. Everything else
+    #: the coupler needs is rebuilt by the initial sync of :meth:`on_start` from
+    #: the restarted model state (restart files are written after the sync).
+    _RESTART = (("T", "z"), ("T", "zsx"), ("T", "zsy"), ("U", "u"), ("V", "v"), ("U", "ue"), ("V", "ve"))
+
+    def _restart_arrays(self):
+        """Arrays (part of the model state, so in pyGETM's restart files) with
+        the previous ring snapshot, and ``nest_ring_old_set`` (1 where it is
+        stored, 0 before the first sync with fluxes: a cold start)."""
+        from ..constants import CellType
+
+        self._rs = None
+        if self.up is None or self.ring_time != "extrapolate":
+            return
+        T = self.sim.T
+        grids = {"T": T, "U": T.ugrid, "V": T.vgrid}
+        attrs = dict(_part_of_state=True, _valid_at=tuple(CellType))  # nothing masked: exact values back
+        self._rs = [grids[g].array(name=f"nest_ring_{n}_old", fill=0.0,
+                                   long_name=f"nesting: parent ring state {n} at the previous sync", attrs=dict(attrs))
+                    for g, n in self._RESTART]
+        self._rs_set = T.array(name="nest_ring_old_set", fill=0.0,
+                               long_name="nesting: previous ring state stored (1) or not (0)", attrs=dict(attrs))
+
+    def _restart_points(self):
+        return (self._rj, self._ri), (self._rj, self._ri), (self._rj, self._ri), self._ru, self._rv, self._eu, self._ev
+
+    def _snap_to_restart(self):
+        """Keep the restart arrays equal to ``_snap_old``."""
+        if self._rs is None:
+            return
+        if self._snap_old is None:
+            self._rs_set.all_values[...] = 0.0
+            return
+        z, u, v, eu, ev = self._snap_old
+        for a, pts, vals in zip(self._rs, self._restart_points(), (z[0], z[1], z[2], u, v, eu, ev)):
+            a.all_values[pts] = vals
+        self._rs_set.all_values[...] = 1.0
+
+    def _snap_from_restart(self):
+        """``_snap_old`` from the restart arrays if a restart stored one (else
+        None, as at a cold start)."""
+        if self._rs is None or not (self._rs_set.all_values > 0.5).any():
+            return
+        vals = [a.all_values[pts].copy() for a, pts in zip(self._rs, self._restart_points())]
+        self._snap_old = (np.stack(vals[:3]), vals[3], vals[4], vals[5], vals[6])
 
     # --- helpers --------------------------------------------------------------
 
@@ -681,6 +732,8 @@ class NestedBarotropic(Coupler):
             self._sync_up_first(fps, with_parent, fluxes)
         else:
             self._sync_inner(fps, with_parent, fluxes)
+        if with_parent and fluxes:
+            self._snap_to_restart()
         if self._t_start is not None:
             self.t_sync += MPI.Wtime() - t0
 
@@ -747,6 +800,8 @@ class NestedBarotropic(Coupler):
             self._set_sponge(sim)
         if self.schedule == "sync":
             self._sync([None] * len(self.down), self.up is not None, fluxes=False)
+            if self.up is not None:
+                self._snap_from_restart()  # after a restart: the snapshot before the last sync
             self.clock.reset()
             self._t_start = MPI.Wtime()
             return
