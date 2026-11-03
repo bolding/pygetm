@@ -189,7 +189,8 @@ class NestedTracers3D(Coupler):
         #: parent's layer means cannot carry the child's finer vertical structure;
         #: without this the ring's stepped profile next to the child's smooth one
         #: is a horizontal density gradient at the interface (IDEAL V2: spurious
-        #: currents of 1-2 cm/s in a lake at rest, 10x the single-model error)
+        #: currents of 1-2 cm/s in a lake at rest, 10x the single-model error).
+        #: Limited to the range of the parent's value and the child's adjacent value
         self.ring_detail = ring_detail
         #: remap of concentrations (ring, rim): "z" (default) keeps every interface at
         #: its depth below the surface and cuts or extends only the bottom layer, so
@@ -213,6 +214,11 @@ class NestedTracers3D(Coupler):
         self.t_transport = 0.0
         self.max_correction = 0.0
         self._tracer_spec = tracers
+        # wall-clock time per part of the exchange (inclusive of the MPI waits inside it)
+        self.parts = {}
+        for name in ("_own_edge_fluxes", "_send_up", "_recv_ring", "_send_down", "_recv_rim", "_match_fluxes",
+                     "_send_ring_uv", "_recv_ring_uv", "_set_ring_uv", "_send_transports_up", "_recv_transports"):
+            self._timed(name)
         self.t_sync = 0.0
         self._fluxes_ready = False
         self.t_wait = 0.0
@@ -220,6 +226,20 @@ class NestedTracers3D(Coupler):
         self.max_ring_change = 0.0
 
     # --- helpers -----------------------------------------------------------
+
+    def _timed(self, name):
+        f = getattr(self, name)
+
+        def wrapper(*a, **kw):
+            t0, w0 = MPI.Wtime(), self.t_wait
+            try:
+                return f(*a, **kw)
+            finally:
+                p = self.parts.setdefault(name, [0.0, 0.0])
+                p[0] += MPI.Wtime() - t0
+                p[1] += self.t_wait - w0  # of which waiting for the partner (MPI receives)
+
+        setattr(self, name, wrapper)
 
     def loc(self, j, i):
         return self.til.local(self.t, j, i)
@@ -326,7 +346,10 @@ class NestedTracers3D(Coupler):
                 sc = self.scheme
                 direct = remap_column(cin[:, m], hin[m], hd[m], self.keep, z, sc)
                 back = remap_column(remap_column(cin[:, m], hin[m], hs[m], self.keep, z, sc), hs[m], hd[m], self.keep, z, sc)
-                c[:, m] += direct - back
+                # limited to the range of the parent's value and the child's adjacent one
+                # (layer by layer): the correction adds no new extrema (IDEAL V6)
+                c0 = c[:, m]
+                c[:, m] = np.clip(c0 + direct - back, np.minimum(c0, direct), np.maximum(c0, direct))
         for f, cf in zip(self.tracers, c):
             new = cf.T[::-1]  # pyGETM: layer 0 at the bottom
             old = f.all_values[:, rj[ok], ri[ok]]
@@ -684,6 +707,7 @@ class NestedTracers3D(Coupler):
         self._fluxes_ready = True
         self.max_ring_change = 0.0
         self.t_sync = self.t_wait = 0.0
+        self.parts = {}  # the start-up sync does not count
         self.n_sync = 0
 
     def on_stage(self, sim, stage, macro_active):
@@ -703,4 +727,6 @@ class NestedTracers3D(Coupler):
 
     def timing(self) -> dict:
         return dict(sync=self.t_sync, wait=self.t_wait, n_sync=self.n_sync, max_ring_change=self.max_ring_change,
-                    max_correction=self.max_correction, transport=self.t_transport)
+                    max_correction=self.max_correction, transport=self.t_transport,
+                    parts={k.lstrip("_"): v[0] for k, v in self.parts.items()},
+                    parts_wait={k.lstrip("_"): v[1] for k, v in self.parts.items()})
