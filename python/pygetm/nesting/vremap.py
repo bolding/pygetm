@@ -247,3 +247,34 @@ def rim_columns_apply(shared, c_c, h_c, h_p, by_volume=False, fix=None):
         with np.errstate(invalid="ignore", divide="ignore"):
             return c * np.where(have != 0.0, total / have, 1.0)
     return c + (total - have) / h_p.sum(axis=-1, keepdims=True)
+
+
+def contents(zs, zd, c, h, scheme="pcm"):
+    """Contents of the target layers (per unit area) for source interfaces ``zs [..., ns+1]`` and
+    target interfaces ``zd [..., nd+1]`` (depths below the surface), concentrations ``c [(tracers,)
+    ..., ns]`` and source thicknesses ``h [..., ns]``: the same as ``apply(prepare(zs, zd), c, h,
+    scheme)``, with the compiled kernel (``_pygetm.vertical_remap``) when it is available."""
+    try:
+        from .. import _pygetm
+
+        kernel = _pygetm.vertical_remap
+    except (ImportError, AttributeError):
+        kernel = None
+    zs = np.asarray(zs, dtype=float)
+    zd = np.asarray(zd, dtype=float)
+    h = np.asarray(h, dtype=float)
+    c = np.asarray(c, dtype=float)
+    if kernel is None:
+        return apply(prepare(zs, zd), c, h, scheme)
+    lead = np.broadcast_shapes(zs.shape[:-1], zd.shape[:-1], h.shape[:-1])
+    ns, nd = zs.shape[-1] - 1, zd.shape[-1] - 1
+    extra = c.shape[: c.ndim - len(lead) - 1]
+    n = int(np.prod(lead)) if lead else 1
+    nt = int(np.prod(extra)) if extra else 1
+    zs2 = np.ascontiguousarray(np.broadcast_to(zs, lead + (ns + 1,)).reshape(n, ns + 1))
+    zd2 = np.ascontiguousarray(np.broadcast_to(zd, lead + (nd + 1,)).reshape(n, nd + 1))
+    h2 = np.ascontiguousarray(np.broadcast_to(h, lead + (ns,)).reshape(n, ns))
+    c2 = np.ascontiguousarray(np.broadcast_to(c, extra + lead + (ns,)).reshape(nt, n, ns))
+    out = np.empty((nt, n, nd))
+    kernel(zs2, zd2, h2, c2, out, 1 if scheme == "ppm" else 0)
+    return out.reshape(extra + lead + (nd,))

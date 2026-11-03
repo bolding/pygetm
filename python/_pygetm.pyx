@@ -31,6 +31,7 @@ cdef extern void grid_interp_z(int nx, int ny, int nz1, int nz2, const double* s
 cdef extern void grid_interp_xy(int nx1, int ny1, int nx2, int ny2, int nz, const double* source, double* target, int ioffset, int joffset) nogil
 cdef extern void c_horizontal_filter(int nx, int ny, int nz, int halox, int haloy, int* mask, double w, const double* var) nogil
 cdef extern void c_vertical_filter(int nx, int ny, int nz, int halox, int haloy, int n, int* mask, double w, const double* var) nogil
+cdef extern void c_vertical_remap(int n, int ns, int nd, int nt, int scheme, const double* zs, const double* zd, const double* h, const double* c, double* out) nogil
 cdef extern void c_gradient_x(int nx1, int ny1, int nx2, int ny2, int nz, const double* source, const double* idx, double* target, int ioffset, int joffset) nogil
 cdef extern void c_gradient_y(int nx1, int ny1, int nx2, int ny2, int nz, const double* source, const double* idy, double* target, int ioffset, int joffset) nogil
 cdef extern void get_array(int source_type, void* grid, const char* name, int* grid_type, int* sub_type, int* data_type, void** p) nogil
@@ -214,6 +215,22 @@ def vertical_filter(int n, Array f not None, double w):
     cdef Array mask = f.grid.mask
 
     c_vertical_filter(nx, ny, nz, halox, haloy, n, <int*>mask.p, w, <double*>f.p)
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def vertical_remap(const double[:,::1] zs not None, const double[:,::1] zd not None, const double[:,::1] h not None, const double[:,:,::1] c not None, double[:,:,::1] out not None, int scheme=0):
+    """Contents of the target layers of n columns (pygetm.nesting.vremap.contents): zs (n, ns + 1) and
+    zd (n, nd + 1) the source and target interfaces (depths below the surface), h (n, ns) the source
+    thicknesses, c (nt, n, ns) the concentrations, out (nt, n, nd); scheme 0: PCM, 1: PPM."""
+    cdef int n = <int>zs.shape[0], ns = <int>zs.shape[1] - 1, nd = <int>zd.shape[1] - 1, nt = <int>c.shape[0]
+    if zd.shape[0] != n or h.shape[0] != n or h.shape[1] != ns or c.shape[1] != n or c.shape[2] != ns:
+        raise ValueError("vertical_remap: inconsistent shapes")
+    if out.shape[0] != nt or out.shape[1] != n or out.shape[2] != nd:
+        raise ValueError("vertical_remap: out has the wrong shape")
+    if n == 0 or nt == 0:
+        return
+    with nogil:
+        c_vertical_remap(n, ns, nd, nt, scheme, &zs[0,0], &zd[0,0], &h[0,0], &c[0,0,0], &out[0,0,0])
 
 def gradient_x(const double[:,::1] idx not None, const double[:,:,::1] source not None, double[:,:,::1] target not None, int ioffset=0, int joffset=0):
     c_gradient_x(<int>source.shape[2], <int>source.shape[1], <int>target.shape[2], <int>target.shape[1], <int>source.shape[0], &source[0,0,0], &idx[0,0], &target[0,0,0], ioffset, joffset)

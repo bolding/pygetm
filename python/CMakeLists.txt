@@ -53,6 +53,7 @@ add_library(cgetm
   src/tridiagonal.F90
   src/internal_pressure.F90
   src/vertical_adaptive.F90
+  src/vertical_remap.F90
 )
 
 target_link_libraries(cgetm getm_domain getm_operators)
