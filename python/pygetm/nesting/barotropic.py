@@ -402,6 +402,8 @@ class NestedBarotropic(Coupler):
             self._rv = self.loc(*self.up_faces["ring_y"].points(self.t))
             self._eu = self.loc(*self.up_faces["edge_x"].points(self.t))
             self._ev = self.loc(*self.up_faces["edge_y"].points(self.t))
+            #: lowest ring elevation: the bed + Dmin (drying)
+            self._ring_zmin = -T.H.all_values[self._rj, self._ri] + float(sim.Dmin)
         self._k = 0
         self._fps = []
         self._restart_arrays()
@@ -503,18 +505,37 @@ class NestedBarotropic(Coupler):
     def _set_ring_z(self, snap, halos=True):
         if not self.break_ring and self._rj.size:
             vals = ops.prolong(snap[0], snap[1], snap[2], self._ring_a, self._ring_b, self.lev.ratio)
+            # drying: the parent's (block mean) elevation can lie below a ring cell's
+            # own bed; there the ring cell is dry, as the child's own dry cells
+            # (pyGETM keeps those at -H + Dmin). Ring cells are not part of the
+            # child's volume, so conservation is unchanged.
+            np.maximum(vals, self._ring_zmin, out=vals)
             keep = self.wetmask[self._rj, self._ri]
             self.z.all_values[self._rj[keep], self._ri[keep]] = vals[keep]
         if halos:
             self.clock.halos(self.z)
 
+    def _alpha(self, grid, pts):
+        """pyGETM's drying factor at faces ``pts`` of ``grid`` (U or V) from the
+        child's own water depth there: 0 at D <= 2 Dmin, 1 at D >= Dcrit
+        (as pygetm.Simulation.update_depth, _pygetm.alpha). pyGETM computes it
+        only at faces it updates; the ring faces are set from the parent."""
+        sim = self.sim
+        D = grid.D.all_values[pts]
+        dmin2 = 2.0 * sim.Dmin
+        return np.clip((D - dmin2) / (sim.Dcrit - dmin2), 0.0, 1.0)
+
     def _set_ring_uv(self, u, v, eu=None, ev=None, halos=True):
         if not self.break_ring:
-            self.U.all_values[self._ru] = u
-            self.V.all_values[self._rv] = v
+            # drying: the parent's transport through a (coarser) face that is wet in
+            # the parent, scaled by the child's own drying factor at its ring face, so
+            # no water moves over the child's dry ground (alpha = 1 in deep water)
+            Ug, Vg = self.sim.U, self.sim.V
+            self.U.all_values[self._ru] = u * self._alpha(Ug, self._ru)
+            self.V.all_values[self._rv] = v * self._alpha(Vg, self._rv)
             if self.edge_flux == "parent" and eu is not None:
-                self.U.all_values[self._eu] = eu
-                self.V.all_values[self._ev] = ev
+                self.U.all_values[self._eu] = eu * self._alpha(Ug, self._eu)
+                self.V.all_values[self._ev] = ev * self._alpha(Vg, self._ev)
         if halos:
             self.clock.halos(self.U, self.V)
 
