@@ -72,6 +72,7 @@ from ..constants import CENTERS
 from ..simulation import Coupler
 from .runtime import NestingRun
 from . import vremap
+from .operators import minmod, subcell_offset
 
 #: tag offset (added to the 2D plan's tags) of the 3D messages
 TAG_3D = 1000
@@ -148,7 +149,8 @@ class NestedTracers3D(Coupler):
     def __init__(self, nest: NestingRun, sim, tracers: Optional[Sequence] = None, keep: float = 0.8,
                  break_ring: bool = False, break_rim: bool = False, flux_matching: bool = True,
                  flux_form: str = "consistent", replace_transport: bool = True, ring_velocities: bool = True,
-                 ring_detail: bool = True, vertical_map: str = "z", remap_scheme: str = "ppm"):
+                 ring_detail: bool = True, vertical_map: str = "z", remap_scheme: str = "ppm",
+                 ring_slopes: bool = False):
         self.nest, self.sim = nest, sim
         self.lev = nest.level
         self.t = nest.tile
@@ -209,6 +211,15 @@ class NestedTracers3D(Coupler):
         if remap_scheme not in ("ppm", "pcm"):
             raise ValueError(f"remap_scheme {remap_scheme!r}")
         self.scheme = remap_scheme
+        #: the ring horizontally linear within each parent cell (as the 2D ring's
+        #: elevation): the parent also sends the columns of the four neighbours of
+        #: every ring source cell; the child remaps all five onto the ring cell's own
+        #: layers and takes minmod-limited slopes layer by layer (zero towards land).
+        #: Flat isopycnals give no slope; no new extrema. Without it the ring is
+        #: piecewise constant per parent cell, with steps at the parent cells' edges
+        #: where the child's interior is smooth (IDEAL V2: the strait's largest
+        #: spurious current at a block edge next to a wall). The same on all levels.
+        self.ring_slopes = bool(ring_slopes)
         self._ring_uv = None
         self.t_transport = 0.0
         self.max_correction = 0.0
@@ -325,15 +336,16 @@ class NestedTracers3D(Coupler):
         nzp = self.parent_nz
         nt = len(self.tracers)
         parts = []
+        nnb = 5 if self.ring_slopes else 1
         for p, v in self._ring:
-            buf = np.empty((1 + nt, v[2].size, nzp))  # column by column, surface first
+            buf = np.empty((nnb, 1 + nt, v[2].size, nzp))  # columns surface first
             self._recv(self.up.comm, buf, self.up.poff + p, self.up.tag_p + TAG_3D)
             parts.append(buf)
-        buf = np.concatenate(parts, axis=1)
+        buf = np.concatenate(parts, axis=2)
         if self.break_ring:
             return
-        hs = buf[0]  # (n, nzp)
-        cs = buf[1:]  # (nt, n, nzp)
+        hs = buf[0, 0]  # (n, nzp)
+        cs = buf[0, 1:]  # (nt, n, nzp)
         rj, ri = self._rj, self._ri
         hd = vremap.gather_columns(self.sim.T.hn.all_values, rj, ri)  # (n, nzc), surface first
         ok = self.wet[rj, ri] & (hs.sum(axis=1) > 0.0) & (hd.sum(axis=1) > 0.0)
@@ -341,6 +353,21 @@ class NestedTracers3D(Coupler):
             return
         hs, cs, hd = hs[ok], cs[:, ok], hd[ok]
         c = remap_column(cs, hs, hd, self.keep, self.zmap, self.scheme)
+        if self.ring_slopes:
+            # the neighbours on the ring cell's layers; minmod slopes per layer, zero towards land
+            nbs = []
+            for k in range(1, 5):
+                hk, ck = buf[k, 0][ok], buf[k, 1:][:, ok]
+                wk = hk.sum(axis=1) > 0.0
+                ck_d = np.empty_like(c)
+                ck_d[:, ~wk] = c[:, ~wk]
+                if wk.any():
+                    ck_d[:, wk] = remap_column(ck[:, wk], hk[wk], hd[wk], self.keep, self.zmap, self.scheme)
+                nbs.append(np.where(wk[None, :, None], ck_d, c))
+            cw, ce, cs_, cn = nbs
+            sx = minmod(c - cw, ce - c)
+            sy = minmod(c - cs_, cn - c)
+            c = c + sx * self._ring_ox[ok][None, :, None] + sy * self._ring_oy[ok][None, :, None]
         if self.ring_detail:
             ij, ii_ = self._rin_j[ok], self._rin_i[ok]
             m = self._rin_ok[ok].copy()
@@ -373,10 +400,18 @@ class NestedTracers3D(Coupler):
             if p != self.t:
                 continue
             jj, ii = self.loc(pj, pi)
-            buf = np.empty((1 + len(self.tracers), jj.size, h.shape[0]))  # column by column, surface first
-            vremap.gather_columns(h, jj, ii, out=buf[0])
-            for n, f in enumerate(self.tracers):
-                vremap.gather_columns(f.all_values, jj, ii, out=buf[1 + n])
+            # the source column, and with ring_slopes its W, E, S, N neighbours (land: thickness 0)
+            nb = ((0, 0), (0, -1), (0, 1), (-1, 0), (1, 0)) if self.ring_slopes else ((0, 0),)
+            buf = np.empty((len(nb), 1 + len(self.tracers), jj.size, h.shape[0]))  # columns surface first
+            ny, nx = self.wet.shape
+            for k, (dj, di) in enumerate(nb):
+                j2 = np.clip(jj + dj, 0, ny - 1)
+                i2 = np.clip(ii + di, 0, nx - 1)
+                vremap.gather_columns(h, j2, i2, out=buf[k, 0])
+                for n, f in enumerate(self.tracers):
+                    vremap.gather_columns(f.all_values, j2, i2, out=buf[k, 1 + n])
+                if k:
+                    buf[k, 0][~self.wet[j2, i2]] = 0.0
             reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=plan.tag_p + TAG_3D))
         return reqs
 
@@ -678,13 +713,15 @@ class NestedTracers3D(Coupler):
         world = self.nest.world
         # all levels share the macro time step (every macro step is a sync)
         dts = world.allgather((self.lev.name, float(sim.macrotimestep), int(T.hn.all_values.shape[0]),
-                               len(self.tracers)))
+                               len(self.tracers), self.ring_slopes))
         steps = {d[1] for d in dts}
         if max(steps) - min(steps) > 1e-6 * max(steps):
             raise ValueError("NestedTracers3D: the levels need the same macro time step (split factor of a child ="
                              f" its parent's x its time ratio): {sorted(set((d[0], d[1]) for d in dts))}")
         if len({d[3] for d in dts}) != 1:
             raise ValueError(f"NestedTracers3D: the levels exchange different numbers of tracers: {dts}")
+        if len({d[4] for d in dts}) != 1:
+            raise ValueError(f"NestedTracers3D: ring_slopes must be the same on all levels: {dts}")
         nz = {d[0]: d[2] for d in dts}
         self.nz = nz[self.lev.name]
         self.parent_nz = nz[self.lev.parent.name] if self.lev.parent is not None else None
@@ -696,6 +733,8 @@ class NestedTracers3D(Coupler):
             self._ring = [(p, v) for (p, tt), v in sorted(self.up.pro.items()) if tt == self.t]
             cat = lambda k: np.concatenate([v[k] for _, v in self._ring]) if self._ring else np.zeros(0, int)
             self._rj, self._ri = self.loc(cat(2), cat(3))
+            r = self.lev.ratio
+            self._ring_ox, self._ring_oy = subcell_offset(cat(5), r), subcell_offset(cat(4), r)  # x: b, y: a
             # the child's interior cell next to each ring cell (within the halo)
             gj = np.clip(cat(2), 0, self.lev.ny - 1)
             gi = np.clip(cat(3), 0, self.lev.nx - 1)
