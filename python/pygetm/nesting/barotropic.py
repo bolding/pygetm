@@ -384,6 +384,7 @@ class NestedBarotropic(Coupler):
         self.z, self.U, self.V = T.z, sim.momentum.U, sim.momentum.V
         self.wetmask = T.mask.all_values != 0
         self.area = T.area.all_values
+        self.H = T.H.all_values
         self.dyu, self.dxv = T.ugrid.dy.all_values, T.vgrid.dx.all_values
         links = {c.name: k for k, c in enumerate(nest.levels[1:])}
         self.up_faces = None
@@ -420,6 +421,12 @@ class NestedBarotropic(Coupler):
         #: largest elevation correction (m) by flux matching so far (diagnostic)
         self.max_correction = 0.0
         self.max_correction_info = None
+        #: drying (diagnostics, parent side): the least water depth (m) of a
+        #: parent cell after the flux-matching correction, and of a rim cell
+        #: after the restriction, so far
+        self.min_depth_corrected = np.inf
+        self.min_depth_corrected_info = None
+        self.min_depth_rim = np.inf
 
     # --- restart ----------------------------------------------------------------
 
@@ -608,6 +615,9 @@ class NestedBarotropic(Coupler):
                 jj, ii = self.loc(mine[:, 0], mine[:, 1])
                 ok = np.isfinite(vals)
                 self.z.all_values[jj[ok], ii[ok]] = vals[ok]
+                if ok.any():  # diagnostic
+                    d = self.H[jj[ok], ii[ok]] + vals[ok]
+                    self.min_depth_rim = min(self.min_depth_rim, float(d.min()))
         # rim U, V (mean over child faces)
         u = faces["rim_x"].recv(plan.comm, self.t, self.clock)
         v = faces["rim_y"].recv(plan.comm, self.t, self.clock)
@@ -639,6 +649,11 @@ class NestedBarotropic(Coupler):
             if not self.break_flux:
                 def apply(oj=oj, oi=oi, dz=dz, m_in=m_in, fci=fci):
                     np.add.at(self.z.all_values, (oj, oi), dz)
+                    d = np.where(self.wetmask[oj, oi], self.H[oj, oi] + self.z.all_values[oj, oi], np.inf)  # diagnostic
+                    k = int(np.argmin(d))
+                    if d[k] < self.min_depth_corrected:
+                        self.min_depth_corrected = float(d[k])
+                        self.min_depth_corrected_info = (self._k, int(oj[k]), int(oi[k]), float(dz[k]), float(d[k] - dz[k]))
                     if self.replace_transport:
                         # the parent continues from the child's mean transport
                         fj, fi = self.loc(wf["face"][0][m_in], wf["face"][1][m_in])
