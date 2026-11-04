@@ -183,3 +183,22 @@ def test_numpy_switch(monkeypatch):
     assert vr._kernel("vertical_remap") is None
     b = vr.contents(zs, zd, c, h, "ppm")
     assert np.abs(a - b).max() < 1e-12
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_ppm_linear_exact_in_second_layers(compiled, monkeypatch):
+    # a linear profile on uniform layers, the interfaces shifted by a fraction of a layer:
+    # with the edges next to the outermost layers from the two layer means, the parabola
+    # is exact in the second layers too (IDEAL V2: a pycnocline in the bottom layers)
+    if not compiled:
+        monkeypatch.setenv("PYGETM_NESTING_REMAP", "numpy")
+    nz, D = 15, 20.0
+    hs = np.full((1, nz), D / nz)
+    zs = np.concatenate([[0.0], np.cumsum(hs[0])])
+    c = (0.5 * (zs[1:] + zs[:-1]) * 0.3 + 1.0)[None]  # layer means of 1 + 0.3 z
+    zd = zs + 0.25 * D / nz  # every interface shifted down by a quarter layer
+    zd[0], zd[-1] = 0.0, D
+    out = vr.contents(zs[None], zd[None], c[None], hs, scheme="ppm")[0, 0] / np.diff(zd)
+    exact = 1.0 + 0.3 * 0.5 * (zd[1:] + zd[:-1])
+    # target layers 1 .. nz-3 lie within source layers 1 .. nz-2 (not the outermost ones)
+    np.testing.assert_allclose(out[1:-2], exact[1:-2], rtol=0, atol=1e-12)

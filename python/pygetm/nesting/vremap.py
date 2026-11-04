@@ -90,8 +90,12 @@ def ppm_edges(c, h):
     """Left (upper) and right (lower) edge values of the limited piecewise-parabolic
     reconstruction (Colella and Woodward 1984, eqs. 1.6-1.10, for layers of unequal
     thickness) of layer means ``c [..., n]`` with thicknesses ``h [..., n]``. The
-    outermost two layers and layers next to empty ones are piecewise constant. The
-    parabola in each layer keeps its mean, and the limiter adds no new extrema."""
+    second and second-last layers get the edge towards the outermost layer by linear
+    interpolation of the two layer means (second order); the outermost layers and
+    layers next to empty ones are piecewise constant. The parabola in each layer keeps
+    its mean, and the limiter adds no new extrema. (Before 2026-11-04 the second
+    layers were constant too: IDEAL V2, a pycnocline in the bottom layers, had ring
+    errors 3x larger.)"""
     c = np.asarray(c, dtype=float)
     h = np.broadcast_to(np.asarray(h, dtype=float), c.shape)
     n = c.shape[-1]
@@ -120,11 +124,21 @@ def ppm_edges(c, h):
                                                  - hj * z1 * dj1 + hj1 * z2 * dj))
         good = np.isfinite(e) & (hj_1 > 0) & (hj > 0) & (hj1 > 0) & (hj2 > 0)
         e = np.where(good, e, 0.5 * (cj + cj1))
-    # inner layers 2 .. n-3 get both edges from e; the outer two layers stay constant
+        # the edges next to the outermost layers: linear between the two layer means
+        def lin(ca, cb, ha, hb):
+            v = ca + ha / (ha + hb) * (cb - ca)
+            return np.where((ha > 0) & (hb > 0) & np.isfinite(v), v, 0.5 * (ca + cb))
+        e0 = lin(c[..., 0], c[..., 1], h[..., 0], h[..., 1])
+        en = lin(c[..., -2], c[..., -1], h[..., -2], h[..., -1])
+    # layers 1 .. n-2 get both edges; the outermost two stay constant
     aR[..., 2:-2] = e[..., 1:]       # lower edge of layer j = edge j+1/2
     aL[..., 2:-2] = e[..., :-1]      # upper edge of layer j = edge j-1/2
+    aL[..., 1] = e0
+    aR[..., 1] = e[..., 0]
+    aL[..., -2] = e[..., -1]
+    aR[..., -2] = en
     inner = np.zeros(n, dtype=bool)
-    inner[2:-2] = True
+    inner[1:-1] = True
     # limiter (1.10)
     a = c
     flat = ((aR - a) * (a - aL) <= 0.0) | ~inner

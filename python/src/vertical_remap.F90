@@ -6,7 +6,8 @@
 !
 ! Reconstruction inside each source layer: constant (PCM, scheme 0) or a limited parabola
 ! (PPM, scheme 1; Colella and Woodward 1984, eqs. 1.6-1.10 for layers of unequal thickness;
-! the outer two layers and layers next to empty ones constant), exactly as vremap.ppm_edges.
+! the second layers from each end with the outer edge linear between the two layer means,
+! the outermost layers and layers next to empty ones constant), exactly as vremap.ppm_edges.
 ! Both keep the column content exactly and add no new extrema.
 !
 ! Arrays as numpy passes them (C order): zs(n, ns+1), zd(n, nd+1), h(n, ns), c(nt, n, ns),
@@ -69,11 +70,24 @@ contains
       end do
 
       inner = .false.
-      inner(3:n-2) = .true.
+      inner(2:n-1) = .true.
       do k = 3, n - 2
          aR(k) = e(k)
          aL(k) = e(k-1)
       end do
+      ! the edges next to the outermost layers: linear between the two layer means
+      if (h(1) > 0.0_c_double .and. h(2) > 0.0_c_double) then
+         aL(2) = c(1) + h(1) / (h(1) + h(2)) * (c(2) - c(1))
+      else
+         aL(2) = 0.5_c_double * (c(1) + c(2))
+      end if
+      aR(2) = e(2)
+      aL(n-1) = e(n-2)
+      if (h(n-1) > 0.0_c_double .and. h(n) > 0.0_c_double) then
+         aR(n-1) = c(n-1) + h(n-1) / (h(n-1) + h(n)) * (c(n) - c(n-1))
+      else
+         aR(n-1) = 0.5_c_double * (c(n-1) + c(n))
+      end if
 
       ! limiter (1.10)
       do k = 1, n
