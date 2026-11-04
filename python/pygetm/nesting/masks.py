@@ -22,6 +22,15 @@ child overlap they are reconciled, the child's finer bathymetry leading:
    stored per level (:attr:`Level.closed_faces`) and closed in the level's
    domain mask before its grids are built
    (:meth:`pygetm.nesting.runtime.NestingRun.build`).
+
+Interfaces and drying: the layout is assumed to keep every interface out of
+water that floods and dries - drying happens inside a level, where pyGETM
+handles it (the coupling has a safety net for it in 2D, see
+:mod:`pygetm.nesting.barotropic`, but not in 3D). :func:`interface_depths`
+checks this against ``interface_min_depth`` (m below the depth datum) of the
+layout: per level, or for all levels under ``config:``. Choose it as the
+largest fall of the water level below the datum (tidal amplitude plus
+set-down by wind) plus a margin above pyGETM's Dcrit.
 """
 
 from typing import Dict, Iterable
@@ -160,3 +169,39 @@ def _n_closed(p: Level, c: Level, wet: Dict[str, np.ndarray]) -> int:
     have = set(zip(cf["is_x"].tolist(), cf["face"][0].tolist(), cf["face"][1].tolist()))
     want = zip(f["is_x"][bad].tolist(), f["face"][0][bad].tolist(), f["face"][1][bad].tolist())
     return sum(k in have for k in want)
+
+
+def interface_min_depth(config: dict, name: str) -> float:
+    """``interface_min_depth`` of level ``name`` in a layout (its own key, else
+    ``config:``; 0: not checked)."""
+    v = (config.get(name) or {}).get("interface_min_depth", (config.get("config") or {}).get("interface_min_depth", 0.0))
+    return float(v or 0.0)
+
+
+def interface_depths(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict[str, np.ndarray],
+                     min_depth: Dict[str, float]) -> Dict[str, dict]:
+    """The water at every child's interface: per child level, the least depth
+    (``H``, positive down, on the extended shapes) of its wet ring cells and
+    of the wet parent cells they are filled from, and how many of each are
+    shallower than ``min_depth[child]`` (``interface_shallow``; 0 if no minimum
+    is set)."""
+    out = {}
+    for lev in levels:
+        if lev.parent is None:
+            continue
+        h, p = lev.band, lev.parent
+        bj, bi = lev.ring_cells()
+        pj, pi, _, _ = lev.ring_source(bj, bi)
+        cw = wet[lev.name][bj + h, bi + h]
+        cd = np.asarray(H[lev.name], dtype=float)[bj + h, bi + h][cw]
+        pk = np.unique(np.stack([pj, pi]), axis=1) if pj.size else np.zeros((2, 0), int)
+        pw = wet[p.name][pk[0] + p.band, pk[1] + p.band]
+        pd = np.asarray(H[p.name], dtype=float)[pk[0] + p.band, pk[1] + p.band][pw]
+        lim = float(min_depth.get(lev.name, 0.0))
+        out[lev.name] = {
+            "min_depth_ring": float(cd.min(initial=np.inf)),
+            "min_depth_parent": float(pd.min(initial=np.inf)),
+            "interface_min_depth": lim,
+            "interface_shallow": int((cd < lim).sum() + (pd < lim).sum()) if lim > 0.0 else 0,
+        }
+    return out

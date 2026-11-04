@@ -405,6 +405,7 @@ class NestedBarotropic(Coupler):
             self._ev = self.loc(*self.up_faces["edge_y"].points(self.t))
             #: lowest ring elevation: the bed + Dmin (drying)
             self._ring_zmin = -T.H.all_values[self._rj, self._ri] + float(sim.Dmin)
+            self._dmin = float(sim.Dmin)
         self._k = 0
         self._fps = []
         self._restart_arrays()
@@ -427,6 +428,9 @@ class NestedBarotropic(Coupler):
         self.min_depth_corrected = np.inf
         self.min_depth_corrected_info = None
         self.min_depth_rim = np.inf
+        #: least water depth (m) the ring has had (diagnostic; ring cells at the
+        #: child's bed + Dmin are dry: the interface has fallen dry)
+        self.min_depth_ring = np.inf
 
     # --- restart ----------------------------------------------------------------
 
@@ -518,6 +522,9 @@ class NestedBarotropic(Coupler):
             # child's volume, so conservation is unchanged.
             np.maximum(vals, self._ring_zmin, out=vals)
             keep = self.wetmask[self._rj, self._ri]
+            if keep.any():  # diagnostic: the layout should keep this well above Dcrit (masks.interface_depths)
+                d = vals[keep] - self._ring_zmin[keep] + self._dmin
+                self.min_depth_ring = min(self.min_depth_ring, float(d.min()))
             self.z.all_values[self._rj[keep], self._ri[keep]] = vals[keep]
         if halos:
             self.clock.halos(self.z)
@@ -954,7 +961,8 @@ class NestedBarotropic(Coupler):
                     work=work, halo=c.halo, halo_wait=c.halo_wait,
                     transfer=c.transfer, wait=c.wait, idle=c.wait / elapsed if elapsed > 0 else 0.0,
                     steps=self._k, cells=int(mask.size), wet=int((mask != 0).sum()),
-                    open_boundary=int(getattr(self.sim.open_boundaries, "np", 0)))
+                    open_boundary=int(getattr(self.sim.open_boundaries, "np", 0)),
+                    min_depth_ring=self.min_depth_ring)
 
     def describe(self) -> List[str]:
         """Messages of the U/V transfers of this process."""

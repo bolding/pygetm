@@ -26,6 +26,8 @@ Steps 2 and 3 are collective over all processes of all components.
 
 from typing import Any, Dict, Mapping, Optional
 
+import warnings
+
 import numpy as np
 from mpi4py import MPI
 
@@ -71,6 +73,8 @@ class NestedModel:
         self._run: Optional[NestingRun] = None
         self.changes: Dict[str, dict] = {}
         self.violations: Dict[str, dict] = {}
+        #: per child level: least depth at its interface (masks.interface_depths)
+        self.interface_depths: Dict[str, dict] = {}
 
     @property
     def level(self) -> Level:
@@ -95,6 +99,17 @@ class NestedModel:
         self.levels = load_levels(self.config, halo=self.halo, root_band=self.root_band, wet=actives)
         wets, Hs, self.changes = masks.make_consistent(self.levels, wets, Hs)
         self.violations = masks.check_consistent(self.levels, wets)
+        # the layout keeps the interfaces out of water that floods and dries (masks.interface_depths)
+        lims = {l.name: masks.interface_min_depth(self.config, l.name) for l in self.levels}
+        self.interface_depths = masks.interface_depths(self.levels, wets, Hs, lims)
+        for n, d in self.interface_depths.items():
+            self.violations.setdefault(n, {})["interface_shallow"] = d["interface_shallow"]
+        mine_iface = self.interface_depths.get(self.name)
+        if mine_iface and mine_iface["interface_shallow"] and self.comm.rank == 0:
+            warnings.warn(f"{self.name}: {mine_iface['interface_shallow']} interface cells shallower than "
+                          f"interface_min_depth {mine_iface['interface_min_depth']} m (least: ring "
+                          f"{mine_iface['min_depth_ring']:.2f} m, parent {mine_iface['min_depth_parent']:.2f} m): "
+                          f"the interface may fall dry", stacklevel=2)
         self.wet = wets
         return np.where(wets[self.name], Hs[self.name], np.nan)
 

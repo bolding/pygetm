@@ -731,6 +731,32 @@ class TestNestingMasks(unittest.TestCase):
         self.assertEqual(int((dom.mask == 0).sum()), 1)
 
 
+    def test_interface_depths(self):
+        # the layout keeps interfaces out of drying water: shallow ring cells or
+        # parent source cells are counted against interface_min_depth
+        from pygetm.nesting.masks import interface_depths, interface_min_depth
+
+        levels = small_hierarchy()
+        root, child = levels[0], levels[1]
+        wet = {l.name: np.ones(l.extended_shape, bool) for l in levels}
+        H = {l.name: np.full(l.extended_shape, 10.0) for l in levels}
+        lim = {child.name: 3.0}
+        d = interface_depths(levels, wet, H, lim)[child.name]
+        self.assertEqual(d["interface_shallow"], 0)
+        self.assertEqual(d["min_depth_ring"], 10.0)
+        bj, bi = child.ring_cells()
+        H[child.name][bj[0] + child.band, bi[0] + child.band] = 1.0  # one shallow ring cell
+        pj, pi, _, _ = child.ring_source(bj, bi)
+        H[root.name][pj[-1] + root.band, pi[-1] + root.band] = 2.0  # one shallow parent source cell
+        d = interface_depths(levels, wet, H, lim)[child.name]
+        self.assertEqual(d["interface_shallow"], 2)
+        self.assertEqual((d["min_depth_ring"], d["min_depth_parent"]), (1.0, 2.0))
+        self.assertEqual(interface_depths(levels, wet, H, {})[child.name]["interface_shallow"], 0)  # not set
+        cfg = {"config": {"interface_min_depth": 2.5}, child.name: {"interface_min_depth": 4}}
+        self.assertEqual((interface_min_depth(cfg, child.name), interface_min_depth(cfg, root.name)), (4.0, 2.5))
+        self.assertEqual(interface_min_depth({}, child.name), 0.0)
+
+
 class TestNestingPlan(unittest.TestCase):
     def _check(self, levels, layouts):
         from pygetm.nesting.plan import LevelTiling, Plan
