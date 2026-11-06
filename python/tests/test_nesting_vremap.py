@@ -202,3 +202,22 @@ def test_ppm_linear_exact_in_second_layers(compiled, monkeypatch):
     exact = 1.0 + 0.3 * 0.5 * (zd[1:] + zd[:-1])
     # target layers 1 .. nz-3 lie within source layers 1 .. nz-2 (not the outermost ones)
     np.testing.assert_allclose(out[1:-2], exact[1:-2], rtol=0, atol=1e-12)
+
+
+def test_macro_ratios():
+    """3D sub-stepping: a child's 3D step is its parent's divided by a whole number."""
+    from pygetm.nesting.baroclinic import macro_ratios
+
+    # the shared 3D step (split = parent's x time ratio), then the strait's own (a third)
+    shared = {"c": (None, 180.0, 10, 1), "s": ("c", 180.0, 10, 1), "t": ("s", 180.0, 30, 3)}
+    assert macro_ratios(shared) == {"s": 1, "t": 1}
+    own = {"c": (None, 180.0, 10, 1), "s": ("c", 180.0, 10, 1), "t": ("s", 60.0, 10, 3)}
+    assert macro_ratios(own) == {"s": 1, "t": 3}
+    # a chain: both levels sub-step
+    chain = {"c": (None, 180.0, 10, 1), "s": ("c", 90.0, 5, 1), "t": ("s", 30.0, 5, 3)}
+    assert macro_ratios(chain) == {"s": 2, "t": 3}
+    for bad in ({"c": (None, 180.0, 10, 1), "t": ("c", 72.0, 12, 3)},  # 30 / 12: no whole number
+                {"c": (None, 180.0, 10, 1), "t": ("c", 360.0, 60, 3)},  # longer than the parent's
+                {"c": (None, 180.0, 10, 1), "t": ("c", 50.0, 10, 3)}):  # time steps that do not fit
+        with pytest.raises(ValueError):
+            macro_ratios(bad)

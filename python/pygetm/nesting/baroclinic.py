@@ -6,10 +6,17 @@ docs/plan_21_3d_exchange.md.
 :class:`NestedTracers3D` is a :class:`pygetm.simulation.Coupler` attached to
 every level next to :class:`pygetm.nesting.barotropic.NestedBarotropic`
 (which keeps coupling z, U, V at every 2D step). It acts at the ``tracers``
-stage of every macro (3D) time step. All levels must have the same macro
-time step: a child's split factor is its parent's times its time ratio, so
-that the macro steps of all levels end together and every macro step is a
-sync point for the tracers.
+stage of every macro (3D) time step.
+
+**3D sub-stepping:** a child's macro step may be its parent's divided by a whole
+number R (:attr:`NestedTracers3D.ratio_3d`), which follows from the split factors:
+R = parent's split x child's time ratio / child's split (R = 1: all levels share
+the macro step). Everything between the two levels happens once per parent macro
+step, at the sync at the end of the child's R-th macro step. In between the child
+holds the ring (concentrations and the parent's layer transports, the latter
+shifted at every macro step to the column total of its own 2D ring), and adds up
+its tracer amounts and its water through the edge faces. The parent therefore
+sees the sum over all sub-steps in its correction and its transports.
 
 At a sync, in an order without cycles over the hierarchy (as the 2D sync,
 "up_first"):
@@ -28,14 +35,14 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
   concentrations) of the parent cell covering each child ring cell; the
   child remaps it onto its own layers in that cell (the same stretch, by
   volume: a uniform field stays uniform). Horizontally piecewise constant
-  (first version), held over the child's next macro step (the parent's
+  (first version), held over the child's next R macro steps (the parent's
   state of the last sync).
 
 * **flux matching (child -> parent, ``flux_matching=True``):** pyGETM's
   tracer advection adds the amount through every face and layer to arrays
   of this coupler (:attr:`pygetm.tracer.TracerCollection.face_fluxes`).
   The child sends, with the rim, the profiles through its edge faces (r
-  sub-faces per parent interface face) over the 3D step, with its face
+  sub-faces per parent interface face) over the parent's 3D step, with its face
   layer thicknesses. The parent remaps every sub-face profile onto the
   layers of its own face (the same stretch; the amounts are kept exactly),
   adds the r sub-faces, and corrects the parent cell next to the face layer
@@ -45,7 +52,7 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
 
 * **3D transports (child -> parent, ``replace_transport=True``):** at the
   ``momentum_3d`` stage the child sends its layer transports through its
-  edge faces; the parent remaps them onto its face layers, keeps its own
+  edge faces (the mean over its R macro steps); the parent remaps them onto its face layers, keeps its own
   column total (which its elevation used) and sets pk, qk there, then
   recomputes ww, uk, vk. Parent and child then move the same water through
   every layer of the interface, and the flux correction conserves the
@@ -58,9 +65,10 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
   ``momentum_3d`` stage the child remaps them onto its own face layers,
   shifts them to its own column total (the ring's 2D transport, which its
   elevation used) and sets pk, qk there, then recomputes ww, uk, vk. Held
-  over the 3D step.
+  over the parent's 3D step.
 
-Not yet: limited slopes in the ring, time interpolation of the ring.
+Not yet: time interpolation of the ring. Limited slopes in the ring are an option
+(``ring_slopes``).
 """
 
 from typing import List, Optional, Sequence
@@ -130,6 +138,23 @@ def remap_column(c, h_src, h_dst, keep=0.0, z=False, scheme="ppm"):
     ``z``: interfaces kept at their depths (:func:`remap_conc_z`)."""
     shared = vremap.rim_columns_prepare(h_src[:, None, :], np.ones((h_src.shape[0], 1)), h_dst, keep=keep)
     return vremap.rim_columns_apply(shared, c[:, :, None, :], h_src[:, None, :], h_dst, by_volume=True)
+
+
+def macro_ratios(levels) -> dict:
+    """Macro steps of every child per macro step of its parent. ``levels``: name ->
+    (parent name or None, macro time step, split factor, time ratio). A child's macro
+    step must be its parent's divided by a whole number."""
+    ratios = {}
+    for name, (parent, macro, split, time_ratio) in levels.items():
+        if parent is None:
+            continue
+        pmacro, psplit = levels[parent][1], levels[parent][2]
+        q, rem = divmod(psplit * time_ratio, split)
+        if q < 1 or rem != 0 or abs(pmacro - q * macro) > 1e-6 * pmacro:
+            raise ValueError(f"NestedTracers3D: the 3D step of {name} ({macro} s, split {split}, time ratio {time_ratio}) is not"
+                             f" the 3D step of its parent {parent} ({pmacro} s, split {psplit}) divided by a whole number")
+        ratios[name] = q
+    return ratios
 
 
 class NestedTracers3D(Coupler):
@@ -221,6 +246,11 @@ class NestedTracers3D(Coupler):
         #: spurious current at a block edge next to a wall). The same on all levels.
         self.ring_slopes = bool(ring_slopes)
         self._ring_uv = None
+        #: this level's macro steps per macro step of its parent (from the split
+        #: factors, set in :meth:`on_start`); the exchange with the parent happens
+        #: at every ``ratio_3d``-th macro step
+        self.ratio_3d = 1
+        self._water_sum = {}
         self.t_transport = 0.0
         self.max_correction = 0.0
         self._tracer_spec = tracers
@@ -259,6 +289,10 @@ class NestedTracers3D(Coupler):
             names = [n for n in ("temp", "salt") if getattr(sim, n, None) is not None]
             return [getattr(sim, n) for n in names]
         return [getattr(sim, n) if isinstance(n, str) else n for n in self._tracer_spec]
+
+    def _up_active(self) -> bool:
+        """Does this macro step end one of the parent's (a sync with the parent)?"""
+        return self.up is not None and self.sim.istep % (self.sim.split_factor * self.ratio_3d) == 0
 
     def _recv(self, comm, buf, source, tag):
         t0 = MPI.Wtime()
@@ -515,17 +549,30 @@ class NestedTracers3D(Coupler):
 
     # --- 3D transports at the interface (momentum_3d stage) ------------------------
 
+    def _add_water_up(self):
+        """Add this macro step's water through the edge faces (every macro step)."""
+        e = self.lev.edge
+        for key, (_, _, fk) in self.up.flx.items():
+            if key[0] != self.t:
+                continue
+            vol = self._volume_profiles(e["is_x"][fk], e["face"][0][fk], e["face"][1][fk])
+            if key in self._water_sum:
+                self._water_sum[key] += vol
+            else:
+                self._water_sum[key] = vol
+
     def _send_transports_up(self) -> List[MPI.Request]:
         reqs = []
         e = self.lev.edge
-        m = self.sim.momentum
-        for (tt, p), (_, _, fk) in self.up.flx.items():
+        for key, (_, _, fk) in self.up.flx.items():
+            tt, p = key
             if tt != self.t:
                 continue
             args = (e["is_x"][fk], e["face"][0][fk], e["face"][1][fk])
             h = self._face_profiles((self.sim.U.hn, self.sim.V.hn), *args)
             h = np.where(np.isfinite(h), h, 0.0)
-            q = self._volume_profiles(*args) / self.sim.macrotimestep  # m3 s-1 per layer
+            # m3 s-1 per layer, the mean over the parent's macro step
+            q = self._water_sum.pop(key) / (self.sim.macrotimestep * self.ratio_3d)
             buf = np.ascontiguousarray(np.concatenate([h.T, q.T], axis=0))
             reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=self.up.tag_f + TAG_3D + 300))
         return reqs
@@ -642,7 +689,11 @@ class NestedTracers3D(Coupler):
 
     def _sync_transports(self, sim):
         t0 = MPI.Wtime()
-        reqs = self._send_transports_up() if (self.up is not None and self.replace_transport) else []
+        reqs = []
+        if self.up is not None and self.replace_transport:
+            self._add_water_up()
+            if self._up_active():
+                reqs = self._send_transports_up()
         changed = False
         if self.replace_transport:
             for plan, nzc in zip(self.down, self.child_nz):
@@ -667,15 +718,16 @@ class NestedTracers3D(Coupler):
     def _sync(self):
         t0 = MPI.Wtime()
         reqs = []
+        up = self._up_active()
         if self.flux_matching and self._fluxes_ready and self.up is not None:
             self._own_edge_fluxes()
-        if self.up is not None and not self._up_after_children:
+        if up and not self._up_after_children:
             reqs += self._send_up()
         for plan, nzc in zip(self.down, self.child_nz):
             self._recv_rim(plan, nzc)
             if self.flux_matching and self._fluxes_ready:
                 self._match_fluxes(plan, nzc)
-        if self.up is not None and self._up_after_children:
+        if up and self._up_after_children:
             reqs += self._send_up()
         if self.down:
             for f in self.tracers:
@@ -684,7 +736,7 @@ class NestedTracers3D(Coupler):
                 reqs += self._send_down(plan)
                 if self.ring_velocities:
                     reqs += self._send_ring_uv(plan, tx)
-        if self.up is not None:
+        if up:
             if self.ring_detail:
                 for f in self.tracers:  # the interior cells next to the ring may lie in the halo
                     f.update_halos()
@@ -711,13 +763,11 @@ class NestedTracers3D(Coupler):
         self.computed = T.mask.all_values[h:-h, h:-h] == 1
         self.halo = h
         world = self.nest.world
-        # all levels share the macro time step (every macro step is a sync)
+        parent = self.lev.parent.name if self.lev.parent is not None else None
         dts = world.allgather((self.lev.name, float(sim.macrotimestep), int(T.hn.all_values.shape[0]),
-                               len(self.tracers), self.ring_slopes))
-        steps = {d[1] for d in dts}
-        if max(steps) - min(steps) > 1e-6 * max(steps):
-            raise ValueError("NestedTracers3D: the levels need the same macro time step (split factor of a child ="
-                             f" its parent's x its time ratio): {sorted(set((d[0], d[1]) for d in dts))}")
+                               len(self.tracers), self.ring_slopes, parent, int(sim.split_factor), self.lev.time_ratio))
+        # checked for all levels on all processes, so that all stop
+        self.ratio_3d = macro_ratios({d[0]: (d[5], d[1], d[6], d[7]) for d in dts}).get(self.lev.name, 1)
         if len({d[3] for d in dts}) != 1:
             raise ValueError(f"NestedTracers3D: the levels exchange different numbers of tracers: {dts}")
         if len({d[4] for d in dts}) != 1:
@@ -778,7 +828,7 @@ class NestedTracers3D(Coupler):
         return np.array([float((f.all_values[:, h:-h, h:-h] * vol)[:, self.computed].sum()) for f in self.tracers])
 
     def timing(self) -> dict:
-        return dict(sync=self.t_sync, wait=self.t_wait, n_sync=self.n_sync, max_ring_change=self.max_ring_change,
+        return dict(ratio_3d=self.ratio_3d, sync=self.t_sync, wait=self.t_wait, n_sync=self.n_sync, max_ring_change=self.max_ring_change,
                     max_correction=self.max_correction, transport=self.t_transport,
                     parts={k.lstrip("_"): v[0] for k, v in self.parts.items()},
                     parts_wait={k.lstrip("_"): v[1] for k, v in self.parts.items()})
