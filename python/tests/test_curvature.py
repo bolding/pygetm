@@ -124,5 +124,59 @@ class TestCurvature(unittest.TestCase):
         np.testing.assert_allclose(dx, np.broadcast_to(chord[:, None], dx.shape), rtol=1e-12)
 
 
+def rotated_pole(rlon, rlat, pole_lon, pole_lat, mirrored=False):
+    """CF rotated pole (right-handed), or mirrored in longitude."""
+    rr, lr, pp = np.radians(rlon), np.radians(rlat), np.radians(pole_lat)
+    lat = np.degrees(np.arcsin(np.sin(pp) * np.sin(lr) + np.cos(pp) * np.cos(lr) * np.cos(rr)))
+    cs = np.sin(pp) * np.cos(lr) * np.cos(rr) - np.cos(pp) * np.sin(lr)
+    lon = pole_lon - 180.0 + np.degrees(np.arctan2(np.cos(lr) * np.sin(rr), -cs if mirrored else cs))
+    return (lon + 180.0) % 360.0 - 180.0, lat
+
+
+class TestRotatedGrids(unittest.TestCase):
+    def setUp(self):
+        nx, ny, d = 60, 50, 0.05
+        self.n = nx, ny
+        self.ri, self.rj = np.meshgrid((np.arange(2 * nx + 1) / 2 - nx / 2) * d, (np.arange(2 * ny + 1) / 2 - ny / 2) * d)
+
+    def test_rotated_pole_angle(self):
+        # centred on 8 E 56 N: the grid's angle against east is that of its x axis, cos(lat) included
+        lon, lat = rotated_pole(self.ri, self.rj, 188.0, 34.0)
+        d = pygetm.domain.Domain(*self.n, lon=lon, lat=lat, H=50.0)
+        rot = np.degrees(d._rotation[1::2, 1::2])
+        dlon = lon[1::2, 2::2] - lon[1::2, :-2:2]
+        dlat = lat[1::2, 2::2] - lat[1::2, :-2:2]
+        expected = np.degrees(np.arctan2(dlat, dlon * np.cos(np.radians(lat[1::2, 1::2]))))
+        np.testing.assert_allclose(rot, expected, atol=1e-5)
+        self.assertGreater(np.abs(rot).max(), 2.0)
+
+    def test_rotated_pole_metrics(self):
+        # distances do not change under a rotation of the sphere: the same metrics and
+        # curvature coefficients as the regular grid in rotated coordinates
+        lon, lat = rotated_pole(self.ri, self.rj, 188.0, 34.0)
+        sims = []
+        for lo, la in ((self.ri, self.rj), (lon, lat)):
+            d = pygetm.domain.Domain(*self.n, lon=lo, lat=la, H=50.0, f=1e-4)
+            sims.append(pygetm.Simulation(d, runtype=pygetm.RunType.BAROTROPIC_2D, airsea=pygetm.airsea.Fluxes(taux=0.0, tauy=0.0),
+                                          momentum=pygetm.momentum.Momentum(curvature=True), log_level="ERROR"))
+        a, b = sims
+        h = a.T.halox
+        for name in ("dx", "dy", "area"):
+            np.testing.assert_allclose(getattr(b.T, name).all_values[h:-h, h:-h], getattr(a.T, name).all_values[h:-h, h:-h], rtol=1e-10)
+        for k, ca in a.momentum._curv.items():
+            np.testing.assert_allclose(b.momentum._curv[k][h:-h, h:-h], ca[h:-h, h:-h], atol=1e-14)
+
+    def test_regular_lonlat_not_rotated(self):
+        d = pygetm.domain.create_spherical(np.linspace(0.0, 3.0, 31), np.linspace(54.0, 56.0, 21), H=10.0)
+        self.assertIsNone(d._rotation)
+
+    def test_left_handed_refused(self):
+        lon, lat = rotated_pole(self.ri, self.rj, 188.0, 34.0, mirrored=True)
+        with self.assertRaisesRegex(Exception, "left-handed"):
+            pygetm.domain.Domain(*self.n, lon=lon, lat=lat, H=50.0)
+        with self.assertRaisesRegex(Exception, "left-handed"):
+            pygetm.domain.create_cartesian(np.arange(5) * 1e3, np.arange(4)[::-1] * 1e3, H=10.0, f=1e-4)
+
+
 if __name__ == "__main__":
     unittest.main()

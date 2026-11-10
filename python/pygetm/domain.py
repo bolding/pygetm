@@ -372,6 +372,42 @@ def apply_only_on_root(method):
     return wrapper
 
 
+def _east_north(lon1, lat1, lon0, lat0):
+    """Local east and north components (radians of arc) of the step from
+    (lon0, lat0) to (lon1, lat1) (radians), longitude differences wrapped."""
+    dlon = np.mod(lon1 - lon0 + np.pi, 2.0 * np.pi) - np.pi
+    return dlon * np.cos(0.5 * (lat0 + lat1)), lat1 - lat0
+
+
+def _rotation_lonlat(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """As :func:`_rotation`, but for longitude and latitude (radians): the angles of
+    the half-cell lines are taken from their local east and north components, that
+    is, with longitude differences scaled by cos(latitude). On a regular
+    longitude/latitude grid the result is exactly 0."""
+    def angle(j1, i1, j0, i0):
+        e, n = _east_north(lon[j1, i1], lat[j1, i1], lon[j0, i0], lat[j0, i0])
+        return np.arctan2(n, e)
+
+    a = slice(None)
+    rot_left = angle(a, slice(1, -1), a, slice(None, -2))
+    rot_right = angle(a, slice(2, None), a, slice(1, -1))
+    rot_bot = angle(slice(1, -1), a, slice(None, -2), a) - 0.5 * np.pi
+    rot_top = angle(slice(2, None), a, slice(1, -1), a) - 0.5 * np.pi
+    x_dum = (
+        np.cos(rot_left[1:-1, :])
+        + np.cos(rot_right[1:-1, :])
+        + np.cos(rot_bot[:, 1:-1])
+        + np.cos(rot_top[:, 1:-1])
+    )
+    y_dum = (
+        np.sin(rot_left[1:-1, :])
+        + np.sin(rot_right[1:-1, :])
+        + np.sin(rot_bot[:, 1:-1])
+        + np.sin(rot_top[:, 1:-1])
+    )
+    return np.arctan2(y_dum, x_dum)
+
+
 def _rotation(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     # For each point, draw lines to the nearest neighbor (1/2 a grid cell) on
     # the left, right, top and bottom.
@@ -505,6 +541,7 @@ class Domain:
         self._external = None
         self._tiling_mask = None
 
+        n_left_handed = 0
         if self.comm.rank != 0:
             self._x = self._y = self._lon = self._lat = None
             self._mask = self._H = self._z0 = None
@@ -574,8 +611,10 @@ class Domain:
                 and (self._lon == self._lon[0, 0]).any()
                 and has_xy
             ):
-                # Proper rotation with respect to true North
-                rotation = _rotation(lon_rad_ex, lat_rad_ex)
+                # Proper rotation with respect to true North, from the local east and
+                # north components of the grid lines (longitude differences scaled
+                # by cos(latitude))
+                rotation = _rotation_lonlat(lon_rad_ex, lat_rad_ex)
             else:
                 # Rotation with respect to y-axis - assumes y-axis always points to
                 # true North (can be valid only for infinitesimally small domain)
@@ -583,6 +622,19 @@ class Domain:
             self._rotation = rotation if rotation[1:-1, 1:-1].any() else None
 
             self._area = self._dx * self._dy
+
+            # The grid must be right-handed: i increasing to the right of j (with x
+            # east and y north, or longitude east and latitude north). A mirrored
+            # grid gives positive metrics but the wrong sense of rotation.
+            if has_xy:
+                ex, ey, nx_, ny_ = dx_x, dy_x, dx_y, dy_y
+            else:
+                ex, ey = _east_north(lon_rad_ex[1:-1, 2:], lat_rad_ex[1:-1, 2:], lon_rad_ex[1:-1, :-2], lat_rad_ex[1:-1, :-2])
+                nx_, ny_ = _east_north(lon_rad_ex[2:, 1:-1], lat_rad_ex[2:, 1:-1], lon_rad_ex[:-2, 1:-1], lat_rad_ex[:-2, 1:-1])
+            with np.errstate(invalid="ignore"):
+                cross = ex * ny_ - ey * nx_
+            n_left_handed = int(np.count_nonzero(cross < 0.0))
+
             if exact_area:
                 if not has_xy:
                     raise Exception("exact_area requires x and y (planar coordinates)")
@@ -593,6 +645,14 @@ class Domain:
                 d2x = x_ex[2:, :-2] - x_ex[:-2, 2:]
                 d2y = y_ex[2:, :-2] - y_ex[:-2, 2:]
                 self._area = 0.5 * np.abs(d1x * d2y - d1y * d2x)
+
+        n_left_handed = self.comm.bcast(n_left_handed)
+        if n_left_handed:
+            raise Exception(
+                f"The grid is left-handed (mirrored) at {n_left_handed} supergrid points:"
+                " i must increase to the right of j (x or longitude east, y or latitude"
+                " north). Reverse the order of one axis."
+            )
 
         self.open_boundaries = open_boundaries.GlobalOpenBoundaryCollection(
             nx, ny, self.logger.getChild("open_boundaries"), **self._tcoords()
