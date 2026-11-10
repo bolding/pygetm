@@ -703,14 +703,11 @@ class NestedTracers3D(Coupler):
         if ring:
             self._set_ring_uv(sim)
         if (self.down and self.replace_transport) or ring:
+            # the simulation then updates the momentum diagnostics (w, velocities,
+            # friction, advection, Coriolis) from the replaced transports
             mom = sim.momentum
             mom.pk.update_halos()
             mom.qk.update_halos()
-            # as Momentum.update_diagnostics: w from the transports, velocities
-            from .. import _pygetm
-            _pygetm.w_momentum_3d(mom.pk, mom.qk, sim.macrotimestep, mom.ww)
-            np.divide(mom.pk.all_values, mom.pk.grid.hn.all_values, out=mom.uk.all_values)
-            np.divide(mom.qk.all_values, mom.qk.grid.hn.all_values, out=mom.vk.all_values)
         self.t_transport += MPI.Wtime() - t0
 
     # --- sync --------------------------------------------------------------------
@@ -813,7 +810,7 @@ class NestedTracers3D(Coupler):
         self.n_sync = 0
 
     def on_stage(self, sim, stage, macro_active):
-        if stage == "momentum_3d" and macro_active and (self.replace_transport or self.ring_velocities):
+        if stage == "momentum_3d_transports" and macro_active and (self.replace_transport or self.ring_velocities):
             self._sync_transports(sim)
         elif stage == "tracers" and macro_active:
             self._sync()

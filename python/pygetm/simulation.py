@@ -74,9 +74,19 @@ def log_exceptions(method):
 
 #: Points within the state update of :class:`Simulation` at which
 #: :meth:`Coupler.on_stage` is called, in order of occurrence. ``transports_2d``
-#: and ``elevation`` occur every microtimestep; ``momentum_3d`` and ``tracers``
-#: only when the microtimestep completes a macrotimestep (3D runs only).
-COUPLING_STAGES = ("transports_2d", "elevation", "momentum_3d", "tracers")
+#: and ``elevation`` occur every microtimestep; ``momentum_3d_transports``,
+#: ``momentum_3d`` and ``tracers`` only when the microtimestep completes a
+#: macrotimestep (3D runs only). ``momentum_3d_transports`` comes after the 3D
+#: transports are updated, before the momentum diagnostics are computed from them
+#: (a coupler may replace transports there); ``momentum_3d`` after the
+#: diagnostics and the turbulence update.
+COUPLING_STAGES = (
+    "transports_2d",
+    "elevation",
+    "momentum_3d_transports",
+    "momentum_3d",
+    "tracers",
+)
 
 
 class Coupler:
@@ -161,6 +171,7 @@ class BaseSimulation:
         "_cached_check_finite_info",
         "_couplers",
         "_split_order",
+        "_restarted",
     )
 
     def __init__(
@@ -191,6 +202,7 @@ class BaseSimulation:
         self.default_time_reference: Optional[cftime.datetime] = None
         self._cached_check_finite_info = None
         self._couplers: list[Coupler] = []
+        self._restarted = False
 
     def add_coupler(self, coupler: Coupler):
         """Register an object that will be notified at fixed points in the time loop,
@@ -292,6 +304,7 @@ class BaseSimulation:
                 )
 
         self._after_restart(initialized_variables)
+        self._restarted = True
 
         return time_coord[itime]
 
@@ -1178,15 +1191,23 @@ class Simulation(BaseSimulation):
         # mirroring for boundary points, but by convention, `start` assumes all
         # mirroring needs to be redone (some tests intentionally corrupt mirrored
         # values to verify this).
+        # After a restart the depths and thicknesses outside and along open
+        # boundaries are kept: they were set by update_depth (initialize_depth, the
+        # restored old thicknesses), as in a continuous run, whereas mirroring from
+        # the neighbouring U/V points would give other values.
         for grid in (self.U, self.V):
             edges = grid._edge_x | grid._edge_y
+            if self._restarted:
+                edges = edges & (grid.mask.all_values == CellType.UNRESOLVED)
             grid.D.all_values[edges] = FILL_VALUE
-            grid.D.mirror()
+            if not self._restarted:
+                grid.D.mirror()
             if grid.hn is not None:
                 grid.hn.all_values[..., edges] = FILL_VALUE
                 grid.ho.all_values[..., edges] = FILL_VALUE
-                grid.ho.mirror()
-                grid.hn.mirror()
+                if not self._restarted:
+                    grid.ho.mirror()
+                    grid.hn.mirror()
 
         self.momentum.start()
         self.tracers.start()
@@ -1355,6 +1376,14 @@ class Simulation(BaseSimulation):
             # add_freshwater_inputs above.
             self.update_depth(_3d=True, timestep=self.macrotimestep)
 
+            if self._couplers:
+                # Couplers (nesting) may have corrected the summed transports of
+                # this macrotimestep where they replaced U/V, in the subdomain that
+                # owns the face only: make the halos agree before the 3D momentum
+                # uses them (as they do after a restart).
+                self.momentum.U_cum.update_halos()
+                self.momentum.V_cum.update_halos()
+
             # Update momentum from time=-1/2 to 1/2 of the macrotimestep, using forcing
             # defined at time=0. For this purpose, surface stresses (tausxo, tausyo)
             # and surface pressure gradients (dpdxo, dpdyo) at the end of the previous
@@ -1371,7 +1400,18 @@ class Simulation(BaseSimulation):
                 self.internal_pressure.idpdx,
                 self.internal_pressure.idpdy,
                 self.vertical_mixing.num,
+                diagnostics=not self._couplers,
             )
+            if self._couplers:
+                # Couplers (nesting) may replace the 3D transports; the diagnostics
+                # (vertical velocity, velocities, shear, bottom friction, advection,
+                # slow terms, Coriolis) are then computed from the replaced
+                # transports, as they are after a restart. Without a change this
+                # is the same as the update at the end of momentum.advance.
+                self._coupling_stage("momentum_3d_transports", macro_active)
+                self.momentum.update_diagnostics(
+                    self.macrotimestep, self.vertical_mixing.num
+                )
 
             # Update turbulent quantities (T grid - interfaces) from time=0 to
             # time=1 (macrotimestep), using surface/buoyancy-related forcing
@@ -1507,9 +1547,13 @@ class Simulation(BaseSimulation):
         # to advection and diffusion, bottom friction and Coriolis terms.
         # Only do 2D Coriolis update at the start of the simulation.
         # At subsequent times, this term will already have been updated
-        # as part of the momentum update in _advance_state
+        # as part of the momentum update in _advance_state - unless couplers
+        # (nesting) may have replaced transports after that update: then it is
+        # computed from the replaced transports, as after a restart.
         self.momentum.update_depth_integrated_diagnostics(
-            self.timestep, skip_coriolis=not starting, update_z0b=update_z0b
+            self.timestep,
+            skip_coriolis=not (starting or self._couplers),
+            update_z0b=update_z0b,
         )
 
         # Update air-sea fluxes of heat and momentum (all on T grid)
