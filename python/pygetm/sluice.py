@@ -30,6 +30,17 @@ freshwater update).
 The two cells may lie on different subdomains: their levels, areas and column means
 are combined with one allreduce per step over the simulation's communicator.
 
+In a nested run (``attach(sim, nest=run)``, :class:`pygetm.nesting.runtime.NestingRun`)
+the two ends may lie on different levels, e.g. a fjord behind a dam in a fine level and
+the sea in its parent. Each end is a river and belongs to the level that computes its
+cell (``NestingRun._assign_rivers``). The two levels compute the flow together at
+every time they share (every ``steps_per_root / gcd`` of a level's own steps; the
+parent's step for a parent and its child), from both levels and column means then,
+with one allreduce over the processes of the two levels; each level applies that flow
+to its own end until the next shared time, so both move the same volume. Create the
+sluice on every level (as the rivers) and attach it on all processes of all levels,
+after the nesting couplers.
+
     sluice = pygetm.sluice.Sluice(domain, "hvide_sande", a=(8.13, 56.00), b=(8.10, 56.00),
                                   area=50.0, mu=0.6, gate=1.0)
     sim = pygetm.Simulation(domain, ...)
@@ -104,7 +115,27 @@ class Sluice(Coupler):
         self.content = {}  # per tracer: content moved a -> b so far (concentration x m3)
         self.opening = 0.0
 
-    def attach(self, sim):
+    def attach(self, sim, nest=None):
+        """Add the sluice to ``sim``. ``nest``: the nesting run; then collective over
+        all processes of all levels (call it on every level, after the nesting couplers);
+        a level that has neither end adds nothing."""
+        self._comm = None  # default: the simulation's (on_start)
+        self._every = 1  # own steps between two flow updates
+        if nest is not None:
+            from math import gcd
+
+            owners = [nest.river_owners[n] for n in self._names]
+            part = nest.level.name in owners and getattr(sim, "T", None) is not None
+            comm = nest.world.Split(0 if part else parallel.MPI.UNDEFINED, nest.world.rank)
+            if not part:
+                return self
+            if len(set(owners)) > 1:
+                spr = [l.steps_per_root for l in nest.levels if l.name in owners]
+                self._comm = comm
+                self._every = nest.level.steps_per_root // gcd(*spr)
+                self.levels = tuple(owners)
+            else:
+                comm.Free()
         sim.add_coupler(self)
         return self
 
@@ -125,13 +156,16 @@ class Sluice(Coupler):
                 out.append(None)
         return out
 
-    def _allreduce(self, sim, v: np.ndarray) -> np.ndarray:
-        sim.tiling.comm.Allreduce(parallel.MPI.IN_PLACE, v, op=parallel.MPI.SUM)
+    def _allreduce(self, sim, v: np.ndarray, op=None) -> np.ndarray:
+        (self._comm or sim.tiling.comm).Allreduce(parallel.MPI.IN_PLACE, v, op=op or parallel.MPI.SUM)
         return v
 
     # --- coupler --------------------------------------------------------------------
 
     def on_start(self, sim):
+        if not hasattr(self, "_every"):  # added with sim.add_coupler
+            self._comm, self._every = None, 1
+        self._k = 0
         self._ends = self._locals(sim)
         v = np.zeros(2)
         for k, e in enumerate(self._ends):
@@ -143,6 +177,11 @@ class Sluice(Coupler):
         if not (self._cell_area > 0).all():
             raise RuntimeError(f"sluice {self.name}: an end is not in a water cell")
         self._tracers = list(sim.tracers) if sim.runtype > 1 else []
+        if self._comm is not None:  # two levels: the same tracers, in the same order
+            names = [t.name for t in self._tracers]
+            all_names = self._comm.allgather(names)
+            if any(n != names for n in all_names):
+                raise RuntimeError(f"sluice {self.name}: the two levels have different tracers {all_names[0]} / {names}")
         for e in self._ends:
             if e is not None:
                 for t in self._tracers:
@@ -150,7 +189,10 @@ class Sluice(Coupler):
         self._update(sim)
 
     def after_state_update(self, sim, macro_active: bool):
-        vol, content = self._pending  # the step just done moved this
+        self._k += 1
+        if self._k % self._every:
+            return  # between two shared times of the two levels: the flow holds
+        vol, content = self._pending  # the steps since the last update moved this
         self.volume += vol
         for k, c in content.items():
             self.content[k] = self.content.get(k, 0.0) + c
@@ -176,6 +218,7 @@ class Sluice(Coupler):
                     v[2 + 2 * m + k] = (c * w).sum() / ws if ws > 0 else c[-1]
         v = self._allreduce(sim, v)
         za, zb = v[0], v[1]
+        self.z_a, self.z_b = float(za), (float(zb) if len(self._names) > 1 else float("nan"))  # levels at both ends
         if len(self._names) == 1:
             zb = -np.inf  # nothing downstream: free outflow above the outlet
         g = self.gate
@@ -189,12 +232,12 @@ class Sluice(Coupler):
             Q = 0.0
         # one step must not reverse the level difference
         # (to the outlet when the downstream level is below it, or nothing is downstream)
-        qmax = self.max_fraction * abs(dz) / (sim.timestep * (1.0 / self._cell_area[0] + 1.0 / self._cell_area[1]))
+        dt = sim.timestep * self._every  # until the next update
+        qmax = self.max_fraction * abs(dz) / (dt * (1.0 / self._cell_area[0] + 1.0 / self._cell_area[1]))
         self.Q = float(np.clip(Q, -qmax, qmax))
         # what this flow moves over the next step; counted once that step is done
         donor = 0 if self.Q > 0 else 1
-        self._pending = (self.Q * sim.timestep,
-                         {t.name: self.Q * sim.timestep * v[2 + 2 * m + donor] for m, t in enumerate(self._tracers)})
+        self._pending = (self.Q * dt, {t.name: self.Q * dt * v[2 + 2 * m + donor] for m, t in enumerate(self._tracers)})
         for k, e in enumerate(self._ends):
             if e is None:
                 continue

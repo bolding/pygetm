@@ -104,6 +104,7 @@ class NestingRun:
         domain = make_domain(lev, self.comm)
         domain.external = lev.external()
         domain.tiling_mask = lev.tiling_mask()
+        masks.check_dams(lev, domain)  # dams (pygetm.dams) off the interfaces
         masks.close_faces(lev, domain)  # interface faces with all child sub-faces closed
         grid_kwargs.setdefault("velocity_grids", 1)
         with self._tiling_hint():
@@ -121,6 +122,7 @@ class NestingRun:
         domain = make_domain(lev, self.comm)
         domain.external = lev.external()
         domain.tiling_mask = lev.tiling_mask()
+        masks.check_dams(lev, domain)  # dams (pygetm.dams) off the interfaces
         masks.close_faces(lev, domain)  # interface faces with all child sub-faces closed
         self._assign_rivers(domain)
         with self._tiling_hint():

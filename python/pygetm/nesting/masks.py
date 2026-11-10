@@ -144,6 +144,36 @@ def close_faces(lev: Level, domain) -> None:
     domain.mask[2 * fj[~x] + 2, 2 * fi[~x] + 1] = 0
 
 
+def check_dams(lev: Level, domain) -> None:
+    """Dams (:mod:`pygetm.dams`: faces closed between two wet cells) must stay off the
+    level's interface: a closed face between a computed and an external cell raises
+    (the parent's and the child's fluxes there would differ). Faces between two
+    external cells (the child's band, the parent's hole) are reopened, and the
+    corners among them: the level that computes those cells has the dam itself.
+    Call before :func:`close_faces` (which closes interface faces by rule 3).
+    The global mask lives on the domain's rank 0 only (an error there aborts all levels)."""
+    if domain.comm.rank != 0 or domain._mask is None:
+        return
+    m = domain.mask
+    ext = np.asarray(lev.external(), dtype=bool)
+    tw = m[1::2, 1::2] != 0
+    for name, um, a, b, ea, eb in (
+        ("U", m[1::2, 2:-1:2], tw[:, :-1], tw[:, 1:], ext[:, :-1], ext[:, 1:]),
+        ("V", m[2:-1:2, 1::2], tw[:-1, :], tw[1:, :], ext[:-1, :], ext[1:, :]),
+    ):
+        dam = (um == 0) & a & b
+        bad = dam & (ea != eb)
+        if bad.any():
+            j, i = np.argwhere(bad)[0]
+            raise ValueError(f"{lev.name}: a dam closes {int(bad.sum())} {name} face(s) on the level's interface"
+                             f" (first between domain cells (j {j}, i {i}) and the next); move it off the interface")
+        um[dam & ea & eb] = 1
+    xm = m[2:-1:2, 2:-1:2]  # inner corners
+    t4 = tw[:-1, :-1] & tw[:-1, 1:] & tw[1:, :-1] & tw[1:, 1:]
+    e4 = ext[:-1, :-1] & ext[:-1, 1:] & ext[1:, :-1] & ext[1:, 1:]
+    xm[(xm == 0) & t4 & e4] = 1
+
+
 def check_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray]):
     """Violations of the two rules per child level (all zero if consistent)."""
     out = {}
