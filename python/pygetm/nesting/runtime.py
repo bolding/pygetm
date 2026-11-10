@@ -122,12 +122,43 @@ class NestingRun:
         domain.external = lev.external()
         domain.tiling_mask = lev.tiling_mask()
         masks.close_faces(lev, domain)  # interface faces with all child sub-faces closed
+        self._assign_rivers(domain)
         with self._tiling_hint():
             sim = make_simulation(lev, domain)
         if sim.T is not None and sim.T.halox != lev.halo:
             raise ValueError(f"simulation halo {sim.T.halox} differs from nesting halo {lev.halo}")
         self._setup(sim.T)
         return sim
+
+    def _assign_rivers(self, domain):
+        """Collective. A river belongs to the finest level whose computed region holds it
+        (land in a level's active region is that level's; a curvilinear child beyond its
+        conforming band lies over its parent's land: the child wins); every level drops
+        the rivers of the others. So a setup may give all its rivers to every level. A
+        river no level holds would be lost: that raises."""
+        lev = self.level
+        rivers = list(domain.rivers.values())
+        held = None
+        if self.comm.rank == 0:
+            computed = ~np.asarray(lev.external(), dtype=bool)  # domain-shaped: hole and band excluded
+            held = {r.name: _river_in(domain, r, computed) for r in rivers}
+        claims = self.world.allgather((lev.name, held))
+        owners: Dict[str, list] = {}
+        for name, h in claims:
+            for river, inside in (h or {}).items():
+                owners.setdefault(river, [])
+                if inside:
+                    owners[river].append(name)
+        order = {l.name: k for k, l in enumerate(self.levels)}  # parents before children
+        owner = {}
+        for river, levs in owners.items():
+            if not levs:
+                raise ValueError(f"river {river}: no level computes its cell (its water would be lost)")
+            owner[river] = max(levs, key=lambda n: (self.levels[order[n]].steps_per_root, order[n]))
+        for r in rivers:
+            if owner[r.name] != lev.name:
+                domain.rivers.remove(r.name)
+        self.river_owners = owner
 
     def _tiling_hint(self):
         """Context: a failing subdomain division names the level and its
@@ -484,3 +515,33 @@ class NestedTracer:
 
 def ops_interp(s0, s1, a):
     return (1.0 - a) * s0 + a * s1
+
+
+def _river_in(domain, river, computed: np.ndarray) -> bool:
+    """Whether a river lies in a computed cell of this level's domain (root process).
+    By index: that cell; by location: the cell whose centre is nearest, if the point
+    lies within it (half a cell, with a margin)."""
+    from ..constants import CoordinateType
+
+    ny, nx = computed.shape
+    if river.coordinate_type == CoordinateType.IJ:
+        i, j = int(round(river.x)), int(round(river.y))
+        return 0 <= i < nx and 0 <= j < ny and bool(computed[j, i])
+    if river.coordinate_type == CoordinateType.LONLAT:
+        xs, ys = domain._lon, domain._lat
+    else:
+        xs, ys = domain._x, domain._y
+    if xs is None or ys is None:
+        return False
+    xc, yc = xs[1::2, 1::2], ys[1::2, 1::2]
+    d2 = (xc - river.x) ** 2 + (yc - river.y) ** 2
+    j, i = np.unravel_index(int(np.nanargmin(d2)), d2.shape)
+    # the cell's extent from its corners
+    xcor, ycor = xs[2 * j : 2 * j + 3 : 2, 2 * i : 2 * i + 3 : 2], ys[2 * j : 2 * j + 3 : 2, 2 * i : 2 * i + 3 : 2]
+    half = 0.5 * max(np.ptp(xcor), np.ptp(ycor)) * 1.01
+    reach = half * np.sqrt(2.0)
+    if np.sqrt(d2[j, i]) > reach:
+        return False  # outside this level's domain
+    # a point on the edge between cells: any computed cell within reach
+    return bool((computed & (d2 <= reach ** 2)).any())
+
