@@ -283,5 +283,29 @@ def check_conforming(levels: Iterable[Level], wet: Dict[str, np.ndarray], tol: f
             if twice:
                 raise ValueError(f"{lev.name}: {twice} wet cells lie over water that {p.name} computes "
                                  "(the parent must be land under the level outside its conforming band)")
-            if not inside.all():
-                raise ValueError(f"{lev.name}: {int((~inside).sum())} wet cells lie outside {p.name}")
+            # wet cells outside the parent's domain are allowed: nothing lies beneath them
+
+
+def check_overhang(lev: Level, wet_domain: np.ndarray, wet: Dict[str, np.ndarray]) -> None:
+    """A level's overhang (``overhang``): raise if any of its wet cells lies over
+    water its parent computes (outside the parent's domain is allowed)."""
+    if not lev.has_overhang:
+        return
+    p = lev.parent
+    x, y = lev.domain_supergrid()
+    xc, yc = x[1::2, 1::2], y[1::2, 1::2]
+    over = np.ones(lev.domain_shape, dtype=bool)
+    oj, oi = lev.view_offset
+    ny, nx = lev.extended_shape
+    over[oj : oj + ny, oi : oi + nx] = lev._overhang_band()
+    sel = over & wet_domain
+    if not sel.any():
+        return
+    pi = np.floor((xc[sel] - p.lon0) / p.dlon).astype(int)
+    pj = np.floor((yc[sel] - p.lat0) / p.dlat).astype(int)
+    inside = (pi >= 0) & (pi < p.nx) & (pj >= 0) & (pj < p.ny)
+    pw = wet[p.name][pj[inside] + p.band, pi[inside] + p.band]
+    hole = p.hole[pj[inside], pi[inside]]
+    twice = int((pw & ~hole).sum())
+    if twice:
+        raise ValueError(f"{lev.name}: {twice} wet cells of its overhang lie over water that {p.name} computes")

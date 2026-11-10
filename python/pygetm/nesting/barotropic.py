@@ -820,14 +820,16 @@ class NestedBarotropic(Coupler):
         lev, T, mom = self.lev, sim.T, sim.momentum
         # the level's wet cells including its band, on every process
         gmask = T.mask.gather()
-        wet = self.nest.comm.bcast(None if gmask is None else np.asarray(gmask) != 0)
-        if wet.shape != lev.extended_shape:
-            raise ValueError(f"{lev.name}: gathered mask has shape {wet.shape}, expected {lev.extended_shape}")
+        wet_dom = self.nest.comm.bcast(None if gmask is None else np.asarray(gmask) != 0)
+        if wet_dom.shape != lev.domain_shape:
+            raise ValueError(f"{lev.name}: gathered mask has shape {wet_dom.shape}, expected {lev.domain_shape}")
+        wet = lev.to_view(wet_dom)
         dist = water_distance(lev._ring_mask() & wet, wet)
-        w_glob = sponge_weight(dist, self.sponge_width * lev.ratio)
+        w_glob = lev.to_domain(sponge_weight(dist, self.sponge_width * lev.ratio), 0.0)
         gj, gi = self.nest.global_indices()
-        jj = np.clip(gj + lev.band, 0, wet.shape[0] - 1)
-        ii = np.clip(gi + lev.band, 0, wet.shape[1] - 1)
+        oj, oi = lev.view_offset
+        jj = np.clip(gj + lev.band + oj, 0, w_glob.shape[0] - 1)
+        ii = np.clip(gi + lev.band + oi, 0, w_glob.shape[1] - 1)
         w = w_glob[np.ix_(jj, ii)] * self.wetmask
         dx2 = np.minimum(T.dx.all_values, T.dy.all_values) ** 2
         mom.An.all_values[...] += np.where(w > 0.0, self.sponge_alpha * dx2 / sim.timestep * w, 0.0)

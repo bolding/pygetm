@@ -145,6 +145,20 @@ class Level:
         if self.grid is not None and parent is None:
             raise ValueError(f"{name}: a curvilinear grid is supported for child levels only")
         self._supergrid = None
+        #: cells of a curvilinear child beyond its window on each side ("W", "E",
+        #: "S", "N"; YAML ``overhang: [w, e, s, n]``): computed by the child alone,
+        #: with no parent cells beneath (e.g. an estuary running out of the root).
+        #: The nesting works on the window part (``nx``, ``ny``, ``extended_shape``:
+        #: the view); the level's pyGETM domain is :attr:`domain_shape`.
+        ov = [int(v) for v in cfg.get("overhang", [0, 0, 0, 0])]
+        if len(ov) != 4 or min(ov) < 0:
+            raise ValueError(f"{name}: overhang must be [w, e, s, n] >= 0")
+        self.overhang = dict(zip(SIDES, ov))
+        if any(ov) and self.grid is None:
+            raise ValueError(f"{name}: an overhang needs a curvilinear grid (grid)")
+        if any(ov):
+            # a side that continues as overhang is not the level's own open boundary
+            self.outer_sides = "".join(s for s in self.outer_sides if not self.overhang[s])
 
     def is_outer(self, side: str) -> bool:
         """Whether this level's side ("W", "E", "S", "N") lies on the root's
@@ -174,8 +188,57 @@ class Level:
 
     @property
     def extended_shape(self):
-        """Shape of the level including its band."""
+        """Shape of the level including its band (for a level with an overhang: the
+        view the nesting works on, the window part and its band)."""
         return (self.ny + 2 * self.band, self.nx + 2 * self.band)
+
+    @property
+    def has_overhang(self) -> bool:
+        return any(self.overhang.values())
+
+    @property
+    def domain_shape(self):
+        """Shape of the level's pyGETM domain: the view plus the overhang."""
+        o = self.overhang
+        return (self.ny + 2 * self.band + o["S"] + o["N"], self.nx + 2 * self.band + o["W"] + o["E"])
+
+    @property
+    def view_offset(self):
+        """(j, i) of the view's first cell in the domain's arrays."""
+        return self.overhang["S"], self.overhang["W"]
+
+    def to_domain(self, a: np.ndarray, fill) -> np.ndarray:
+        """A view-shaped array (extended shape) placed into the domain's shape."""
+        if not self.has_overhang:
+            return a
+        out = np.full(self.domain_shape, fill, dtype=np.asarray(a).dtype)
+        oj, oi = self.view_offset
+        out[oj : oj + a.shape[0], oi : oi + a.shape[1]] = a
+        return out
+
+    def to_view(self, a: np.ndarray) -> np.ndarray:
+        """The view (extended shape) of a domain-shaped array."""
+        if not self.has_overhang:
+            return a
+        oj, oi = self.view_offset
+        ny, nx = self.extended_shape
+        return a[oj : oj + ny, oi : oi + nx]
+
+    def _overhang_band(self) -> np.ndarray:
+        """Band cells of the view on the sides that continue as overhang: cells the
+        level computes itself (not ring, not dry)."""
+        h = self.band
+        out = np.zeros(self.extended_shape, dtype=bool)
+        o = self.overhang
+        if o["W"]:
+            out[:, :h] = True
+        if o["E"]:
+            out[:, h + self.nx :] = True
+        if o["S"]:
+            out[:h, :] = True
+        if o["N"]:
+            out[h + self.ny :, :] = True
+        return out
 
     def regular_supergrid(self):
         """The regular grid of the level (from lon0/dlon: for a child the parent's
@@ -186,19 +249,33 @@ class Level:
         y = self.lat0 + (np.arange(2 * (self.ny + 2 * h) + 1) / 2.0 - h) * self.dlat
         return np.meshgrid(x, y)
 
-    def supergrid(self):
-        """The level's coordinates on the supergrid including the band, (x, y):
-        the curvilinear grid if the level has one (``grid``), else the regular grid."""
+    def domain_supergrid(self):
+        """The coordinates of the level's whole pyGETM domain on the supergrid (with an
+        overhang: larger than :meth:`supergrid`)."""
         if self.grid is None:
             return self.regular_supergrid()
         if self._supergrid is None:
             with np.load(self.grid) as f:
                 x, y = np.asarray(f["x"], dtype=float), np.asarray(f["y"], dtype=float)
-            shape = (2 * (self.ny + 2 * self.band) + 1, 2 * (self.nx + 2 * self.band) + 1)
+            ny, nx = self.domain_shape
+            shape = (2 * ny + 1, 2 * nx + 1)
             if x.shape != shape or y.shape != shape:
-                raise ValueError(f"{self.name}: grid {self.grid} has shape {x.shape}, {y.shape}; expected {shape} (supergrid with the band)")
+                raise ValueError(f"{self.name}: grid {self.grid} has shape {x.shape}, {y.shape}; expected {shape}"
+                                 " (supergrid of the domain: the window part, the overhang and the band)")
             self._supergrid = x, y
         return self._supergrid
+
+    def supergrid(self):
+        """The level's coordinates on the supergrid including the band, (x, y): the
+        curvilinear grid if the level has one (``grid``; with an overhang its view),
+        else the regular grid."""
+        if self.grid is None:
+            return self.regular_supergrid()
+        x, y = self.domain_supergrid()
+        oj, oi = self.view_offset
+        ny, nx = self.extended_shape
+        sl = (slice(2 * oj, 2 * (oj + ny) + 1), slice(2 * oi, 2 * (oi + nx) + 1))
+        return x[sl], y[sl]
 
     def centres(self):
         """Coordinates (x, y) of the level's cell centres (ny, nx), without the band."""
@@ -257,6 +334,8 @@ class Level:
                 for b in range(r):
                     needed[(prim[:, 0] - j0) * r + a, (prim[:, 1] - i0) * r + b] = True
         self.rims: Dict[str, np.ndarray] = {}
+        if self.has_overhang and self.children:
+            raise ValueError(f"{self.name}: a level with an overhang cannot have children")
         for c in self.children:
             self.rims[c.name] = np.argwhere(self.hole_of(c) & needed)  # (n, 2) global (j, i), row-major
 
@@ -312,11 +391,13 @@ class Level:
 
     def external(self) -> np.ndarray:
         """Cells (including the band) set from outside or not used: all but
-        the cells this level computes. For :attr:`pygetm.domain.Domain.external`."""
+        the cells this level computes. For :attr:`pygetm.domain.Domain.external`
+        (domain-shaped: with an overhang, its cells are computed)."""
         h = self.band
         ext = np.ones(self.extended_shape, dtype=bool)
         ext[h : h + self.ny, h : h + self.nx] = ~self.computed
-        return ext
+        ext &= ~self._overhang_band()
+        return self.to_domain(ext, False)
 
     def tiling_mask(self) -> np.ndarray:
         """Cells (including the band) that need a subdomain: all but the hole
@@ -332,7 +413,7 @@ class Level:
             unread[hj[~wf["inside"]], hi[~wf["inside"]]] = False
         tm = np.ones(self.extended_shape, dtype=bool)
         tm[h : h + self.ny, h : h + self.nx] = ~unread
-        return tm
+        return self.to_domain(tm, True)
 
     def outer_mask(self) -> np.ndarray:
         """Cells of the extended shape beyond the outer sides (outside the
@@ -353,7 +434,7 @@ class Level:
         h = self.band
         act = np.zeros(self.extended_shape, dtype=bool)
         act[h : h + self.ny, h : h + self.nx] = self.cactive
-        return dilate(act, h) & ~act & ~self.outer_mask()
+        return dilate(act, h) & ~act & ~self.outer_mask() & ~self._overhang_band()
 
     def ring_cells(self):
         """Global (j, i) of all ring cells, row-major (for a full window: the
@@ -368,7 +449,7 @@ class Level:
         h = self.band
         act = np.zeros(self.extended_shape, dtype=bool)
         act[h : h + self.ny, h : h + self.nx] = self.cactive
-        return ~act & ~self._ring_mask()
+        return ~act & ~self._ring_mask() & ~self._overhang_band()
 
     def ring_source(self, j, i):
         """Parent cell (global) covering child cells (j, i) (also in the band),
@@ -412,7 +493,7 @@ def dilate(mask: np.ndarray, width: int) -> np.ndarray:
     ny, nx = mask.shape
     for dj in range(-width, width + 1):
         for di in range(-width, width + 1):
-            if dj or di:
+            if (dj or di) and abs(dj) < ny and abs(di) < nx:  # a shift beyond the array reaches nothing
                 src = mask[max(0, -dj) : ny - max(0, dj), max(0, -di) : nx - max(0, di)]
                 out[max(0, dj) : ny - max(0, -dj), max(0, di) : nx - max(0, -di)] |= src
     return out

@@ -86,6 +86,14 @@ class NestedModel:
         child-led consistency (NaN = land); :attr:`changes` and
         :attr:`violations` per level."""
         H = np.asarray(np.ma.filled(np.ma.asarray(H, dtype=float), np.nan))
+        me = self.level
+        H_dom = None
+        if me.has_overhang:  # the whole domain was given: the nesting works on the view
+            if H.shape != me.domain_shape:
+                raise ValueError(f"{self.name}: depth has shape {H.shape}, expected the domain's {me.domain_shape}")
+            H_dom, H = H, me.to_view(H).copy()
+            if active_wet is not None:
+                active_wet = me.to_view(np.asarray(active_wet))
         wet = np.isfinite(H)
         aw = wet if active_wet is None else np.asarray(active_wet, dtype=bool)
         mine = (self.name, H, wet, aw) if self.comm.rank == 0 else None
@@ -110,7 +118,18 @@ class NestedModel:
                           f"{mine_iface['min_depth_ring']:.2f} m, parent {mine_iface['min_depth_parent']:.2f} m): "
                           f"the interface may fall dry", stacklevel=2)
         self.wet = wets
-        return np.where(wets[self.name], Hs[self.name], np.nan)
+        mine_H = np.where(wets[self.name], Hs[self.name], np.nan)
+        if H_dom is not None:
+            out = H_dom.copy()
+            oj, oi = me.view_offset
+            ny, nx = me.extended_shape
+            # the view's ring and window from the consistency; its overhang-side band and
+            # the overhang as given
+            keep = me._overhang_band()
+            out[oj : oj + ny, oi : oi + nx] = np.where(keep, out[oj : oj + ny, oi : oi + nx], mine_H)
+            masks.check_overhang(me, np.isfinite(out), wets)
+            return out
+        return mine_H
 
     def timestep(self, maxdt: float) -> float:
         """Collective. ``maxdt``: this level's largest stable time step

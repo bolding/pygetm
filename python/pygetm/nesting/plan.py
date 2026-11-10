@@ -34,12 +34,14 @@ from .geometry import Level
 class LevelTiling:
     """A level's pyGETM tiling in the level's global cell indices."""
 
-    def __init__(self, info: dict, band: int, world_offset: int):
+    def __init__(self, info: dict, band: int, world_offset: int, view_offset=(0, 0)):
         self.map = np.asarray(info["map"])
         self.nx_sub, self.ny_sub = info["nx_sub"], info["ny_sub"]
         self.xoff, self.yoff = info["xoffset_global"], info["yoffset_global"]
         self.halo = info["halo"]
         self.band = band
+        #: pyGETM index = global index + these (the band, and a level's overhang to the south/west)
+        self.offj, self.offi = band + int(view_offset[0]), band + int(view_offset[1])
         self.offset = world_offset
         self.ntiles = int((self.map >= 0).sum())
 
@@ -58,8 +60,8 @@ class LevelTiling:
 
     def owner(self, j, i) -> np.ndarray:
         """Rank (within the level) owning global cells (j, i); -1 if none."""
-        row = np.floor_divide(np.asarray(j) + self.band - self.yoff, self.ny_sub)
-        col = np.floor_divide(np.asarray(i) + self.band - self.xoff, self.nx_sub)
+        row = np.floor_divide(np.asarray(j) + self.offj - self.yoff, self.ny_sub)
+        col = np.floor_divide(np.asarray(i) + self.offi - self.xoff, self.nx_sub)
         ok = (row >= 0) & (row < self.map.shape[0]) & (col >= 0) & (col < self.map.shape[1])
         out = np.full(np.shape(row), -1)
         out[ok] = self.map[row[ok], col[ok]]
@@ -68,7 +70,7 @@ class LevelTiling:
     def origin(self, t: int) -> Tuple[int, int]:
         """Global (j, i) of the first interior cell of tile t."""
         row, col = (int(x[0]) for x in np.nonzero(self.map == t))
-        return row * self.ny_sub + self.yoff - self.band, col * self.nx_sub + self.xoff - self.band
+        return row * self.ny_sub + self.yoff - self.offj, col * self.nx_sub + self.xoff - self.offi
 
     def local(self, t: int, j, i):
         """Index into ``Array.all_values`` of tile t for global cells (j, i)."""
@@ -83,7 +85,7 @@ def gather_tilings(levels: List[Level], world, level: Level, grid, offsets: Dict
     for name, inf in world.allgather((level.name, info)):
         if inf is not None:
             lev = next(l for l in levels if l.name == name)
-            tilings[name] = LevelTiling(inf, lev.band, offsets[name])
+            tilings[name] = LevelTiling(inf, lev.band, offsets[name], lev.view_offset)
     return tilings
 
 
