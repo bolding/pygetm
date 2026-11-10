@@ -67,8 +67,18 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
   elevation used) and sets pk, qk there, then recomputes ww, uk, vk. Held
   over the parent's 3D step.
 
-Not yet: time interpolation of the ring. Limited slopes in the ring are an option
-(``ring_slopes``).
+* **ring in time (``ring_time``):** "hold" (default) keeps the ring at the parent's
+  state of the last sync over the child's R macro steps; "extrapolate" (for R > 1)
+  continues it linearly from the parent's last two syncs, c = c_n + a (c_n - c_{n-1})
+  with a = m / R at the child's m-th macro step after the sync (m = 0: the sync's
+  values, so R = 1 is unchanged), limited layer by layer to the range of the parent's
+  cell and its four neighbours at the last sync, remapped onto the ring cell's layers
+  (over one parent macro step the water moves less than a parent cell, so the true
+  value lies in that range: no new extrema). The previous ring is part of the restart
+  state. The vertical structure of the ring velocities is held (their column totals
+  follow the 2D ring, which is extrapolated).
+
+Limited slopes in the ring are an option (``ring_slopes``).
 """
 
 from typing import List, Optional, Sequence
@@ -76,7 +86,7 @@ from typing import List, Optional, Sequence
 import numpy as np
 from mpi4py import MPI
 
-from ..constants import CENTERS
+from ..constants import CENTERS, CellType
 from ..simulation import Coupler
 from .runtime import NestingRun
 from . import vremap
@@ -175,7 +185,7 @@ class NestedTracers3D(Coupler):
                  break_ring: bool = False, break_rim: bool = False, flux_matching: bool = True,
                  flux_form: str = "consistent", replace_transport: bool = True, ring_velocities: bool = True,
                  ring_detail: bool = True, vertical_map: str = "z", remap_scheme: str = "ppm",
-                 ring_slopes: bool = False):
+                 ring_slopes: bool = False, ring_time: str = "hold"):
         self.nest, self.sim = nest, sim
         self.lev = nest.level
         self.t = nest.tile
@@ -245,6 +255,14 @@ class NestedTracers3D(Coupler):
         #: where the child's interior is smooth (IDEAL V2: the strait's largest
         #: spurious current at a block edge next to a wall). The same on all levels.
         self.ring_slopes = bool(ring_slopes)
+        #: the ring between two syncs of a child with 3D sub-stepping: "hold" or
+        #: "extrapolate" (see the module's description). The same on all levels
+        #: (with "extrapolate" the parent sends the neighbour columns for the limiter).
+        if ring_time not in ("hold", "extrapolate"):
+            raise ValueError(f"ring_time {ring_time!r}")
+        self.ring_time = ring_time
+        self._extrap = ring_time == "extrapolate"
+        self._rc = None  # ring on the child's layers at the last sync: (new, previous, lo, hi), NaN where unset
         self._ring_uv = None
         #: this level's macro steps per macro step of its parent (from the split
         #: factors, set in :meth:`on_start`); the exchange with the parent happens
@@ -264,6 +282,7 @@ class NestedTracers3D(Coupler):
         self.t_wait = 0.0
         self.n_sync = 0
         self.max_ring_change = 0.0
+        self._restart_ring_arrays()  # needs the tracers
 
     # --- helpers -----------------------------------------------------------
 
@@ -370,7 +389,7 @@ class NestedTracers3D(Coupler):
         nzp = self.parent_nz
         nt = len(self.tracers)
         parts = []
-        nnb = 5 if self.ring_slopes else 1
+        nnb = 5 if (self.ring_slopes or self._extrap) else 1
         for p, v in self._ring:
             buf = np.empty((nnb, 1 + nt, v[2].size, nzp))  # columns surface first
             self._recv(self.up.comm, buf, self.up.poff + p, self.up.tag_p + TAG_3D)
@@ -387,7 +406,8 @@ class NestedTracers3D(Coupler):
             return
         hs, cs, hd = hs[ok], cs[:, ok], hd[ok]
         c = remap_column(cs, hs, hd, self.keep, self.zmap, self.scheme)
-        if self.ring_slopes:
+        lo = hi = None
+        if self.ring_slopes or self._extrap:
             # the neighbours on the ring cell's layers; minmod slopes per layer, zero towards land
             nbs = []
             for k in range(1, 5):
@@ -399,9 +419,13 @@ class NestedTracers3D(Coupler):
                     ck_d[:, wk] = remap_column(ck[:, wk], hk[wk], hd[wk], self.keep, self.zmap, self.scheme)
                 nbs.append(np.where(wk[None, :, None], ck_d, c))
             cw, ce, cs_, cn = nbs
-            sx = minmod(c - cw, ce - c)
-            sy = minmod(c - cs_, cn - c)
-            c = c + sx * self._ring_ox[ok][None, :, None] + sy * self._ring_oy[ok][None, :, None]
+            if self._extrap:  # the limiter's range (land neighbours count as the cell itself)
+                lo = np.minimum.reduce([c] + nbs)
+                hi = np.maximum.reduce([c] + nbs)
+            if self.ring_slopes:
+                sx = minmod(c - cw, ce - c)
+                sy = minmod(c - cs_, cn - c)
+                c = c + sx * self._ring_ox[ok][None, :, None] + sy * self._ring_oy[ok][None, :, None]
         if self.ring_detail:
             ij, ii_ = self._rin_j[ok], self._rin_i[ok]
             m = self._rin_ok[ok].copy()
@@ -424,6 +448,74 @@ class NestedTracers3D(Coupler):
             old = vremap.gather_columns(f.all_values, jo, io)
             self.max_ring_change = max(self.max_ring_change, float(np.abs(cf - old).max(initial=0.0)))
             vremap.scatter_columns(f.all_values, jo, io, cf)
+        if self._extrap:
+            self._store_ring(ok, c, np.minimum(lo, c), np.maximum(hi, c))
+
+    # --- the ring in time (ring_time "extrapolate") ---------------------------------
+
+    def _store_ring(self, ok, c, lo, hi):
+        """Keep the ring of this sync (all ring cells, NaN where not set) and move
+        the previous one back; the previous one is also written to the restart arrays."""
+        shape = (len(self.tracers), self._rj.size, self.nz)
+        new = np.full(shape, np.nan)
+        new[:, ok] = c
+        lo_, hi_ = np.full(shape, np.nan), np.full(shape, np.nan)
+        lo_[:, ok], hi_[:, ok] = lo, hi
+        prev = self._rc[0] if self._rc is not None else np.full(shape, np.nan)
+        self._rc = (new, prev, lo_, hi_)
+        self._prev_to_restart()
+
+    def _restart_ring_arrays(self):
+        """Arrays (part of the model state) with the previous ring, per tracer, at the
+        ring cells, and where it is set."""
+        self._rs3 = None
+        if self.up is None or not self._extrap:
+            return
+        T = self.sim.T
+        attrs = dict(_part_of_state=True, _valid_at=tuple(CellType))  # nothing masked: exact values back
+        n = len(self._tracers(self.sim))
+        self._rs3 = [T.array(name=f"nest_ring3d_old_{k}", z=CENTERS, fill=0.0,
+                             long_name=f"nesting: 3D ring of tracer {k} at the previous sync", attrs=dict(attrs))
+                     for k in range(n)]
+        self._rs3_set = T.array(name="nest_ring3d_old_set", fill=0.0,
+                                long_name="nesting: previous 3D ring stored (1) or not (0)", attrs=dict(attrs))
+
+    def _prev_to_restart(self):
+        if self._rs3 is None or not self._rj.size:
+            return
+        prev = self._rc[1]
+        set_ = np.isfinite(prev).all(axis=(0, 2))
+        for a, pv in zip(self._rs3, prev):
+            vremap.scatter_columns(a.all_values, self._rj, self._ri, np.where(set_[:, None], pv, 0.0))
+        self._rs3_set.all_values[self._rj, self._ri] = set_.astype(float)
+
+    def _prev_from_restart(self):
+        """The previous ring from the restart arrays (as they were before the initial sync)."""
+        if self._rs3 is None or not self._rj.size:
+            return None
+        set_ = self._rs3_set.all_values[self._rj, self._ri] > 0.5
+        if not set_.any():
+            return None
+        prev = np.stack([vremap.gather_columns(a.all_values, self._rj, self._ri) for a in self._rs3])
+        prev[:, ~set_] = np.nan
+        return prev
+
+    def _extrapolate_ring(self, sim):
+        """At the child's m-th macro step after a sync: the ring continued in time."""
+        R = self.ratio_3d
+        m = (sim.istep // sim.split_factor - 1) % R  # macro steps since the last sync, before this one
+        if m == 0 or self._rc is None:
+            return
+        new, prev, lo, hi = self._rc
+        a = m / R
+        ok = np.isfinite(new).all(axis=(0, 2)) & np.isfinite(prev).all(axis=(0, 2)) & self.wet[self._rj, self._ri]
+        if not ok.any():
+            return
+        c = np.clip(new[:, ok] + a * (new[:, ok] - prev[:, ok]), lo[:, ok], hi[:, ok])
+        jo, io = self._rj[ok], self._ri[ok]
+        for f, cf in zip(self.tracers, c):
+            vremap.scatter_columns(f.all_values, jo, io, cf)
+        self.n_extrapolated += 1
 
     # --- parent side -------------------------------------------------------------
 
@@ -435,7 +527,7 @@ class NestedTracers3D(Coupler):
                 continue
             jj, ii = self.loc(pj, pi)
             # the source column, and with ring_slopes its W, E, S, N neighbours (land: thickness 0)
-            nb = ((0, 0), (0, -1), (0, 1), (-1, 0), (1, 0)) if self.ring_slopes else ((0, 0),)
+            nb = ((0, 0), (0, -1), (0, 1), (-1, 0), (1, 0)) if (self.ring_slopes or self._extrap) else ((0, 0),)
             buf = np.empty((len(nb), 1 + len(self.tracers), jj.size, h.shape[0]))  # columns surface first
             ny, nx = self.wet.shape
             for k, (dj, di) in enumerate(nb):
@@ -762,13 +854,13 @@ class NestedTracers3D(Coupler):
         world = self.nest.world
         parent = self.lev.parent.name if self.lev.parent is not None else None
         dts = world.allgather((self.lev.name, float(sim.macrotimestep), int(T.hn.all_values.shape[0]),
-                               len(self.tracers), self.ring_slopes, parent, int(sim.split_factor), self.lev.time_ratio))
+                               len(self.tracers), (self.ring_slopes, self.ring_time), parent, int(sim.split_factor), self.lev.time_ratio))
         # checked for all levels on all processes, so that all stop
         self.ratio_3d = macro_ratios({d[0]: (d[5], d[1], d[6], d[7]) for d in dts}).get(self.lev.name, 1)
         if len({d[3] for d in dts}) != 1:
             raise ValueError(f"NestedTracers3D: the levels exchange different numbers of tracers: {dts}")
         if len({d[4] for d in dts}) != 1:
-            raise ValueError(f"NestedTracers3D: ring_slopes must be the same on all levels: {dts}")
+            raise ValueError(f"NestedTracers3D: ring_slopes and ring_time must be the same on all levels: {dts}")
         nz = {d[0]: d[2] for d in dts}
         self.nz = nz[self.lev.name]
         self.parent_nz = nz[self.lev.parent.name] if self.lev.parent is not None else None
@@ -802,7 +894,12 @@ class NestedTracers3D(Coupler):
             self.reg = np.zeros((len(self.tracers) + 1, nedge, self.nz))  # tracers, then the water
         self._ring_tx_down = [self._ring_transfers(plan, plan.tag_p + TAG_3D + 500) for plan in self.down]
         self._ring_tx = self._ring_transfers(self.up, self.up.tag_p + TAG_3D + 500) if self.up is not None else None
+        prev = self._prev_from_restart()  # before the initial sync overwrites the arrays
+        self.n_extrapolated = 0
         self._sync()  # initial: no fluxes yet
+        if prev is not None and self._rc is not None:  # after a restart: the ring before the last sync
+            self._rc = (self._rc[0], prev, self._rc[2], self._rc[3])
+            self._prev_to_restart()
         self._fluxes_ready = True
         self.max_ring_change = 0.0
         self.t_sync = self.t_wait = 0.0
@@ -812,6 +909,8 @@ class NestedTracers3D(Coupler):
     def on_stage(self, sim, stage, macro_active):
         if stage == "momentum_3d_transports" and macro_active and (self.replace_transport or self.ring_velocities):
             self._sync_transports(sim)
+        elif stage == "momentum_3d" and macro_active and self._extrap and self.up is not None and self.ratio_3d > 1:
+            self._extrapolate_ring(sim)
         elif stage == "tracers" and macro_active:
             self._sync()
 
@@ -825,7 +924,7 @@ class NestedTracers3D(Coupler):
         return np.array([float((f.all_values[:, h:-h, h:-h] * vol)[:, self.computed].sum()) for f in self.tracers])
 
     def timing(self) -> dict:
-        return dict(ratio_3d=self.ratio_3d, sync=self.t_sync, wait=self.t_wait, n_sync=self.n_sync, max_ring_change=self.max_ring_change,
+        return dict(ratio_3d=self.ratio_3d, ring_time=self.ring_time, n_extrapolated=getattr(self, "n_extrapolated", 0), sync=self.t_sync, wait=self.t_wait, n_sync=self.n_sync, max_ring_change=self.max_ring_change,
                     max_correction=self.max_correction, transport=self.t_transport,
                     parts={k.lstrip("_"): v[0] for k, v in self.parts.items()},
                     parts_wait={k.lstrip("_"): v[1] for k, v in self.parts.items()})
