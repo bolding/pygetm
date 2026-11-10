@@ -692,10 +692,13 @@ class ArrayOpenBoundaries:
         weights = np.where(where, weights, 0.0)
         self.relaxation.append(Relaxation(slicer, weights, target, local, where))
 
-    def update(self):
-        """Update the tracer at the open boundaries"""
+    def update(self, relax: bool = True):
+        """Update the tracer at the open boundaries; ``relax``: also relax the
+        sponge zones towards them (this changes the tracer: once per macro step)"""
         for updater in self.updaters:
             updater()
+        if not relax:
+            return
         deltas = [r.weights * (r.target - r.local) for r in self.relaxation]
         for relax, delta in zip(self.relaxation, deltas):
             np.add(relax.local, delta, out=relax.local, where=relax.where)

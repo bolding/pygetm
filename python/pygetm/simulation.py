@@ -1481,7 +1481,9 @@ class Simulation(BaseSimulation):
             # from the tracers are calculated.
             if self.open_boundaries.np:
                 for tracer in self.tracers:
-                    tracer.open_boundaries.update()
+                    # After a restart, the sponge relaxation of the last macro step is
+                    # already in the restarted state: set the boundary values only
+                    tracer.open_boundaries.update(relax=not (starting and self._restarted))
 
             # Interpolate surface velocities to T grid.
             # These are used by airsea as offset for wind speeds

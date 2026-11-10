@@ -61,6 +61,13 @@ def make_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict
         hp = p.band
         sl = (slice(j0 + hp, j1 + hp), slice(i0 + hp, i1 + hp))
         act = lev.active
+        if lev.grid is not None:
+            # curvilinear: beyond its conforming band the child's cells lie elsewhere;
+            # there the parent keeps its own land (it must be land: check_conforming)
+            act = act & conforming_parent_cells(lev, wet[lev.name])
+            if (wet[p.name][sl] & lev.active & ~act).any():
+                raise ValueError(f"{lev.name}: {p.name} has water in the window beyond the conforming band "
+                                 f"({int((wet[p.name][sl] & lev.active & ~act).sum())} cells): it must be land there")
         before = wet[p.name][sl].copy()
         changes[p.name]["hole_wetted"] += int((act & anywet & ~before).sum())
         changes[p.name]["hole_dried"] += int((act & ~anywet & before).sum())
@@ -205,3 +212,76 @@ def interface_depths(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dic
             "interface_shallow": int((cd < lim).sum() + (pd < lim).sum()) if lim > 0.0 else 0,
         }
     return out
+
+
+def conforming_band(lev: Level, wet_level: np.ndarray) -> np.ndarray:
+    """The level's cells (extended shape) the exchanges use where water crosses its
+    interface: within ``2 r + band`` cells of a wet ring cell (the parent's rim of 2
+    parent cells, the ring and halo)."""
+    from .geometry import dilate
+
+    ring_wet = lev._ring_mask() & wet_level
+    return dilate(ring_wet, 2 * lev.ratio + lev.band)
+
+
+def conforming_parent_cells(lev: Level, wet_level: np.ndarray) -> np.ndarray:
+    """Parent cells of the window (window shape) that hold cells of the conforming band."""
+    h, r = lev.band, lev.ratio
+    i0, i1, j0, j1 = lev.window
+    band = conforming_band(lev, wet_level)[h:-h, h:-h]
+    return band.reshape(j1 - j0, r, i1 - i0, r).any(axis=(1, 3))
+
+
+def check_conforming(levels: Iterable[Level], wet: Dict[str, np.ndarray], tol: float = 1e-6) -> None:
+    """Curvilinear levels (``grid``): raise unless
+
+    1. the grid coincides with the parent's grid refined by the ratio (to ``tol``
+       of a cell) over the band the exchanges use where water crosses the
+       interface: the parent's rim (2 parent cells, ``2 r`` child cells) and the
+       ring and halo (``band`` cells) around every wet ring cell;
+    2. no water is counted twice: wherever a wet cell of the level lies
+       physically outside that band, the parent is land or the level's own hole.
+
+    Then every index relation the nesting uses is also a geometric one, and the
+    exchanges are those between regular grids (docs: methods.html#curvi)."""
+    from .geometry import dilate
+
+    for lev in levels:
+        if lev.grid is None:
+            continue
+        p, r, h = lev.parent, lev.ratio, lev.band
+        if p.grid is not None:
+            raise ValueError(f"{lev.name}: a curvilinear level in a curvilinear parent is not supported")
+        w = wet[lev.name]
+        if not (lev._ring_mask() & w).any():
+            raise ValueError(f"{lev.name}: no water crosses the interface")
+        band = conforming_band(lev, w)
+        # the supergrid points of those cells (corners, faces and centre)
+        sb = np.zeros((2 * band.shape[0] + 1, 2 * band.shape[1] + 1), dtype=bool)
+        for a in range(3):
+            for b in range(3):
+                sb[a : a + 2 * band.shape[0] : 2, b : b + 2 * band.shape[1] : 2] |= band
+        x, y = lev.supergrid()
+        xr, yr = lev.regular_supergrid()
+        dev = np.maximum(np.abs(x - xr), np.abs(y - yr))[sb]
+        cell = min(abs(lev.dlon), abs(lev.dlat))
+        if np.nanmax(dev) > tol * cell:
+            raise ValueError(f"{lev.name}: the grid differs from the refined parent grid by up to {np.nanmax(dev):.3g} "
+                             f"(a cell is {cell:.3g}) in the band where water crosses the interface "
+                             f"({2 * r + h} cells around the wet ring cells): it must coincide there, or the parent "
+                             f"must be land there so that no water crosses the interface")
+        # 2. wet cells outside the band: the parent cell under each must be land or the hole
+        xc, yc = x[1::2, 1::2], y[1::2, 1::2]
+        out = w & ~band
+        if out.any():
+            pi = np.floor((xc[out] - p.lon0) / p.dlon).astype(int)
+            pj = np.floor((yc[out] - p.lat0) / p.dlat).astype(int)
+            inside = (pi >= 0) & (pi < p.nx) & (pj >= 0) & (pj < p.ny)
+            pw = wet[p.name][pj[inside] + p.band, pi[inside] + p.band]
+            hole = p.hole[pj[inside], pi[inside]] if getattr(p, "hole", None) is not None else np.zeros(pw.shape, bool)
+            twice = int((pw & ~hole).sum())
+            if twice:
+                raise ValueError(f"{lev.name}: {twice} wet cells lie over water that {p.name} computes "
+                                 "(the parent must be land under the level outside its conforming band)")
+            if not inside.all():
+                raise ValueError(f"{lev.name}: {int((~inside).sum())} wet cells lie outside {p.name}")

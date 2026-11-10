@@ -135,6 +135,16 @@ class Level:
         self.set_active(None)
         self.index = -1
         self.steps_per_root = 1 if parent is None else parent.steps_per_root * self.time_ratio
+        #: optional curvilinear grid: a file (.npz with arrays x, y) holding the
+        #: level's supergrid including its band, shape (2 (ny + 2 band) + 1,
+        #: 2 (nx + 2 band) + 1), in the layout's units. Without it the grid is
+        #: regular (lon0, dlon). A curvilinear child must coincide with the refined
+        #: parent grid where water crosses its interface (checked at start-up:
+        #: :func:`pygetm.nesting.masks.check_conforming`).
+        self.grid = cfg.get("grid")
+        if self.grid is not None and parent is None:
+            raise ValueError(f"{name}: a curvilinear grid is supported for child levels only")
+        self._supergrid = None
 
     def is_outer(self, side: str) -> bool:
         """Whether this level's side ("W", "E", "S", "N") lies on the root's
@@ -167,8 +177,41 @@ class Level:
         """Shape of the level including its band."""
         return (self.ny + 2 * self.band, self.nx + 2 * self.band)
 
+    def regular_supergrid(self):
+        """The regular grid of the level (from lon0/dlon: for a child the parent's
+        grid refined by the ratio) on the supergrid, including the band:
+        (x, y) of shape (2 (ny + 2 band) + 1, 2 (nx + 2 band) + 1)."""
+        h = self.band
+        x = self.lon0 + (np.arange(2 * (self.nx + 2 * h) + 1) / 2.0 - h) * self.dlon
+        y = self.lat0 + (np.arange(2 * (self.ny + 2 * h) + 1) / 2.0 - h) * self.dlat
+        return np.meshgrid(x, y)
+
+    def supergrid(self):
+        """The level's coordinates on the supergrid including the band, (x, y):
+        the curvilinear grid if the level has one (``grid``), else the regular grid."""
+        if self.grid is None:
+            return self.regular_supergrid()
+        if self._supergrid is None:
+            with np.load(self.grid) as f:
+                x, y = np.asarray(f["x"], dtype=float), np.asarray(f["y"], dtype=float)
+            shape = (2 * (self.ny + 2 * self.band) + 1, 2 * (self.nx + 2 * self.band) + 1)
+            if x.shape != shape or y.shape != shape:
+                raise ValueError(f"{self.name}: grid {self.grid} has shape {x.shape}, {y.shape}; expected {shape} (supergrid with the band)")
+            self._supergrid = x, y
+        return self._supergrid
+
+    def centres(self):
+        """Coordinates (x, y) of the level's cell centres (ny, nx), without the band."""
+        x, y = self.supergrid()
+        h = self.band
+        sl = (slice(2 * h + 1, 2 * (h + self.ny), 2), slice(2 * h + 1, 2 * (h + self.nx), 2))
+        return x[sl], y[sl]
+
     def edges(self):
-        """Cell edges (degrees) in x and y, including the band."""
+        """Cell edges (degrees) in x and y, including the band (regular levels only;
+        see :meth:`supergrid`)."""
+        if self.grid is not None:
+            raise ValueError(f"{self.name} is curvilinear: use Level.supergrid()")
         h = self.band
         lon = self.lon0 + np.arange(-h, self.nx + h + 1) * self.dlon
         lat = self.lat0 + np.arange(-h, self.ny + h + 1) * self.dlat
@@ -399,9 +442,12 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
         wet = wet[h:-h, h:-h]
     if wet.shape != (level.ny, level.nx):
         raise ValueError(f"{level.name}: wet mask has shape {wet.shape}")
-    lon = level.lon0 + (np.arange(level.nx) + 0.5) * level.dlon
-    lat = level.lat0 + (np.arange(level.ny) + 0.5) * level.dlat
-    LO, LA = np.meshgrid(lon, lat)
+    if level.grid is None:
+        lon = level.lon0 + (np.arange(level.nx) + 0.5) * level.dlon
+        lat = level.lat0 + (np.arange(level.ny) + 0.5) * level.dlat
+        LO, LA = np.meshgrid(lon, lat)
+    else:
+        LO, LA = level.centres()
     ok = wet.copy()
     barred = np.zeros_like(ok)
     tests = {"lon_lt": lambda v: LO < v, "lon_gt": lambda v: LO > v, "lat_lt": lambda v: LA < v, "lat_gt": lambda v: LA > v}
@@ -417,7 +463,11 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
         seeds = [seeds]
     ids = []
     for sx, sy in seeds:
-        seed = lab[int(np.argmin(abs(lat - float(sy)))), int(np.argmin(abs(lon - float(sx))))]
+        if level.grid is None:
+            seed = lab[int(np.argmin(abs(lat - float(sy)))), int(np.argmin(abs(lon - float(sx))))]
+        else:
+            k = int(np.argmin((LO - float(sx)) ** 2 + (LA - float(sy)) ** 2))
+            seed = lab.flat[k]
         if seed == 0:
             raise ValueError(f"{level.name}: seed {[sx, sy]} is on land or behind a barrier")
         ids.append(seed)
@@ -444,6 +494,21 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
     return blocks(connected) | land
 
 
+def read_layout(path) -> Dict[str, Any]:
+    """A nesting layout from a YAML file; a level's ``grid`` file is taken
+    relative to the layout's directory."""
+    import os
+    import yaml
+
+    with open(path) as f:
+        config = yaml.safe_load(f)
+    base = os.path.dirname(os.path.abspath(path))
+    for k, v in config.items():
+        if k != "config" and isinstance(v, Mapping) and v.get("grid") is not None:
+            v["grid"] = os.path.join(base, str(v["grid"]))
+    return config
+
+
 def load_levels(config, halo: int = 2, root_band: Optional[int] = None,
                 wet: Optional[Mapping[str, np.ndarray]] = None, active: bool = True) -> List[Level]:
     """Levels from a nesting YAML file (path) or mapping, parents before
@@ -456,10 +521,7 @@ def load_levels(config, halo: int = 2, root_band: Optional[int] = None,
     geometry only (windows, grids, bands), without active regions, e.g. to
     build a level's bathymetry before the wet masks are known."""
     if not isinstance(config, Mapping):
-        import yaml
-
-        with open(config) as f:
-            config = yaml.safe_load(f)
+        config = read_layout(config)
     specs = {k: v for k, v in config.items() if k != "config"}
     levels: List[Level] = []
     done: Dict[str, Level] = {}

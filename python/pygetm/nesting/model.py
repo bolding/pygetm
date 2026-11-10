@@ -31,7 +31,7 @@ import warnings
 import numpy as np
 from mpi4py import MPI
 
-from .geometry import Level, load_levels
+from .geometry import Level, load_levels, read_layout
 from .hierarchy import split_mpmd
 from .runtime import NestingRun, install_abort_hook
 from . import masks
@@ -40,10 +40,7 @@ from . import masks
 def _load_config(layout) -> Dict[str, Any]:
     if isinstance(layout, Mapping):
         return dict(layout)
-    import yaml
-
-    with open(layout) as f:
-        return yaml.safe_load(f)
+    return read_layout(layout)
 
 
 class NestedModel:
@@ -99,6 +96,8 @@ class NestedModel:
         self.levels = load_levels(self.config, halo=self.halo, root_band=self.root_band, wet=actives)
         wets, Hs, self.changes = masks.make_consistent(self.levels, wets, Hs)
         self.violations = masks.check_consistent(self.levels, wets)
+        # curvilinear levels: the refined parent grid where water crosses the interface
+        masks.check_conforming(self.levels, wets)
         # the layout keeps the interfaces out of water that floods and dries (masks.interface_depths)
         lims = {l.name: masks.interface_min_depth(self.config, l.name) for l in self.levels}
         self.interface_depths = masks.interface_depths(self.levels, wets, Hs, lims)

@@ -629,8 +629,12 @@ class NestedBarotropic(Coupler):
         u = faces["rim_x"].recv(plan.comm, self.t, self.clock)
         v = faces["rim_y"].recv(plan.comm, self.t, self.clock)
         if not self.break_rim:
-            self.U.all_values[self.loc(*faces["rim_x"].points(self.t))] = u
-            self.V.all_values[self.loc(*faces["rim_y"].points(self.t))] = v
+            # only at faces open in this level: a land face keeps no transport (beyond a
+            # curvilinear child's conforming band the child's faces lie elsewhere)
+            for arr, f, val in ((self.U, faces["rim_x"], u), (self.V, faces["rim_y"], v)):
+                fj, fi = self.loc(*f.points(self.t))
+                op = arr.grid.mask.all_values[fj, fi] != 0
+                arr.all_values[fj[op], fi[op]] = val[op]
         # volume flux matching
         if fp is None:
             return
