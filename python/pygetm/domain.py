@@ -440,6 +440,7 @@ class Domain:
         periodic_y: bool = False,
         comm: Optional[parallel.MPI.Comm] = None,
         logger: Optional[logging.Logger] = None,
+        exact_area: bool = False,
     ):
         """Create new domain.
 
@@ -464,6 +465,10 @@ class Domain:
             comm: MPI communicator that comprises all processes that should get access
                 to the domain
             logger: logger for diagnostic messages
+            exact_area: cell areas of the quadrilateral spanned by the corners of
+                each cell (as legacy GETM's iow branch) instead of dx * dy. Only with
+                x and y (planar coordinates); it matters on strongly curved or
+                non-orthogonal grids
         """
         if nx <= 0:
             raise Exception(f"Number of x points is {nx} but must be > 0")
@@ -578,6 +583,16 @@ class Domain:
             self._rotation = rotation if rotation[1:-1, 1:-1].any() else None
 
             self._area = self._dx * self._dy
+            if exact_area:
+                if not has_xy:
+                    raise Exception("exact_area requires x and y (planar coordinates)")
+                # The corners of every supergrid point's cell are its diagonal
+                # neighbours on the supergrid: half the cross product of the diagonals
+                d1x = x_ex[2:, 2:] - x_ex[:-2, :-2]
+                d1y = y_ex[2:, 2:] - y_ex[:-2, :-2]
+                d2x = x_ex[2:, :-2] - x_ex[:-2, 2:]
+                d2y = y_ex[2:, :-2] - y_ex[:-2, 2:]
+                self._area = 0.5 * np.abs(d1x * d2y - d1y * d2x)
 
         self.open_boundaries = open_boundaries.GlobalOpenBoundaryCollection(
             nx, ny, self.logger.getChild("open_boundaries"), **self._tcoords()
