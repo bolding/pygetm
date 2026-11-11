@@ -5,6 +5,7 @@ import functools
 import logging
 
 import numpy as np
+import numpy.typing as npt
 
 from pygetm import core
 from .constants import (
@@ -229,6 +230,19 @@ class BoundaryCondition:
     implement :meth:`get_updater`
     """
 
+    def __init__(self, **param):
+        self._param = {k: v for k, v in param.items() if v is not None}
+
+    def __eq__(self, other: "BoundaryCondition") -> bool:
+        return type(self) is type(other) and self._param == other._param
+
+    def __hash__(self) -> int:
+        return hash((type(self), frozenset(self._param.items())))
+
+    def __str__(self):
+        strparam = ", ".join(f"{k}={v}" for k, v in self._param.items())
+        return f"{type(self).__name__}({strparam})"
+
     def initialize(self, grid: core.Grid):
         """Initialize the boundary condition.
 
@@ -341,11 +355,7 @@ class Sponge(Clamped):
     prescribed values will increase with increasing inward flow velocity.
 
     If flow-dependent relaxation is not used (``tmrlx=False``), values at
-    the boundary will be set to the prescribed values.
-
-    Relaxation rates for the ``n`` points are available as :attr:`sp`.
-    They default to the formulation of `Martinsen & Engedahl (1987)
-    <https://doi.org/10.1016/0378-3839(87)90028-7>`_ (Eq 3)."""
+    the boundary will be set to the prescribed values."""
 
     def __init__(
         self,
@@ -355,6 +365,7 @@ class Sponge(Clamped):
         tmrlx_min: float = 0.0,
         tmrlx_ucut: float = 0.02,
         tmrlx_umin: Optional[float] = None,
+        sp: Optional[npt.ArrayLike] = None,
     ):
         """
         Args:
@@ -388,7 +399,19 @@ class Sponge(Clamped):
                 from a weighted mean over the sponge zone. If ``None``,
                 ``tmrlx_umin`` is set to ``-0.25 * tmrlx_ucut``.
                 Only used if ``tmrlx`` is ``True``.
+            sp: optional array defining the sponge zone weights. If omitted,
+                quadratic decay is used as per `Martinsen & Engedahl (1987)
+                <https://doi.org/10.1016/0378-3839(87)90028-7>`_ (Eq 3).
         """
+        super().__init__(
+            n=n,
+            tmrlx=tmrlx,
+            tmrlx_max=tmrlx_max,
+            tmrlx_min=tmrlx_min,
+            tmrlx_ucut=tmrlx_ucut,
+            tmrlx_umin=tmrlx_umin,
+            sp=sp,
+        )
         self.n = n
         self.tmrlx = tmrlx
         self.tmrlx_max = tmrlx_max
@@ -405,7 +428,11 @@ class Sponge(Clamped):
         # These represent the fraction of the cell's value that is replaced
         # by the value at the boundary, per timestep, as we move inward from
         # the boundary.
-        self.sp = ((n - np.arange(n)) / (n + 1.0)) ** 2
+        if sp is not None:
+            self.sp = np.array(sp)
+        else:
+            self.sp = ((n - np.arange(n)) / (n + 1.0)) ** 2
+        assert self.sp.shape == (self.n,)
 
     def initialize(self, grid: core.Grid):
         """Create the relaxation coefficient array if using flow-dependent relaxation.
@@ -530,9 +557,10 @@ class Flather(BoundaryCondition):
     def __init__(self, transport: bool = False):
         """
         Args:
-            transport: use prescribed transport at the boundary instead of
-                prescribed velocity
+            transport: prescribe depth-integrated velocity [transport] at the
+                boundary instead of depth-averaged velocity
         """
+        super().__init__(transport=transport)
         self.transport = transport
 
     def get_updater(
@@ -600,6 +628,10 @@ class ArrayOpenBoundary:
         self._type = self._make_bc(value)
 
     @property
+    def boundary(self) -> OpenBoundary:
+        return self._boundary
+
+    @property
     def values(self) -> np.ndarray:
         return self._prescribed_values
 
@@ -621,7 +653,9 @@ class ArrayOpenBoundaries(Sequence[ArrayOpenBoundary]):
 
     __slots__ = "_array", "values", "_bdy", "updaters", "relaxation"
 
-    def __init__(self, array: core.Array, type=None):
+    def __init__(
+        self, array: core.Array, type: Union[int, BoundaryCondition, None] = None
+    ):
         self._array = array
         self.values = array.grid.array(
             name=f"{array.name}_bdy",
@@ -669,15 +703,13 @@ class ArrayOpenBoundaries(Sequence[ArrayOpenBoundary]):
         return len(self._bdy)
 
     def initialize(self) -> Iterable[BoundaryCondition]:
-        bcs: set[BoundaryCondition] = set()
         for bdy in self._bdy:
-            bdy._type.initialize(self._array.grid)
+            bc = bdy._type
+            bc.initialize(self._array.grid)
             self.updaters.append(
-                bdy._type.get_updater(
-                    bdy._boundary, self._array, bdy._prescribed_values
-                )
+                bc.get_updater(bdy._boundary, self._array, bdy._prescribed_values)
             )
-            bcs.add(bdy._type)
+            yield bc
 
         if self.relaxation:
             # Enumerate relaxation terms beyond the open boundary itself
@@ -690,8 +722,6 @@ class ArrayOpenBoundaries(Sequence[ArrayOpenBoundary]):
                 local_weight_sum += relax.weights
             for relax in self.relaxation:
                 relax.weights[...] /= np.maximum(relax.slicer(weight_sum), 1.0)
-
-        return bcs
 
     def add_relaxation(
         self,
@@ -967,7 +997,6 @@ class LocalOpenBoundaryCollection(Sequence[LocalOpenBoundary]):
         self._arrays: list[ArrayOpenBoundaries] = []
 
         self.sponge = Sponge()
-        self.zero_gradient = ZeroGradient()
         self.bcs: set[BoundaryCondition] = set()
 
         # Indices of T point in open boundary into arrays that INCLUDE halos.
@@ -1110,19 +1139,24 @@ class LocalOpenBoundaryCollection(Sequence[LocalOpenBoundary]):
 
     def _make_bc(self, value: Union[int, BoundaryCondition]) -> BoundaryCondition:
         if isinstance(value, BoundaryCondition):
-            return value
-        if value == ZERO_GRADIENT:
-            return self.zero_gradient
+            bc = value
+        elif value == ZERO_GRADIENT:
+            bc = ZeroGradient()
         elif value == SPONGE:
-            return self.sponge
+            bc = self.sponge
         elif value == CLAMPED:
-            return Clamped()
+            bc = Clamped()
         elif value == FLATHER_ELEV:
-            return Flather()
+            bc = Flather()
         elif value == FLATHER_TRANSPORT:
-            return Flather(transport=True)
+            bc = Flather(transport=True)
         else:
             raise Exception(f"Unknown boundary type {value} specified")
+        for existing_bc in self.bcs:
+            if bc == existing_bc:
+                return existing_bc
+        self.bcs.add(bc)
+        return bc
 
     def _configure_mirroring(self, grid: core.Grid):
         """Set up indices for mirroring across boundaries on U and V grids"""
@@ -1276,8 +1310,31 @@ class LocalOpenBoundaryCollection(Sequence[LocalOpenBoundary]):
                 # Inward velocity (to be calculated from uv and inward sign)
                 boundary.uv_in = self.uv_in.all_values[boundary.slice_bdy]
 
+        # Keep only the boundary conditions assigned to one or more arrays
+        self.bcs.clear()
         for array_open_boundaries in self._arrays:
             self.bcs.update(array_open_boundaries.initialize())
+
+        if all(isinstance(bc, ZeroGradient) for bc in self.bcs):
+            self.logger.info(
+                "All variables defined at the open boundary use zero-gradient boundary conditions"
+            )
+        elif any(isinstance(bc, ZeroGradient) for bc in self.bcs):
+            self.logger.info(
+                "All variables defined at the open boundary use zero-gradient boundary conditions, except:"
+            )
+            for array_open_boundaries in self._arrays:
+                bcs = frozenset(aob.type for aob in array_open_boundaries)
+                if len(bcs) > 1:
+                    for aob in array_open_boundaries:
+                        if not isinstance(aob.type, ZeroGradient):
+                            self.logger.info(
+                                f"  {array_open_boundaries._array.name} @ {aob.boundary.name}: {aob.type}"
+                            )
+                else:
+                    bc = array_open_boundaries[0].type
+                    if not isinstance(bc, ZeroGradient):
+                        self.logger.info(f"  {array_open_boundaries._array.name}: {bc}")
 
     def __getitem__(self, key: Union[int, str]) -> LocalOpenBoundary:
         if isinstance(key, str):
