@@ -452,7 +452,47 @@ class NestedTracers3D(Coupler):
 
         lo = hi = None
         back = None
-        if self.ring_slopes or self._extrap:
+        if self.ring_slopes and not self._extrap:
+            # minmod slopes per layer of the anomalies, taken on each parent column's own layers: the
+            # parent column (the ring cell's and its W, E, S, N neighbours) minus the child's adjacent
+            # column remapped onto those layers, then remapped once onto the ring cell's layers. The
+            # remap's errors (coarse layers of other depths; a horizontally uniform field) are in both
+            # parts and cancel; a one-sided difference counts only in layers above the bottom of the
+            # neighbour, the ring cell and the child's column, and is zero towards land or where the
+            # child has no adjacent column. The range of the five columns on the ring cell's layers is
+            # the ring value plus each difference (12 remaps per ring cell and tracer; the neighbours
+            # themselves are not remapped). With the child detail, the ring cell's own anomaly is
+            # what the parent adds to the child's column.
+            hks = [buf[k, 0][ok] for k in range(1, 5)]
+            wks = [hk.sum(axis=1) > 0.0 for hk in hks]
+            if m.any():
+                nm = int(m.sum())
+                need = [np.ones(nm, bool)] + [w[m] for w in wks]  # land neighbours: nothing to remap
+                N = np.concatenate(need)
+                H = np.concatenate([hs[m]] + [h[m] for h in hks])[N]
+                Cp = np.concatenate([cs[:, m]] + [buf[k, 1:][:, ok][:, m] for k in range(1, 5)], axis=1)[:, N]
+                idx = np.tile(np.arange(nm), 5)[N]
+                p_ = remap_column(cin[:, m][:, idx], hin[m][idx], H, self.keep, z, sc)  # the child's column on the parent's layers
+                A = remap_column(Cp - p_, H, hd[m][idx], self.keep, z, sc)  # the anomalies on the ring cell's layers
+                st = np.zeros((A.shape[0], 5 * nm, A.shape[2]))
+                st[:, N] = A
+                a0 = st[:, :nm]
+                zb = np.cumsum(hd[m], axis=1)
+                dmax = np.minimum(hd[m].sum(axis=1), hin[m].sum(axis=1))
+                nb = []  # each neighbour minus the ring cell, on the ring cell's layers
+                for k in range(4):
+                    lim = np.minimum(dmax, hks[k][m].sum(axis=1))
+                    valid = (zb <= lim[:, None] + 1e-9)[None] & wks[k][m][None, :, None]
+                    nb.append(np.where(valid, st[:, (k + 1) * nm:(k + 2) * nm] - a0, 0.0))
+                sx = minmod(-nb[0], nb[1])  # W: backward, E: forward
+                sy = minmod(-nb[2], nb[3])  # S: backward, N: forward
+                cu = c[:, m]
+                zero = np.zeros_like(cu)
+                lo_m = cu + np.minimum.reduce([zero] + nb)
+                hi_m = cu + np.maximum.reduce([zero] + nb)
+                c[:, m] = np.clip(cu + sx * self._ring_ox[ok][m][None, :, None] + sy * self._ring_oy[ok][m][None, :, None], lo_m, hi_m)
+                back = cu - a0  # the child's column as the ring sees it through the parent's (for ring_detail)
+        elif self.ring_slopes or self._extrap:
             # the neighbours on the ring cell's layers (land: the cell itself)
             # all four in one remap (the columns are independent)
             hks = [buf[k, 0][ok] for k in range(1, 5)]
