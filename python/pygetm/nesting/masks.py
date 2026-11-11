@@ -26,7 +26,7 @@ child overlap they are reconciled, the child's finer bathymetry leading:
 Interfaces and drying: the layout is assumed to keep every interface out of
 water that floods and dries - drying happens inside a level, where pyGETM
 handles it (the coupling has a safety net for it in 2D, see
-:mod:`pygetm.nesting.barotropic`, but not in 3D). :func:`interface_depths`
+:mod:`pygetm.nesting.nested2d`, but not in 3D). :func:`interface_depths`
 checks this against ``interface_min_depth`` (m below the depth datum) of the
 layout: per level, or for all levels under ``config:``. Choose it as the
 largest fall of the water level below the datum (tidal amplitude plus

@@ -25,7 +25,7 @@ This package currently provides:
 * :mod:`pygetm.nesting.operators`: conservative transfer operators (limited
   linear prolongation, weighted restriction, face sums for flux matching)
 * :mod:`pygetm.nesting.sponge`: the AGRIF-like sponge of a child next to its
-  interface (``NestedBarotropic(sponge_width=, sponge_alpha=)``)
+  interface (``Nested2D(sponge_width=, sponge_alpha=)``)
 * :mod:`pygetm.nesting.model`: :class:`NestedModel`, one model of a run
   launched with one ``mpiexec`` component per level (MPMD)
 * :mod:`pygetm.nesting.plan`: the M:N exchange lists between a parent and a

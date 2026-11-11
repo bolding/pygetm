@@ -239,7 +239,7 @@ def vertical_remap(const double[:,::1] zs not None, const double[:,::1] zd not N
 @cython.wraparound(False)
 def remap_z(const double[:,::1] hs not None, const double[:,::1] hd not None, const double[::1] D not None, const double[:,:,::1] c not None, double[:,:,::1] out not None, int scheme=0):
     """Concentrations on the target layers of n single columns, interfaces kept at their depths
-    (pygetm.nesting.baroclinic.remap_conc_z with one source column each): hs (n, ns) and hd (n, nd)
+    (pygetm.nesting.nested3d.remap_conc_z with one source column each): hs (n, ns) and hd (n, nd)
     the source and target thicknesses (surface first), D (n) the target depths, c (nt, n, ns), out
     (nt, n, nd); scheme 0: PCM, 1: PPM."""
     cdef int n = <int>hs.shape[0], ns = <int>hs.shape[1], nd = <int>hd.shape[1], nt = <int>c.shape[0]

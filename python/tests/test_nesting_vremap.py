@@ -80,7 +80,7 @@ def test_sigma_child_a_equals_b():
 
 
 def test_rim_uniform_with_volume_mismatch():
-    """NestedTracers3D's rim: child columns whose total volume differs from the
+    """Nested3D's rim: child columns whose total volume differs from the
     parent cell's (elevation not yet synchronised) keep a uniform field uniform
     when concentrations are formed by the child volume."""
     n, m, nzc, nzp = 50, 9, 20, 10
@@ -97,7 +97,7 @@ def test_rim_uniform_with_volume_mismatch():
 
 
 def test_ring_uniform():
-    """NestedTracers3D's ring: one parent column onto a child column of another
+    """Nested3D's ring: one parent column onto a child column of another
     depth and layer count keeps a uniform field uniform."""
     n, nzp, nzc = 40, 10, 25
     Dp = rng.uniform(5.0, 50.0, n)
@@ -206,7 +206,7 @@ def test_ppm_linear_exact_in_second_layers(compiled, monkeypatch):
 
 def test_macro_ratios():
     """3D sub-stepping: a child's 3D step is its parent's divided by a whole number."""
-    from pygetm.nesting.baroclinic import macro_ratios
+    from pygetm.nesting.nested3d import macro_ratios
 
     # the shared 3D step (split = parent's x time ratio), then the strait's own (a third)
     shared = {"c": (None, 180.0, 10, 1), "s": ("c", 180.0, 10, 1), "t": ("s", 180.0, 30, 3)}

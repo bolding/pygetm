@@ -1,39 +1,33 @@
 """Two-way nesting of 2D barotropic pyGETM simulations (z, U, V).
 
-Schedule (``NestedBarotropic(schedule=...)``):
-
-* "sync" (default): all models step at the same time; at the end of every
-  parent step they meet at a sync point: children send the halo inside the
-  hole and their flux registers, the parent matches the fluxes of the same
-  step and sends its corrected state, which the child holds as its ring for
-  its next ``time_ratio`` sub-steps. Models only wait in MPI at the syncs.
-* "sequential" (old, kept for comparison; described below): the child
-  steps after the parent and interpolates its ring in time.
+All models step at the same time; at the end of every parent step they
+meet at a sync point: children send the halo inside the hole and their flux
+registers, the parent matches the fluxes of the same step and sends its
+corrected state; the child continues its ring from the parent's last two
+syncs (linear in time) over its next ``time_ratio`` sub-steps. Models only
+wait in MPI at the syncs.
 
 Every parent and child is a :class:`pygetm.Simulation` with
-``runtype=BAROTROPIC_2D``; :class:`NestedBarotropic` is a
+``runtype=BAROTROPIC_2D``; :class:`Nested2D` is a
 :class:`pygetm.simulation.Coupler` attached to each of them. Per parent step n
 (t_n -> t_n+1):
 
-* parent, after its state update: send a snapshot to the children - z(n+1)
-  with limited slopes at the parent cells covering the child's ring, and the
-  transports U, V(n+1/2) at the parent faces around the child's ring faces;
-  then wait for the children's sub-steps, receive their restriction
+* parent, after its state update: receive the children's restriction
   (z: area-weighted mean over wet child cells; U, V: mean over the child
   faces along each parent face) for the rim, and their volume flux
   registers; correct z of the parent cells next to the window by
   (parent - child) volume through each shared face, and continue from the
   child's mean transport at those faces (without this, the correction loop
-  is unstable in deep water); send the corrected z to the children (the
-  start of their next parent step). All this happens before pyGETM
-  recomputes depths and pressure gradients from z.
+  is unstable in deep water); then send its state to the children: z with
+  limited slopes at the parent cells covering the child's ring, and the
+  transports U, V at the parent faces around the child's ring faces. All
+  this happens before pyGETM recomputes depths and pressure gradients from z.
 * child, sub-step k of r (r = time_ratio, steps per parent step):
-  - after its momentum update: ring U, V at t_n + (k + 1/2)/r, interpolated
-    (and beyond t_n+1/2 extrapolated) between the parent's U(n-1/2) and
-    U(n+1/2); in space linear across and constant along parent faces;
-  - after its elevation update: ring z at t_n + (k + 1)/r, interpolated
-    between the parent's z(n) and z(n+1); add the volume through its edge
-    faces (U dy dt) to its flux register;
+  - after its momentum update: ring U, V at its half step, extrapolated
+    linearly from the parent's last two syncs; in space linear across and
+    constant along parent faces;
+  - after its elevation update: ring z at its time, the same way; add the
+    volume through its edge faces (U dy dt) to its flux register;
   - after the last sub-step: send restriction and register to the parent.
 
 Faces with ring (or hole) cells on both sides are EXTERNAL
@@ -53,8 +47,6 @@ from .plan import LevelTiling
 from .runtime import NestingRun, ops_interp
 from . import operators as ops
 
-#: tag offset of the parent's corrected z snapshot
-TAG_CORRECTED = 50
 
 
 class HaloWaitTimer:
@@ -64,7 +56,7 @@ class HaloWaitTimer:
     pyGETM's :class:`pygetm.parallel.HaloUpdater` calls the module-level
     ``Waitall`` of :mod:`pygetm.parallel`; :meth:`install` replaces it by a
     timed version (two MPI.Wtime calls per halo update). Installed by
-    :class:`NestedBarotropic`, once per process."""
+    :class:`Nested2D`, once per process."""
 
     total = 0.0
     _installed = False
@@ -276,23 +268,9 @@ def rim_faces(child: Level, axis: str):
     return (pj, pf), (src_j, src_i), weights
 
 
-def edge_faces(child: Level, axis: str):
-    """The child's edge faces (between its ring and its active region) of one
-    axis and the parent's interface face each lies on (weight 1: the same
-    transport per unit width on every sub-face)."""
-    e = child.edge
-    wf = child.parent.wfaces[child.name]
-    r = child.ratio
-    sel = e["is_x"] if axis == "x" else ~e["is_x"]
-    k = np.nonzero(sel)[0]
-    dst = (e["face"][0][k], e["face"][1][k])
-    src = (wf["face"][0][k // r][:, None], wf["face"][1][k // r][:, None])
-    return dst, src, np.ones((k.size, 1))
-
-
 def face_transfers(child: Level, plan, link: int, tag_base: int = 600):
-    """U/V ring (parent -> child), rim (child -> parent) and edge (parent ->
-    child) transfers of the interface of *plan* (on ``plan.comm``)."""
+    """U/V ring (parent -> child) and rim (child -> parent) transfers of the
+    interface of *plan* (on ``plan.comm``)."""
     ptil, ctil, po, co = plan.ptil, plan.ctil, plan.poff, plan.coff
     out = {}
     for n, axis in enumerate("xy"):
@@ -300,60 +278,20 @@ def face_transfers(child: Level, plan, link: int, tag_base: int = 600):
         out[f"ring_{axis}"] = PointTransfer(ptil, ctil, dst, src, w, tag_base + 4 * link + n, "UV"[n] + "r", po, co)
         dst, src, w = rim_faces(child, axis)
         out[f"rim_{axis}"] = PointTransfer(ctil, ptil, dst, src, w, tag_base + 4 * link + 2 + n, "UV"[n] + "R", co, po)
-        dst, src, w = edge_faces(child, axis)
-        out[f"edge_{axis}"] = PointTransfer(ptil, ctil, dst, src, w, tag_base + 200 + 2 * link + n, "UV"[n] + "e", po, co)
     return out
 
 
-class NestedBarotropic(Coupler):
+class Nested2D(Coupler):
     """Coupler exchanging z, U, V of a 2D barotropic simulation with its
     parent and children (see module documentation)."""
 
-    def __init__(self, nest: NestingRun, sim, break_ring=False, break_rim=False, break_flux=False,
-                 replace_transport=True, schedule="sync", ring_time="extrapolate", correct_late=False,
-                 edge_flux="child", sponge_width=0.0, sponge_alpha=0.1, exchange="up_first"):
+    def __init__(self, nest: NestingRun, sim, sponge_width=0.0, sponge_alpha=0.1):
         self.nest, self.sim = nest, sim
         self.lev = lev = nest.level
         self.t = nest.tile
         self.til = nest.tilings[lev.name]
         self.world = nest.world
         self.up, self.down = nest.up, nest.down
-        self.break_ring, self.break_rim, self.break_flux = break_ring, break_rim, break_flux
-        #: after flux matching, set the parent's transport at each window face
-        #: to the child's mean transport (stabilises the coupling in deep water)
-        self.replace_transport = replace_transport
-        #: experimental (schedule "sync"): apply the flux-matching correction
-        #: after the snapshot for the children has been sent, so the children
-        #: see each correction one sync later (volume is conserved either way)
-        self.correct_late = correct_late
-        self._pending = []
-        #: schedule "sync": the order of the messages in a sync.
-        #: "chain": a level receives from its children and corrects
-        #: before it sends up and before it sends its state down, so every sync
-        #: runs up through the hierarchy and down again while the others wait.
-        #: "cross" (experimental, unstable in IDEAL): every level first sends its state down (before this sync's
-        #: correction, which the children then see one sync later, as with
-        #: correct_late) and its rim and fluxes up, then receives; each process
-        #: waits only for its direct partners. Volume is conserved either way.
-        #: "up_first" (default; bit-identical to "chain"): every level sends its rim and fluxes up before it
-        #: receives its children, and its corrected state down before it
-        #: receives its parent's. The same arithmetic as "chain" (what goes up
-        #: does not depend on the children, what goes down not on the parent),
-        #: but the sweeps up and down no longer wait for each other. A level
-        #: whose children pass fluxes on up (a child touching its edge) sends
-        #: up after its children, as in "chain".
-        if exchange not in ("chain", "cross", "up_first"):
-            raise ValueError(f"unknown exchange {exchange!r}")
-        self.exchange = exchange
-        #: transports through the child's edge faces (its interface with the
-        #: parent): "child" (computed by the child's momentum equation) or
-        #: "parent" (the parent's interface-face transport per unit width,
-        #: extrapolated in time like the ring U; the child's response then
-        #: cannot feed back into the flux mismatch - stable with sub-stepping,
-        #: see IDEAL/scripts/coupling1d.py in pygetm-nesting)
-        if edge_flux not in ("child", "parent"):
-            raise ValueError(f"unknown edge_flux {edge_flux!r}")
-        self.edge_flux = edge_flux
         #: sponge (child levels; see :mod:`pygetm.nesting.sponge`): damping of
         #: the transports over ``sponge_width`` parent cells next to the
         #: interface (counted through water), with An dt / dx^2 =
@@ -363,22 +301,6 @@ class NestedBarotropic(Coupler):
         self.sponge_width, self.sponge_alpha = float(sponge_width), float(sponge_alpha)
         if self.sponge_width < 0.0 or self.sponge_alpha < 0.0:
             raise ValueError("sponge_width and sponge_alpha must be >= 0")
-        #: "sync" (default): all models step at the same time and exchange at
-        #: the end of every parent step; the child holds its ring from the
-        #: parent's state at the last sync. "sequential" (old, for comparison):
-        #: the child steps after the parent and interpolates its ring in time
-        #: between the parent's n and n+1.
-        if schedule not in ("sync", "sequential"):
-            raise ValueError(f"unknown schedule {schedule!r}")
-        self.schedule = schedule
-        #: schedule "sync": the ring between syncs is "extrapolate" (default;
-        #: linear in time from the parent's last two syncs, z to the child's
-        #: time, U/V to its half steps) or "hold" (the parent's state at the
-        #: last sync). NWES coarse M2 tides: extrapolate reproduces the
-        #: sequential schedule to < 1 mm, hold differs by up to 6 mm.
-        if ring_time not in ("hold", "extrapolate"):
-            raise ValueError(f"unknown ring_time {ring_time!r}")
-        self.ring_time = ring_time
         self._snap_old = None
         T = sim.T
         self.z, self.U, self.V = T.z, sim.momentum.U, sim.momentum.V
@@ -401,8 +323,6 @@ class NestedBarotropic(Coupler):
             self._rj, self._ri = self.loc(cat(2), cat(3))
             self._ru = self.loc(*self.up_faces["ring_x"].points(self.t))
             self._rv = self.loc(*self.up_faces["ring_y"].points(self.t))
-            self._eu = self.loc(*self.up_faces["edge_x"].points(self.t))
-            self._ev = self.loc(*self.up_faces["edge_y"].points(self.t))
             #: lowest ring elevation: the bed + Dmin (drying)
             self._ring_zmin = -T.H.all_values[self._rj, self._ri] + float(sim.Dmin)
             self._dmin = float(sim.Dmin)
@@ -436,11 +356,11 @@ class NestedBarotropic(Coupler):
     # --- restart ----------------------------------------------------------------
 
     #: the parent's ring state at the sync before the last one (``_snap_old``,
-    #: for ring_time "extrapolate"): z with its slopes on the T grid at the
-    #: ring cells, U/V at the ring faces and at the edge faces. Everything else
+    #: for the extrapolation in time): z with its slopes on the T grid at the
+    #: ring cells, U/V at the ring faces. Everything else
     #: the coupler needs is rebuilt by the initial sync of :meth:`on_start` from
     #: the restarted model state (restart files are written after the sync).
-    _RESTART = (("T", "z"), ("T", "zsx"), ("T", "zsy"), ("U", "u"), ("V", "v"), ("U", "ue"), ("V", "ve"))
+    _RESTART = (("T", "z"), ("T", "zsx"), ("T", "zsy"), ("U", "u"), ("V", "v"))
 
     def _restart_arrays(self):
         """Arrays (part of the model state, so in pyGETM's restart files) with
@@ -449,7 +369,7 @@ class NestedBarotropic(Coupler):
         from ..constants import CellType
 
         self._rs = None
-        if self.up is None or self.ring_time != "extrapolate":
+        if self.up is None:
             return
         T = self.sim.T
         grids = {"T": T, "U": T.ugrid, "V": T.vgrid}
@@ -519,7 +439,7 @@ class NestedBarotropic(Coupler):
                 + "); write restarts at whole root 3D steps")
 
     def _restart_points(self):
-        return (self._rj, self._ri), (self._rj, self._ri), (self._rj, self._ri), self._ru, self._rv, self._eu, self._ev
+        return (self._rj, self._ri), (self._rj, self._ri), (self._rj, self._ri), self._ru, self._rv
 
     def _snap_to_restart(self):
         """Keep the restart arrays equal to ``_snap_old``."""
@@ -528,8 +448,8 @@ class NestedBarotropic(Coupler):
         if self._snap_old is None:
             self._rs_set.all_values[...] = 0.0
             return
-        z, u, v, eu, ev = self._snap_old
-        for a, pts, vals in zip(self._rs, self._restart_points(), (z[0], z[1], z[2], u, v, eu, ev)):
+        z, u, v = self._snap_old
+        for a, pts, vals in zip(self._rs, self._restart_points(), (z[0], z[1], z[2], u, v)):
             a.all_values[pts] = vals
         self._rs_set.all_values[...] = 1.0
 
@@ -539,7 +459,7 @@ class NestedBarotropic(Coupler):
         if self._rs is None or not (self._rs_set.all_values > 0.5).any():
             return
         vals = [a.all_values[pts].copy() for a, pts in zip(self._rs, self._restart_points())]
-        self._snap_old = (np.stack(vals[:3]), vals[3], vals[4], vals[5], vals[6])
+        self._snap_old = (np.stack(vals[:3]), vals[3], vals[4])
 
     # --- helpers --------------------------------------------------------------
 
@@ -568,12 +488,10 @@ class NestedBarotropic(Coupler):
         z = np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
         u = self.up_faces["ring_x"].recv(self.up.comm, self.t, self.clock)
         v = self.up_faces["ring_y"].recv(self.up.comm, self.t, self.clock)
-        eu = self.up_faces["edge_x"].recv(self.up.comm, self.t, self.clock)
-        ev = self.up_faces["edge_y"].recv(self.up.comm, self.t, self.clock)
-        return z, u, v, eu, ev
+        return z, u, v
 
     def _set_ring_z(self, snap, halos=True):
-        if not self.break_ring and self._rj.size:
+        if self._rj.size:
             vals = ops.prolong(snap[0], snap[1], snap[2], self._ring_a, self._ring_b, self.lev.ratio)
             # drying: the parent's (block mean) elevation can lie below a ring cell's
             # own bed; there the ring cell is dry, as the child's own dry cells
@@ -598,17 +516,13 @@ class NestedBarotropic(Coupler):
         dmin2 = 2.0 * sim.Dmin
         return np.clip((D - dmin2) / (sim.Dcrit - dmin2), 0.0, 1.0)
 
-    def _set_ring_uv(self, u, v, eu=None, ev=None, halos=True):
-        if not self.break_ring:
-            # drying: the parent's transport through a (coarser) face that is wet in
-            # the parent, scaled by the child's own drying factor at its ring face, so
-            # no water moves over the child's dry ground (alpha = 1 in deep water)
-            Ug, Vg = self.sim.U, self.sim.V
-            self.U.all_values[self._ru] = u * self._alpha(Ug, self._ru)
-            self.V.all_values[self._rv] = v * self._alpha(Vg, self._rv)
-            if self.edge_flux == "parent" and eu is not None:
-                self.U.all_values[self._eu] = eu * self._alpha(Ug, self._eu)
-                self.V.all_values[self._ev] = ev * self._alpha(Vg, self._ev)
+    def _set_ring_uv(self, u, v, halos=True):
+        # drying: the parent's transport through a (coarser) face that is wet in
+        # the parent, scaled by the child's own drying factor at its ring face, so
+        # no water moves over the child's dry ground (alpha = 1 in deep water)
+        Ug, Vg = self.sim.U, self.sim.V
+        self.U.all_values[self._ru] = u * self._alpha(Ug, self._ru)
+        self.V.all_values[self._rv] = v * self._alpha(Vg, self._rv)
         if halos:
             self.clock.halos(self.U, self.V)
 
@@ -652,8 +566,6 @@ class NestedBarotropic(Coupler):
                 reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=plan.tag_p))
         reqs += faces["ring_x"].send(plan.comm, self.t, self.U.all_values, self.loc)
         reqs += faces["ring_y"].send(plan.comm, self.t, self.V.all_values, self.loc)
-        reqs += faces["edge_x"].send(plan.comm, self.t, self.U.all_values, self.loc)
-        reqs += faces["edge_y"].send(plan.comm, self.t, self.V.all_values, self.loc)
         return reqs
 
     def _window_volumes(self, plan):
@@ -674,26 +586,24 @@ class NestedBarotropic(Coupler):
                     self.clock.recv(plan.comm, buf, plan.coff + tt, plan.tag_r)
                     blk[k, a, b] = buf[0]
                     wgt[k, a, b] = buf[1]
-            if not self.break_rim:
-                vals = blk[:, 0, 0].copy() if r == 1 else ops.restrict(blk, wgt)
-                if r == 1:
-                    vals[wgt[:, 0, 0] <= 0] = np.nan
-                jj, ii = self.loc(mine[:, 0], mine[:, 1])
-                ok = np.isfinite(vals)
-                self.z.all_values[jj[ok], ii[ok]] = vals[ok]
-                if ok.any():  # diagnostic
-                    d = self.H[jj[ok], ii[ok]] + vals[ok]
-                    self.min_depth_rim = min(self.min_depth_rim, float(d.min()))
+            vals = blk[:, 0, 0].copy() if r == 1 else ops.restrict(blk, wgt)
+            if r == 1:
+                vals[wgt[:, 0, 0] <= 0] = np.nan
+            jj, ii = self.loc(mine[:, 0], mine[:, 1])
+            ok = np.isfinite(vals)
+            self.z.all_values[jj[ok], ii[ok]] = vals[ok]
+            if ok.any():  # diagnostic
+                d = self.H[jj[ok], ii[ok]] + vals[ok]
+                self.min_depth_rim = min(self.min_depth_rim, float(d.min()))
         # rim U, V (mean over child faces)
         u = faces["rim_x"].recv(plan.comm, self.t, self.clock)
         v = faces["rim_y"].recv(plan.comm, self.t, self.clock)
-        if not self.break_rim:
-            # only at faces open in this level: a land face keeps no transport (beyond a
-            # curvilinear child's conforming band the child's faces lie elsewhere)
-            for arr, f, val in ((self.U, faces["rim_x"], u), (self.V, faces["rim_y"], v)):
-                fj, fi = self.loc(*f.points(self.t))
-                op = arr.grid.mask.all_values[fj, fi] != 0
-                arr.all_values[fj[op], fi[op]] = val[op]
+        # only at faces open in this level: a land face keeps no transport (beyond a
+        # curvilinear child's conforming band the child's faces lie elsewhere)
+        for arr, f, val in ((self.U, faces["rim_x"], u), (self.V, faces["rim_y"], v)):
+            fj, fi = self.loc(*f.points(self.t))
+            op = arr.grid.mask.all_values[fj, fi] != 0
+            arr.all_values[fj[op], fi[op]] = val[op]
         # volume flux matching
         if fp is None:
             return
@@ -716,33 +626,26 @@ class NestedBarotropic(Coupler):
             oj, oi = self.loc(wf["out"][0][m_in], wf["out"][1][m_in])
             fpi, fci = fp[ins], fc[ins]
             dz = wf["sign"][m_in] * (fpi - fci) / self.area[oj, oi]
-            if not self.break_flux:
-                def apply(oj=oj, oi=oi, dz=dz, m_in=m_in, fci=fci):
-                    np.add.at(self.z.all_values, (oj, oi), dz)
-                    d = np.where(self.wetmask[oj, oi], self.H[oj, oi] + self.z.all_values[oj, oi], np.inf)  # diagnostic
-                    k = int(np.argmin(d))
-                    if d[k] < self.min_depth_corrected:
-                        self.min_depth_corrected = float(d[k])
-                        self.min_depth_corrected_info = (self._k, int(oj[k]), int(oi[k]), float(dz[k]), float(d[k] - dz[k]))
-                    if self.replace_transport:
-                        # the parent continues from the child's mean transport
-                        fj, fi = self.loc(wf["face"][0][m_in], wf["face"][1][m_in])
-                        x = wf["is_x"][m_in]
-                        newU = fci[x] / (self.dyu[fj[x], fi[x]] * self._dt())
-                        newV = fci[~x] / (self.dxv[fj[~x], fi[~x]] * self._dt())
-                        # 3D runs: the transports summed over the macro step for the
-                        # 3D momentum (Ui, Vi) hold this step's own U, V; the volume
-                        # that moved is the child's (the z correction above)
-                        mom = self.sim.momentum
-                        if getattr(mom, "_U_cum", None) is not None and self.sim.runtype > 1:
-                            mom._U_cum[fj[x], fi[x]] += newU - self.U.all_values[fj[x], fi[x]]
-                            mom._V_cum[fj[~x], fi[~x]] += newV - self.V.all_values[fj[~x], fi[~x]]
-                        self.U.all_values[fj[x], fi[x]] = newU
-                        self.V.all_values[fj[~x], fi[~x]] = newV
-                if self.correct_late and self.schedule == "sync":
-                    self._pending.append(apply)
-                else:
-                    apply()
+            np.add.at(self.z.all_values, (oj, oi), dz)
+            d = np.where(self.wetmask[oj, oi], self.H[oj, oi] + self.z.all_values[oj, oi], np.inf)  # diagnostic
+            k = int(np.argmin(d))
+            if d[k] < self.min_depth_corrected:
+                self.min_depth_corrected = float(d[k])
+                self.min_depth_corrected_info = (self._k, int(oj[k]), int(oi[k]), float(dz[k]), float(d[k] - dz[k]))
+            # the parent continues from the child's mean transport
+            fj, fi = self.loc(wf["face"][0][m_in], wf["face"][1][m_in])
+            x = wf["is_x"][m_in]
+            newU = fci[x] / (self.dyu[fj[x], fi[x]] * self._dt())
+            newV = fci[~x] / (self.dxv[fj[~x], fi[~x]] * self._dt())
+            # 3D runs: the transports summed over the macro step for the
+            # 3D momentum (Ui, Vi) hold this step's own U, V; the volume
+            # that moved is the child's (the z correction above)
+            mom = self.sim.momentum
+            if getattr(mom, "_U_cum", None) is not None and self.sim.runtype > 1:
+                mom._U_cum[fj[x], fi[x]] += newU - self.U.all_values[fj[x], fi[x]]
+                mom._V_cum[fj[~x], fi[~x]] += newV - self.V.all_values[fj[~x], fi[~x]]
+            self.U.all_values[fj[x], fi[x]] = newU
+            self.V.all_values[fj[~x], fi[~x]] = newV
             k = int(np.argmax(np.abs(dz)))
             if abs(dz[k]) > self.max_correction:  # diagnostic
                 m = m_in[k]
@@ -753,57 +656,16 @@ class NestedBarotropic(Coupler):
         if up.any():
             np.add.at(self.reg, wf["up"][flist][up], fc[up])
 
-    def _send_corrected_z(self, plan):
-        """After the volume correction: the corrected z (with slopes) at the
-        cells the child's ring is filled from. The child uses it as the start
-        of its next parent step, so ring and parent stay consistent."""
-        z = self.z.all_values
-        reqs = []
-        for (p, tt), (pj, pi, *_rest) in plan.pro.items():
-            if p == self.t:
-                jj, ii = self.loc(pj, pi)
-                sx, sy = ops.limited_slopes_at(z, self.wetmask, jj, ii)
-                buf = np.ascontiguousarray(np.stack([z[jj, ii], sx, sy]))
-                reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=plan.tag_p + TAG_CORRECTED))
-        return reqs
-
-    def _couple_down(self, fps):
-        reqs = []
-        for plan, faces in zip(self.down, self.down_faces):
-            reqs += self._send_snapshot(plan, faces)
-        self.clock.waitall(reqs)
-        for plan, faces, fp in zip(self.down, self.down_faces, fps):
-            self._recv_child(plan, faces, fp)
-        self.clock.halos(self.z, self.U, self.V)
-        if any(fp is not None for fp in fps):
-            reqs = []
-            for plan in self.down:
-                reqs += self._send_corrected_z(plan)
-            self.clock.waitall(reqs)
-
-    def _sync_cross(self, fps, with_parent: bool, fluxes: bool):
-        """exchange "cross": all sends first (state down, rim and fluxes up),
-        then the receives; the children's corrections are applied after the
-        state has gone down."""
-        reqs = []
-        for plan, faces in zip(self.down, self.down_faces):
-            reqs += self._send_snapshot(plan, faces)
-        if with_parent:
-            reqs += self._send_up(fluxes=fluxes, wait=False)
-        for plan, faces, fp in zip(self.down, self.down_faces, fps):
-            self._recv_child(plan, faces, fp)
-        if with_parent:
-            self._snap_old = getattr(self, "_snap", None) if fluxes else None
-            self._snap = self._recv_snapshot()
-            self._set_ring_z(self._snap[0], halos=False)
-            self._set_ring_uv(self._snap[1], self._snap[2], halos=False)
-        if self.down or with_parent:
-            self.clock.halos(self.z, self.U, self.V)
-        self.clock.waitall(reqs)
-
-    def _sync_up_first(self, fps, with_parent: bool, fluxes: bool):
-        """exchange "up_first": up first, then the children, the state down,
-        then the parent's state for the ring."""
+    def _sync(self, fps, with_parent: bool, fluxes: bool):
+        """One sync point, in an order without cycles over the hierarchy: (a) to
+        the parent: restriction and registers (what goes up does not depend on
+        the children); (b) from the children: halo in the hole and flux
+        registers, then flux matching; (c) to the children: this level's
+        corrected state for their rings; (d) from the parent: its state for the
+        ring (what goes down does not depend on the parent). The sweeps up and
+        down do not wait for each other. A level whose children pass fluxes on
+        up (a child touching its edge) sends up after its children."""
+        t0 = MPI.Wtime()
         if not hasattr(self, "_up_after_children"):
             self._up_after_children = any(
                 bool((np.asarray(self.lev.wfaces[plan.child.name]["up"]) >= 0).any()) for plan in self.down)
@@ -824,49 +686,10 @@ class NestedBarotropic(Coupler):
             self._set_ring_z(self._snap[0])
             self._set_ring_uv(self._snap[1], self._snap[2])
         self.clock.waitall(reqs)
-
-    def _sync(self, fps, with_parent: bool, fluxes: bool):
-        """One sync point (schedule "sync"), in an order without cycles over
-        the hierarchy: (a) from the children: halo in the hole and flux
-        registers, then flux matching; (b) to the parent: restriction and
-        registers; (c) from the parent: its (corrected) state for the ring;
-        (d) to the children: this level's state for their rings."""
-        t0 = MPI.Wtime()
-        if self.exchange == "cross" and self._t_start is not None:  # the first sync in the chain order
-            self._sync_cross(fps, with_parent, fluxes)
-        elif self.exchange == "up_first":
-            self._sync_up_first(fps, with_parent, fluxes)
-        else:
-            self._sync_inner(fps, with_parent, fluxes)
         if with_parent and fluxes:
             self._snap_to_restart()
         if self._t_start is not None:
             self.t_sync += MPI.Wtime() - t0
-
-    def _sync_inner(self, fps, with_parent: bool, fluxes: bool):
-        # the values from the children (rim, corrections) and from the parent
-        # (ring) are all set before one halo update of z, U and V: _send_up and
-        # _recv_snapshot use only cells this process owns, _send_snapshot (the
-        # slopes) needs the halos
-        for plan, faces, fp in zip(self.down, self.down_faces, fps):
-            self._recv_child(plan, faces, fp)
-        if with_parent:
-            self._send_up(fluxes=fluxes)
-            self._snap_old = getattr(self, "_snap", None) if fluxes else None
-            self._snap = self._recv_snapshot()
-            self._set_ring_z(self._snap[0], halos=False)
-            self._set_ring_uv(self._snap[1], self._snap[2], halos=False)
-        if self.down or with_parent:
-            self.clock.halos(self.z, self.U, self.V)
-        reqs = []
-        for plan, faces in zip(self.down, self.down_faces):
-            reqs += self._send_snapshot(plan, faces)
-        self.clock.waitall(reqs)
-        if self._pending:  # correct_late: the corrections after the snapshot
-            for apply in self._pending:
-                apply()
-            self._pending = []
-            self.clock.halos(self.z, self.U, self.V)
 
     # --- Coupler hooks -------------------------------------------------------------
 
@@ -908,25 +731,11 @@ class NestedBarotropic(Coupler):
         self._clean_external_after_restart(sim)
         if self.sponge_width > 0.0 and self.up is not None:
             self._set_sponge(sim)
-        if self.schedule == "sync":
-            self._sync([None] * len(self.down), self.up is not None, fluxes=False)
-            if self.up is not None:
-                self._snap_from_restart()  # after a restart: the snapshot before the last sync
-            self.clock.reset()
-            self._t_start = MPI.Wtime()
-            return
+        self._sync([None] * len(self.down), self.up is not None, fluxes=False)
         if self.up is not None:
-            snap = self._recv_snapshot()
-            self._prev = self._new = snap
-            self._set_ring_z(snap[0])
-            self._set_ring_uv(snap[1], snap[2])
-        self._couple_down([None] * len(self.down))
-        if self.up is not None:
-            self._send_up(fluxes=False)
-
-    def before_state_update(self, sim, macro_active):
-        if self.schedule == "sequential" and self.up is not None and self._k % self.lev.time_ratio == 0:
-            self._new = self._recv_snapshot()
+            self._snap_from_restart()  # after a restart: the snapshot before the last sync
+        self.clock.reset()
+        self._t_start = MPI.Wtime()
 
     def on_stage(self, sim, stage, macro_active):
         t0 = MPI.Wtime()
@@ -937,61 +746,29 @@ class NestedBarotropic(Coupler):
     def _on_stage(self, sim, stage, macro_active):
         r = self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
-        if self.schedule == "sync":
-            # ring held at the parent's state of the last sync (external
-            # cells/faces: pyGETM keeps them, set again for safety)
-            ex = self.ring_time == "extrapolate" and self._snap_old is not None
-            if stage == "transports_2d" and self.up is not None:
-                if ex:  # parent U at n-1/2 and n-3/2 -> child half step n + (k+1/2)/r
-                    a = 1.0 + (k + 0.5) / r
-                    self._set_ring_uv(*(ops_interp(self._snap_old[m], self._snap[m], a) for m in (1, 2, 3, 4)))
-                else:
-                    self._set_ring_uv(*self._snap[1:5])
-            elif stage == "elevation":
-                if self.up is not None:
-                    if ex:  # parent z at n and n-1 -> child time n + (k+1)/r
-                        self._set_ring_z(ops_interp(self._snap_old[0], self._snap[0], 1.0 + (k + 1) / r))
-                    else:
-                        self._set_ring_z(self._snap[0])
-                    self._own_edge_fluxes()
-                self._fps = [self._window_volumes(plan) for plan in self.down]
-            return
+        # the ring continued linearly in time from the parent's last two syncs
+        # (until there are two: held at the last one)
+        ex = self._snap_old is not None
         if stage == "transports_2d" and self.up is not None:
-            # parent U lives at n-1/2 and n+1/2: interpolate up to n+1/2,
-            # hold beyond (extrapolation is unstable in deep water)
-            a = min((k + 0.5) / r + 0.5, 1.0)
-            self._set_ring_uv(*(ops_interp(self._prev[m], self._new[m], a) for m in (1, 2, 3, 4)))
+            if ex:  # parent U at n-1/2 and n-3/2 -> child half step n + (k+1/2)/r
+                a = 1.0 + (k + 0.5) / r
+                self._set_ring_uv(*(ops_interp(self._snap_old[m], self._snap[m], a) for m in (1, 2)))
+            else:
+                self._set_ring_uv(*self._snap[1:3])
         elif stage == "elevation":
             if self.up is not None:
-                self._set_ring_z(ops_interp(self._prev[0], self._new[0], (k + 1) / r))
+                if ex:  # parent z at n and n-1 -> child time n + (k+1)/r
+                    self._set_ring_z(ops_interp(self._snap_old[0], self._snap[0], 1.0 + (k + 1) / r))
+                else:
+                    self._set_ring_z(self._snap[0])
                 self._own_edge_fluxes()
             self._fps = [self._window_volumes(plan) for plan in self.down]
-
-    def _recv_corrected_z(self):
-        parts = []
-        for p, v in self._ring:
-            buf = np.empty((3, v[2].size))
-            self.clock.recv(self.up.comm, buf, self.up.poff + p, self.up.tag_p + TAG_CORRECTED)
-            parts.append(buf)
-        return np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
 
     def after_state_update(self, sim, macro_active):
         self._phase.all_values[...] = sim.istep % self._period  # restart state (see _phase_array)
         r = self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
-        if self.schedule == "sync":
-            self._sync(self._fps, self.up is not None and k == r - 1, fluxes=True)
-            self._k += 1
-            return
-        self._couple_down(self._fps)
-        if self.up is not None and k == r - 1:
-            self._send_up()
-            # the parent's z after its volume correction is the start of the
-            # next parent step (and the ring's value now)
-            zc = self._recv_corrected_z()
-            self._new = (zc,) + tuple(self._new[1:])
-            self._set_ring_z(zc)
-            self._prev = self._new
+        self._sync(self._fps, self.up is not None and k == r - 1, fluxes=True)
         self._k += 1
 
     def timing(self) -> dict:

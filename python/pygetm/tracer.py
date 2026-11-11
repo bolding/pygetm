@@ -154,7 +154,7 @@ class TracerCollection(Sequence[Tracer]):
         self._w = grid.array(fill=0.0, z=INTERFACES)
         #: optional per tracer name: (flux_u, flux_v), 3D arrays on the U and V
         #: grid to which advection adds the amount through every face and layer
-        #: (nesting flux matching, :class:`pygetm.nesting.baroclinic.NestedTracers3D`)
+        #: (nesting flux matching, :class:`pygetm.nesting.nested3d.Nested3D`)
         self.face_fluxes: dict = {}
 
         self.Ah = grid.array(

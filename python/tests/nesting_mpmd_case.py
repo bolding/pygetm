@@ -20,7 +20,7 @@ import pygetm
 from pygetm import parallel
 from pygetm.nesting import NestedModel, load_levels
 from pygetm.nesting.runtime import NestingRun
-from pygetm.nesting.barotropic import NestedBarotropic
+from pygetm.nesting.nested2d import Nested2D
 
 LAYOUT = {
     "root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
@@ -57,7 +57,7 @@ def make_sim(lev, domain):
 
 def run(nest, lev, H, dt):
     sim = nest.build_simulation(lambda l, comm: make_domain(l, comm, H), make_sim)
-    cpl = NestedBarotropic(nest, sim)
+    cpl = Nested2D(nest, sim)
     sim.add_coupler(cpl)
     gj, gi = nest.global_indices()
     x = lev.lon0 + (gi + 0.5) * lev.dlon

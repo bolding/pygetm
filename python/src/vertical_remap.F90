@@ -157,7 +157,7 @@ contains
       end do
    end subroutine
 
-   ! The whole z-mode remap of single columns (pygetm.nesting.baroclinic.remap_conc_z with one source column
+   ! The whole z-mode remap of single columns (pygetm.nesting.nested3d.remap_conc_z with one source column
    ! per target, weight 1): source interfaces from the thicknesses hs (surface first), kept at their depths
    ! below the surface, cut at the target's depth D (given, so that it is the same sum as numpy's) and the
    ! bottom source layer extended to it; contents of the target layers (hd) as c_vertical_remap with the

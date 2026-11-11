@@ -3,13 +3,13 @@ between levels whose vertical grids differ (number of layers, coordinate,
 column depth): the first step of the 3D coupling, pygetm-nesting
 docs/plan_21_3d_exchange.md.
 
-:class:`NestedTracers3D` is a :class:`pygetm.simulation.Coupler` attached to
-every level next to :class:`pygetm.nesting.barotropic.NestedBarotropic`
+:class:`Nested3D` is a :class:`pygetm.simulation.Coupler` attached to
+every level next to :class:`pygetm.nesting.nested2d.Nested2D`
 (which keeps coupling z, U, V at every 2D step). It acts at the ``tracers``
 stage of every macro (3D) time step.
 
 **3D sub-stepping:** a child's macro step may be its parent's divided by a whole
-number R (:attr:`NestedTracers3D.ratio_3d`), which follows from the split factors:
+number R (:attr:`Nested3D.ratio_3d`), which follows from the split factors:
 R = parent's split x child's time ratio / child's split (R = 1: all levels share
 the macro step). Everything between the two levels happens once per parent macro
 step, at the sync at the end of the child's R-th macro step. In between the child
@@ -23,22 +23,22 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
 
 * **rim (child -> parent):** the child sends, for each parent cell of the
   rim, its r x r columns (layer thicknesses, concentrations, area; 0 for
-  land). The parent remaps every child column onto its own layers with
-  :func:`pygetm.nesting.vremap.rim_columns_prepare` (the upper ``keep`` of
-  min(D_c, D_p) unstretched, the part below stretched to the parent's depth;
-  concentrations by the child volume each parent layer receives). A uniform
-  field stays uniform. The rim then holds the child's content per child
-  volume; the volumes differ by the elevation the parent's rim gets at the
-  next 2D sync (the 2D sync follows the tracer stage), so the content is
-  exact only up to that.
+  land). The parent remaps them onto its own layers with every interface
+  kept at its depth below the surface (only the bottom layer cut or
+  extended; PPM or PCM inside the layers, the child's ``remap_scheme``),
+  concentrations by the child volume each parent layer receives. A uniform
+  field stays uniform, and flat isopycnals stay flat over a sloping bottom.
+  The rim then holds the child's content per child volume; the volumes
+  differ by the elevation the parent's rim gets at the next 2D sync (the 2D
+  sync follows the tracer stage), so the content is exact only up to that.
 * **ring (parent -> child):** the parent sends the column (thicknesses,
-  concentrations) of the parent cell covering each child ring cell; the
-  child remaps it onto its own layers in that cell (the same stretch, by
-  volume: a uniform field stays uniform). Horizontally piecewise constant
-  (first version), held over the child's next R macro steps (the parent's
-  state of the last sync).
+  concentrations) of the parent cell covering each child ring cell and of its
+  four neighbours; the child remaps them onto its own layers in that cell (as
+  the rim), adds its own vertical detail and limited slopes within the parent
+  cell (``ring_slopes``), and holds or extrapolates it over its next R macro
+  steps (``ring_time``).
 
-* **flux matching (child -> parent, ``flux_matching=True``):** pyGETM's
+* **flux matching (child -> parent):** pyGETM's
   tracer advection adds the amount through every face and layer to arrays
   of this coupler (:attr:`pygetm.tracer.TracerCollection.face_fluxes`).
   The child sends, with the rim, the profiles through its edge faces (r
@@ -50,7 +50,7 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
   parent's own interface are passed upwards, in the parent's layers, as in
   2D.
 
-* **3D transports (child -> parent, ``replace_transport=True``):** at the
+* **3D transports (child -> parent):** at the
   ``momentum_3d`` stage the child sends its layer transports through its
   edge faces (the mean over its R macro steps); the parent remaps them onto its face layers, keeps its own
   column total (which its elevation used) and sets pk, qk there, then
@@ -58,7 +58,7 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
   every layer of the interface, and the flux correction conserves the
   content exactly while keeping uniform fields uniform.
 
-* **ring velocities (parent -> child, ``ring_velocities=True``):** at every
+* **ring velocities (parent -> child):** at every
   sync the parent sends its layer transports and face thicknesses at the
   faces around the child's ring faces (2 per face, linear across and
   constant along the parent faces, as the 2D ring). At its next
@@ -97,6 +97,11 @@ TAG_3D = 1000
 
 # pyGETM's layers run from the bottom (0) to the surface (nz - 1); vremap's
 # columns from the surface down: the messages hold columns surface first.
+
+
+#: fraction of min(D_c, D_p) below the surface kept at its depth when the amounts of the flux
+#: register and the transports are remapped between columns of different depth (the rest stretched)
+KEEP = 0.8
 
 
 def remap_amounts(F, h_src, h_dst, keep=0.0):
@@ -139,23 +144,19 @@ def remap_conc_z(c, h_src, h_dst, w=None, scheme="ppm"):
         return np.where(V > 0.0, C / V, 0.0)
 
 
-def remap_column(c, h_src, h_dst, keep=0.0, z=False, scheme="ppm"):
-    if z:
-        k = vremap._kernel("remap_z")
-        if k is None:
-            return remap_conc_z(c[:, :, None, :], h_src[:, None, :], h_dst, scheme=scheme)
-        hs = np.ascontiguousarray(h_src, dtype=float)
-        hd = np.ascontiguousarray(h_dst, dtype=float)
-        cc = np.ascontiguousarray(c, dtype=float)
-        out = np.empty(cc.shape[:2] + (hd.shape[-1],))
-        k(hs, hd, np.ascontiguousarray(hd.sum(axis=-1)), cc, out, 1 if scheme == "ppm" else 0)  # D as numpy sums it
-        return out
+def remap_column(c, h_src, h_dst, scheme="ppm"):
     """Concentrations ``c [nt, n, ns]`` of columns with thicknesses ``h_src`` onto
-    the layers ``h_dst [n, nd]`` (surface first), the source stretched to the
-    target's depth below ``keep`` x min(depths), by volume (uniform stays uniform);
-    ``z``: interfaces kept at their depths (:func:`remap_conc_z`)."""
-    shared = vremap.rim_columns_prepare(h_src[:, None, :], np.ones((h_src.shape[0], 1)), h_dst, keep=keep)
-    return vremap.rim_columns_apply(shared, c[:, :, None, :], h_src[:, None, :], h_dst, by_volume=True)
+    the layers ``h_dst [n, nd]`` (surface first), every source interface kept at
+    its depth below the surface (:func:`remap_conc_z`), compiled when available."""
+    k = vremap._kernel("remap_z")
+    if k is None:
+        return remap_conc_z(c[:, :, None, :], h_src[:, None, :], h_dst, scheme=scheme)
+    hs = np.ascontiguousarray(h_src, dtype=float)
+    hd = np.ascontiguousarray(h_dst, dtype=float)
+    cc = np.ascontiguousarray(c, dtype=float)
+    out = np.empty(cc.shape[:2] + (hd.shape[-1],))
+    k(hs, hd, np.ascontiguousarray(hd.sum(axis=-1)), cc, out, 1 if scheme == "ppm" else 0)  # D as numpy sums it
+    return out
 
 
 def macro_ratios(levels) -> dict:
@@ -169,13 +170,13 @@ def macro_ratios(levels) -> dict:
         pmacro, psplit = levels[parent][1], levels[parent][2]
         q, rem = divmod(psplit * time_ratio, split)
         if q < 1 or rem != 0 or abs(pmacro - q * macro) > 1e-6 * pmacro:
-            raise ValueError(f"NestedTracers3D: the 3D step of {name} ({macro} s, split {split}, time ratio {time_ratio}) is not"
+            raise ValueError(f"Nested3D: the 3D step of {name} ({macro} s, split {split}, time ratio {time_ratio}) is not"
                              f" the 3D step of its parent {parent} ({pmacro} s, split {psplit}) divided by a whole number")
         ratios[name] = q
     return ratios
 
 
-class NestedTracers3D(Coupler):
+class Nested3D(Coupler):
     """Exchange of 3D tracers (T-grid arrays ``(nz, ny, nx)``) with the parent
     and the children, at every macro time step.
 
@@ -184,73 +185,30 @@ class NestedTracers3D(Coupler):
         sim: the level's simulation
         tracers: names of the tracers (attributes of ``sim``, e.g. "temp",
             "salt") or arrays; default: temp and salt where present
-        keep: fraction of min(D_c, D_p) below the surface that is not
-            stretched in the vertical remap (B''; 0: linear stretch, B)
-        break_ring, break_rim: diagnostics, leave out one direction
+        remap_scheme: "ppm" or "pcm" (see below), per interface
+        ring_slopes: the ring linear within each parent cell (see below)
+        ring_time: "hold" or "extrapolate" (children with 3D sub-stepping)
     """
 
-    def __init__(self, nest: NestingRun, sim, tracers: Optional[Sequence] = None, keep: float = 0.8,
-                 break_ring: bool = False, break_rim: bool = False, flux_matching: bool = True,
-                 flux_form: str = "consistent", replace_transport: bool = True, ring_velocities: bool = True,
-                 ring_detail: bool = True, vertical_map: str = "z", remap_scheme: str = "ppm",
-                 ring_slopes: bool = True, ring_time: str = "hold", limit_correction: bool = True):
+    def __init__(self, nest: NestingRun, sim, tracers: Optional[Sequence] = None, remap_scheme: str = "ppm",
+                 ring_slopes: bool = True, ring_time: str = "hold"):
         self.nest, self.sim = nest, sim
         self.lev = nest.level
         self.t = nest.tile
         self.til = nest.tilings[self.lev.name]
         self.up, self.down = nest.up, nest.down
-        self.keep = keep
-        self.break_ring, self.break_rim = break_ring, break_rim
-        self.break_flux = False
-        self.flux_matching = flux_matching
-        #: correction of the parent cell next to an interface face, layer k
-        #: (amounts F of tracer and V of water through the face, parent p and
-        #: child c over the 3D step; the 2D coupling adds the column's volume
-        #: difference dV = sum_k (V_p - V_c)_k to the parent cell at its own
-        #: concentrations):
-        #: "content": dc_k = sign ((F_p - F_c)_k - c_k dV h_k / D) / vol_k -
-        #: the composite content is conserved, a uniform field does not stay
-        #: uniform (the layers' volume fluxes differ); "consistent" (default):
-        #: dc_k = sign ((F_p - F_c)_k - c_k (V_p - V_c)_k) / vol_k - a uniform
-        #: field stays uniform, the content is conserved up to
-        #: sum_k c_k ((V_p - V_c)_k - dV h_k / D)
-        if flux_form not in ("content", "consistent"):
-            raise ValueError(f"flux_form {flux_form!r}")
-        self.flux_form = flux_form
-        #: at the momentum_3d stage, the parent's layer transports at the window
-        #: faces become the child's (remapped onto the parent's face layers, the
-        #: parent's column total kept), and its vertical velocity is
-        #: recomputed: parent and child then move the same water through every
-        #: layer of the interface, and the tracer correction is exact and keeps
-        #: uniform fields uniform
-        self.replace_transport = replace_transport
-        #: the child's 3D transports at its ring faces from the parent's (sent
-        #: at every sync, set at the child's next momentum_3d stage)
-        self.ring_velocities = ring_velocities
-        #: the ring's profile = the parent's, remapped, + the child's own vertical
-        #: detail: (child's adjacent interior column remapped onto the ring cell's
-        #: layers) - (the same column through the parent's layers and back). The
-        #: parent's layer means cannot carry the child's finer vertical structure;
-        #: without this the ring's stepped profile next to the child's smooth one
-        #: is a horizontal density gradient at the interface (IDEAL V2: spurious
-        #: currents of 1-2 cm/s in a lake at rest, 10x the single-model error).
-        #: Limited to the range of the parent's value and the child's adjacent value
-        self.ring_detail = ring_detail
-        #: remap of concentrations (ring, rim): "z" (default) keeps every interface at
-        #: its depth below the surface and cuts or extends only the bottom layer, so
-        #: flat isopycnals stay flat over a sloping bottom; "stretch": the upper
-        #: ``keep`` of the column at its depth, the rest stretched (the amounts of the
-        #: flux register and the transports are always remapped with the stretch,
-        #: which keeps their sums exactly). IDEAL V2 (lake at rest over a slope):
-        #: "stretch" displaces the pycnocline where the column is shallow
-        if vertical_map not in ("z", "stretch"):
-            raise ValueError(f"vertical_map {vertical_map!r}")
-        self.zmap = vertical_map == "z"
+        #: the stretch of the amounts (flux register, transports) between columns of
+        #: different depth: the upper KEEP of min(D_c, D_p) at its depth, the rest
+        #: stretched; their sums over the layers are kept exactly
+        self.keep = KEEP
         #: reconstruction inside each source layer when concentrations are remapped
-        #: (ring, rim; with vertical_map "z"): "ppm" (default, limited parabola,
+        #: (ring, rim): "ppm" (default, limited parabola,
         #: Colella and Woodward 1984) or "pcm" (constant). PPM carries a thin
         #: pycnocline from coarse layers onto finer ones 5-20x more accurately;
-        #: both keep the content exactly and add no new extrema
+        #: both keep the content exactly and add no new extrema. Per interface: a child
+        #: level's setting is used for its ring and for its rim in the parent (the
+        #: root's own setting is not used). IDEAL V5/V7: PCM makes the exchange's work
+        #: 25-35 % cheaper; the pycnocline next to the interfaces 4-8 % less accurate
         if remap_scheme not in ("ppm", "pcm"):
             raise ValueError(f"remap_scheme {remap_scheme!r}")
         self.scheme = remap_scheme
@@ -292,7 +250,7 @@ class NestedTracers3D(Coupler):
         self.t_wait = 0.0
         self.n_sync = 0
         self.max_ring_change = 0.0
-        #: the flux correction (parent side) without new extrema: the corrections of all
+        #: The flux correction (parent side) is limited, without new extrema: the corrections of all
         #: children at a sync are added per cell and layer, the corrected value is clipped
         #: to the range of the cell, its four neighbours and the layers above and below
         #: (before the correction); the column's net cut-off amount is spread over its
@@ -300,8 +258,7 @@ class NestedTracers3D(Coupler):
         #: is kept per cell and layer (``nest_flux_deferred_<k>``, an amount; restart
         #: state) and added at the next sync. The content is conserved over time (with the deferred amounts, see
         #: :meth:`deferred_content`). Off: the correction as it comes (new extrema of
-        #: 1e-4 in IDEAL V6).
-        self.limit_correction = bool(limit_correction)
+        #: 1e-4 in IDEAL V6 without it).
         self.n_clipped = 0
         self.n_seen_reused = 0  # ring slopes: neighbours' round trips not remapped (the same layers)
         self.max_deferred = 0.0
@@ -375,7 +332,7 @@ class NestedTracers3D(Coupler):
         area or 0 for land); with flux matching, the register of every edge
         face (its layer thicknesses and the amounts per tracer and layer)."""
         reqs = []
-        if self.flux_matching and self._fluxes_ready:
+        if self._fluxes_ready:
             e = self.lev.edge
             for (tt, p), (_, _, fk) in self.up.flx.items():
                 if tt != self.t:
@@ -419,8 +376,6 @@ class NestedTracers3D(Coupler):
             self._recv(self.up.comm, buf, self.up.poff + p, self.up.tag_p + TAG_3D)
             parts.append(buf)
         buf = np.concatenate(parts, axis=2)
-        if self.break_ring:
-            return
         hs = buf[0, 0]  # (n, nzp)
         cs = buf[0, 1:]  # (nt, n, nzp)
         rj, ri = self._rj, self._ri
@@ -429,26 +384,24 @@ class NestedTracers3D(Coupler):
         if not ok.any():
             return
         hs, cs, hd = hs[ok], cs[:, ok], hd[ok]
-        c = remap_column(cs, hs, hd, self.keep, self.zmap, self.scheme)
-        z = self.zmap
+        c = remap_column(cs, hs, hd, self.scheme)
         sc = self.scheme
         # the child's own column next to each ring cell (one cell inwards): its vertical
         # detail for the ring (ring_detail) and the reference for the slopes
         m = np.zeros(c.shape[1], bool)
-        if self.ring_detail or self.ring_slopes:
-            ij, ii_ = self._rin_j[ok], self._rin_i[ok]
-            m = self._rin_ok[ok].copy()
-            if m.any():
-                hin = vremap.gather_columns(self.sim.T.hn.all_values, ij, ii_)
-                cin = np.empty((len(self.tracers),) + hin.shape)
-                for n, f in enumerate(self.tracers):
-                    vremap.gather_columns(f.all_values, ij, ii_, out=cin[n])
-                m &= np.isfinite(hin).all(axis=1) & (hin.sum(axis=1) > 0.0)
+        ij, ii_ = self._rin_j[ok], self._rin_i[ok]
+        m = self._rin_ok[ok].copy()
+        if m.any():
+            hin = vremap.gather_columns(self.sim.T.hn.all_values, ij, ii_)
+            cin = np.empty((len(self.tracers),) + hin.shape)
+            for n, f in enumerate(self.tracers):
+                vremap.gather_columns(f.all_values, ij, ii_, out=cin[n])
+            m &= np.isfinite(hin).all(axis=1) & (hin.sum(axis=1) > 0.0)
 
         def seen_through(h_src):
             """the child's adjacent column as the ring sees it through a parent column with
             layers h_src: remapped onto them and back onto the ring cell's layers"""
-            return remap_column(remap_column(cin[:, m], hin[m], h_src[m], self.keep, z, sc), h_src[m], hd[m], self.keep, z, sc)
+            return remap_column(remap_column(cin[:, m], hin[m], h_src[m], sc), h_src[m], hd[m], sc)
 
         lo = hi = None
         back = None
@@ -472,8 +425,8 @@ class NestedTracers3D(Coupler):
                 H = np.concatenate([hs[m]] + [h[m] for h in hks])[N]
                 Cp = np.concatenate([cs[:, m]] + [buf[k, 1:][:, ok][:, m] for k in range(1, 5)], axis=1)[:, N]
                 idx = np.tile(np.arange(nm), 5)[N]
-                p_ = remap_column(cin[:, m][:, idx], hin[m][idx], H, self.keep, z, sc)  # the child's column on the parent's layers
-                A = remap_column(Cp - p_, H, hd[m][idx], self.keep, z, sc)  # the anomalies on the ring cell's layers
+                p_ = remap_column(cin[:, m][:, idx], hin[m][idx], H, sc)  # the child's column on the parent's layers
+                A = remap_column(Cp - p_, H, hd[m][idx], sc)  # the anomalies on the ring cell's layers
                 st = np.zeros((A.shape[0], 5 * nm, A.shape[2]))
                 st[:, N] = A
                 a0 = st[:, :nm]
@@ -491,7 +444,7 @@ class NestedTracers3D(Coupler):
                 lo_m = cu + np.minimum.reduce([zero] + nb)
                 hi_m = cu + np.maximum.reduce([zero] + nb)
                 c[:, m] = np.clip(cu + sx * self._ring_ox[ok][m][None, :, None] + sy * self._ring_oy[ok][m][None, :, None], lo_m, hi_m)
-                back = cu - a0  # the child's column as the ring sees it through the parent's (for ring_detail)
+                back = cu - a0  # the child's column as the ring sees it through the parent's (for the child detail)
         elif self.ring_slopes or self._extrap:
             # the neighbours on the ring cell's layers (land: the cell itself)
             # all four in one remap (the columns are independent)
@@ -501,7 +454,7 @@ class NestedTracers3D(Coupler):
             nbs = [c.copy() for _ in range(4)]
             if W.any():
                 r = remap_column(np.concatenate([buf[k, 1:][:, ok] for k in range(1, 5)], axis=1)[:, W],
-                                 np.concatenate(hks)[W], np.tile(hd, (4, 1))[W], self.keep, self.zmap, self.scheme)
+                                 np.concatenate(hks)[W], np.tile(hd, (4, 1))[W], self.scheme)
                 pos = np.cumsum(W) - 1
                 n0 = c.shape[1]
                 for k in range(4):
@@ -531,8 +484,8 @@ class NestedTracers3D(Coupler):
                     N = np.concatenate(need)
                     H = np.concatenate([h[m] for h in hk5])[N]
                     idx = np.tile(np.arange(nm), 5)[N]
-                    r = remap_column(remap_column(cin[:, m][:, idx], hin[m][idx], H, self.keep, z, sc),
-                                     H, hd[m][idx], self.keep, z, sc)
+                    r = remap_column(remap_column(cin[:, m][:, idx], hin[m][idx], H, sc),
+                                     H, hd[m][idx], sc)
                     st = np.empty((r.shape[0], 5 * nm, r.shape[2]))
                     st[:, N] = r
                     back = st[:, :nm]
@@ -554,15 +507,14 @@ class NestedTracers3D(Coupler):
                     sx[:, m] = minmod(d[0], d[1])
                     sy[:, m] = minmod(d[2], d[3])
                 c = np.clip(c + sx * self._ring_ox[ok][None, :, None] + sy * self._ring_oy[ok][None, :, None], lo, hi)
-        if self.ring_detail:
-            if m.any():
-                direct = remap_column(cin[:, m], hin[m], hd[m], self.keep, z, sc)
-                if back is None:
-                    back = seen_through(hs)
-                # limited to the range of the parent's value and the child's adjacent one
-                # (layer by layer): the correction adds no new extrema (IDEAL V6)
-                c0 = c[:, m]
-                c[:, m] = np.clip(c0 + direct - back, np.minimum(c0, direct), np.maximum(c0, direct))
+        if m.any():
+            direct = remap_column(cin[:, m], hin[m], hd[m], sc)
+            if back is None:
+                back = seen_through(hs)
+            # limited to the range of the parent's value and the child's adjacent one
+            # (layer by layer): the correction adds no new extrema (IDEAL V6)
+            c0 = c[:, m]
+            c[:, m] = np.clip(c0 + direct - back, np.minimum(c0, direct), np.maximum(c0, direct))
         jo, io = rj[ok], ri[ok]
         for f, cf in zip(self.tracers, c):
             old = vremap.gather_columns(f.all_values, jo, io)
@@ -606,7 +558,7 @@ class NestedTracers3D(Coupler):
         self._deferred = None
         self._acc = None
         self._corr_cells = []
-        if not self.down or not self.flux_matching or not self.limit_correction:
+        if not self.down:
             return
         T = self.sim.T
         attrs = dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType))
@@ -626,7 +578,7 @@ class NestedTracers3D(Coupler):
         return np.array([float(a.all_values[:, h:-h, h:-h][:, self.computed].sum()) for a in self._deferred])
 
     def _apply_corrections(self):
-        """The limited flux correction (see ``limit_correction``) of this sync."""
+        """The limited flux correction of this sync (see the constructor)."""
         if self._deferred is None:
             return
         cells = list(self._corr_cells)
@@ -775,8 +727,6 @@ class NestedTracers3D(Coupler):
             H[k, m] = B[0]
             C[:, k, m] = B[1:]
             W[k, m] = buf[-nk:]
-        if self.break_rim:
-            return
         jj, ii = self.loc(mine[:, 0], mine[:, 1])
         hp = vremap.gather_columns(self.sim.T.hn.all_values, jj, ii)  # (n, nzp), surface first
         ok = (W.sum(axis=1) > 0.0) & self.wet[jj, ii] & (hp.sum(axis=1) > 0.0)
@@ -787,21 +737,10 @@ class NestedTracers3D(Coupler):
         dry = (W <= 0.0) | (H.sum(axis=-1) <= 0.0)
         W = np.where(dry, 0.0, W)
         H = np.where(dry[..., None], hp.sum(axis=-1)[:, None, None] / nzc, H)
-        if self.zmap:
-            c = remap_conc_z(C, H, hp, W, self.scheme)
-            jo, io = jj[ok], ii[ok]
-            for f, cf in zip(self.tracers, c):
-                vremap.scatter_columns(f.all_values, jo, io, cf)
-            return
-        shared = vremap.rim_columns_prepare(H, W, hp, keep=self.keep)
-        # concentrations by the child volume each parent layer receives: the
-        # child columns' content per child volume. Their total volume differs
-        # from the parent cell's by the elevation the parent's rim gets only
-        # at the next 2D sync, so restoring the content exactly in the
-        # parent's volume ("fix") would make a uniform field non-uniform.
-        c = vremap.rim_columns_apply(shared, C, H, hp, by_volume=True)
+        c = remap_conc_z(C, H, hp, W, self.child_scheme[self.down.index(plan)])
+        jo, io = jj[ok], ii[ok]
         for f, cf in zip(self.tracers, c):
-            f.all_values[:, jj[ok], ii[ok]] = cf.T[::-1]
+            vremap.scatter_columns(f.all_values, jo, io, cf)
 
     def _match_fluxes(self, plan, nzc: int):
         flist = plan.faces_of[self.t]
@@ -826,22 +765,17 @@ class NestedTracers3D(Coupler):
         fc = remap_amounts(F, H, np.broadcast_to(hp[:, None, :], H.shape[:2] + hp.shape[-1:]), self.keep).sum(axis=-2)
         ins = wf["inside"][flist]
         m_in = flist[ins]
-        if m_in.size and not self.break_flux:
+        if m_in.size:
             oj, oi = self.loc(wf["out"][0][m_in], wf["out"][1][m_in])
             T = self.sim.T
             vol = (T.hn.all_values[::-1, oj, oi] * T.area.all_values[oj, oi]).T  # (n, nz), surface first
             sign = wf["sign"][m_in][:, None]
             kk = np.arange(self.nz)[::-1]
             dV = self._volume_profiles(*(a[ins] for a in args)) - fc[-1][ins]  # water, parent - child (n, nz)
-            hT = T.hn.all_values[::-1, oj, oi].T
-            frac = hT / np.maximum(hT.sum(axis=1, keepdims=True), 1e-30)
             for n, (f, fl) in enumerate(zip(self.tracers, self.fluxes)):
                 fp = self._face_profiles(fl, *(a[ins] for a in args))
                 c = f.all_values[::-1, oj, oi].T
-                if self.flux_form == "consistent":
-                    amount = fp - fc[n][ins] - c * dV
-                else:
-                    amount = fp - fc[n][ins] - c * dV.sum(axis=1, keepdims=True) * frac
+                amount = fp - fc[n][ins] - c * dV
                 with np.errstate(invalid="ignore", divide="ignore"):
                     dc = np.where(vol > 0.0, sign * amount / vol, 0.0)
                 self.max_correction = max(self.max_correction, float(np.abs(dc).max(initial=0.0)))
@@ -933,7 +867,7 @@ class NestedTracers3D(Coupler):
     # --- 3D transports in the child's ring (parent -> child) ------------------------
 
     def _ring_transfers(self, plan, link_tag):
-        from .barotropic import PointTransfer, ring_faces
+        from .nested2d import PointTransfer, ring_faces
 
         out = {}
         for n, axis in enumerate("xy"):
@@ -1002,19 +936,18 @@ class NestedTracers3D(Coupler):
     def _sync_transports(self, sim):
         t0 = MPI.Wtime()
         reqs = []
-        if self.up is not None and self.replace_transport:
+        if self.up is not None:
             self._add_water_up()
             if self._up_active():
                 reqs = self._send_transports_up()
         changed = False
-        if self.replace_transport:
-            for plan, nzc in zip(self.down, self.child_nz):
-                changed |= self._recv_transports(plan, nzc)
+        for plan, nzc in zip(self.down, self.child_nz):
+            changed |= self._recv_transports(plan, nzc)
         MPI.Request.Waitall(reqs)
-        ring = self.ring_velocities and self.up is not None and self._ring_uv is not None
+        ring = self.up is not None and self._ring_uv is not None
         if ring:
             self._set_ring_uv(sim)
-        if (self.down and self.replace_transport) or ring:
+        if self.down or ring:
             # the simulation then updates the momentum diagnostics (w, velocities,
             # friction, advection, Coriolis) from the replaced transports
             mom = sim.momentum
@@ -1028,15 +961,15 @@ class NestedTracers3D(Coupler):
         t0 = MPI.Wtime()
         reqs = []
         up = self._up_active()
-        if self.flux_matching and self._fluxes_ready and self.up is not None:
+        if self._fluxes_ready and self.up is not None:
             self._own_edge_fluxes()
         if up and not self._up_after_children:
             reqs += self._send_up()
         for plan, nzc in zip(self.down, self.child_nz):
             self._recv_rim(plan, nzc)
-            if self.flux_matching and self._fluxes_ready:
+            if self._fluxes_ready:
                 self._match_fluxes(plan, nzc)
-        if self.down and self.flux_matching and self._fluxes_ready:
+        if self.down and self._fluxes_ready:
             self._apply_corrections()
         if up and self._up_after_children:
             reqs += self._send_up()
@@ -1045,22 +978,18 @@ class NestedTracers3D(Coupler):
                 f.update_halos()
             for plan, tx in zip(self.down, self._ring_tx_down):
                 reqs += self._send_down(plan)
-                if self.ring_velocities:
-                    reqs += self._send_ring_uv(plan, tx)
+                reqs += self._send_ring_uv(plan, tx)
         if up:
-            if self.ring_detail:
-                for f in self.tracers:  # the interior cells next to the ring may lie in the halo
-                    f.update_halos()
+            for f in self.tracers:  # the interior cells next to the ring may lie in the halo
+                f.update_halos()
             self._recv_ring()
-            if self.ring_velocities:
-                self._recv_ring_uv()
+            self._recv_ring_uv()
             for f in self.tracers:
                 f.update_halos()
         MPI.Request.Waitall(reqs)
-        if self.flux_matching:
-            for fl in self.fluxes:
-                fl[0].all_values[...] = 0.0
-                fl[1].all_values[...] = 0.0
+        for fl in self.fluxes:
+            fl[0].all_values[...] = 0.0
+            fl[1].all_values[...] = 0.0
         self.t_sync += MPI.Wtime() - t0
         self.n_sync += 1
 
@@ -1076,17 +1005,20 @@ class NestedTracers3D(Coupler):
         world = self.nest.world
         parent = self.lev.parent.name if self.lev.parent is not None else None
         dts = world.allgather((self.lev.name, float(sim.macrotimestep), int(T.hn.all_values.shape[0]),
-                               len(self.tracers), (self.ring_slopes, self.ring_time), parent, int(sim.split_factor), self.lev.time_ratio))
+                               len(self.tracers), (self.ring_slopes, self.ring_time), parent, int(sim.split_factor), self.lev.time_ratio,
+                               self.scheme))
         # checked for all levels on all processes, so that all stop
         self.ratio_3d = macro_ratios({d[0]: (d[5], d[1], d[6], d[7]) for d in dts}).get(self.lev.name, 1)
         if len({d[3] for d in dts}) != 1:
-            raise ValueError(f"NestedTracers3D: the levels exchange different numbers of tracers: {dts}")
+            raise ValueError(f"Nested3D: the levels exchange different numbers of tracers: {dts}")
         if len({d[4] for d in dts}) != 1:
-            raise ValueError(f"NestedTracers3D: ring_slopes and ring_time must be the same on all levels: {dts}")
+            raise ValueError(f"Nested3D: ring_slopes and ring_time must be the same on all levels: {dts}")
         nz = {d[0]: d[2] for d in dts}
         self.nz = nz[self.lev.name]
         self.parent_nz = nz[self.lev.parent.name] if self.lev.parent is not None else None
         self.child_nz = [nz[plan.child.name] for plan in self.down]
+        # the remap scheme belongs to the interface: the child's decides its ring and its rim in the parent
+        self.child_scheme = [{d[0]: d[8] for d in dts}[plan.child.name] for plan in self.down]
         self._up_after_children = any(
             bool((np.asarray(self.lev.wfaces[plan.child.name]["up"]) >= 0).any()) for plan in self.down)
         self._ring = []
@@ -1102,18 +1034,17 @@ class NestedTracers3D(Coupler):
             self._rin_ok = self.lev.computed[gj, gi]
             self._rin_j, self._rin_i = self.loc(gj, gi)
         self.fluxes = []
-        if self.flux_matching:
-            U, V = sim.U, sim.V
-            for f in self.tracers:
-                fl = (U.array(z=CENTERS, fill=0.0), V.array(z=CENTERS, fill=0.0))
-                sim.tracers.face_fluxes[f.name] = fl
-                self.fluxes.append(fl)
-            if self.up is not None:
-                e = self.lev.edge
-                self._own_edge = self.til.owner(*e["inner"]) == self.t
-            # this level's register: amount per tracer, edge face and layer (surface first)
-            nedge = self.lev.edge["is_x"].size if self.up is not None else 0
-            self.reg = np.zeros((len(self.tracers) + 1, nedge, self.nz))  # tracers, then the water
+        U, V = sim.U, sim.V
+        for f in self.tracers:
+            fl = (U.array(z=CENTERS, fill=0.0), V.array(z=CENTERS, fill=0.0))
+            sim.tracers.face_fluxes[f.name] = fl
+            self.fluxes.append(fl)
+        if self.up is not None:
+            e = self.lev.edge
+            self._own_edge = self.til.owner(*e["inner"]) == self.t
+        # this level's register: amount per tracer, edge face and layer (surface first)
+        nedge = self.lev.edge["is_x"].size if self.up is not None else 0
+        self.reg = np.zeros((len(self.tracers) + 1, nedge, self.nz))  # tracers, then the water
         self._ring_tx_down = [self._ring_transfers(plan, plan.tag_p + TAG_3D + 500) for plan in self.down]
         self._ring_tx = self._ring_transfers(self.up, self.up.tag_p + TAG_3D + 500) if self.up is not None else None
         prev = self._prev_from_restart()  # before the initial sync overwrites the arrays
@@ -1129,7 +1060,7 @@ class NestedTracers3D(Coupler):
         self.n_sync = 0
 
     def on_stage(self, sim, stage, macro_active):
-        if stage == "momentum_3d_transports" and macro_active and (self.replace_transport or self.ring_velocities):
+        if stage == "momentum_3d_transports" and macro_active:
             self._sync_transports(sim)
         elif stage == "momentum_3d" and macro_active and self._extrap and self.up is not None and self.ratio_3d > 1:
             self._extrapolate_ring(sim)

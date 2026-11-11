@@ -19,7 +19,7 @@ import sys
 
 import pygetm
 from pygetm.nesting import NestedModel
-from pygetm.nesting.barotropic import NestedBarotropic
+from pygetm.nesting.nested2d import Nested2D
 
 from nesting_mpmd_case import LAYOUT, depth, make_domain, make_sim
 
@@ -32,7 +32,7 @@ def main():
     dt = model.timestep(20.0)
     nest = model.run
     sim = nest.build_simulation(lambda l, comm: make_domain(l, comm, H), make_sim)
-    sim.add_coupler(NestedBarotropic(nest, sim))
+    sim.add_coupler(Nested2D(nest, sim))
     if mode == "mid":
         sim.output_manager.add_restart(f"{out}/mid_{name}.nc", interval=4)
     elif mode != "from_mid":

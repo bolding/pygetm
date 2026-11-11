@@ -19,7 +19,7 @@ nesting through :class:`NestedModel`:
    level's steps per root step) from every level's own limit.
 4. :attr:`NestedModel.run`: the :class:`pygetm.nesting.runtime.NestingRun`
    (``build_simulation``, then e.g.
-   :class:`pygetm.nesting.barotropic.NestedBarotropic`).
+   :class:`pygetm.nesting.nested2d.Nested2D`).
 
 Steps 2 and 3 are collective over all processes of all components.
 """
@@ -47,12 +47,11 @@ class NestedModel:
     """This process's model in an MPMD nesting run (see module docs)."""
 
     def __init__(self, layout, name: str, comm: Optional[MPI.Comm] = None, halo: int = 2,
-                 root_band: Optional[int] = 0, abort_on_error: bool = True, interface_comms: bool = True):
+                 root_band: Optional[int] = 0, abort_on_error: bool = True):
         self.config = _load_config(layout)
         if name not in self.config:
             raise ValueError(f"level {name!r} is not in the layout ({[k for k in self.config if k != 'config']})")
         self.halo, self.root_band = halo, root_band
-        self.interface_comms = interface_comms
         self.context = split_mpmd(name, comm)
         self.name = name
         #: communicator of this model (pass it to the pyGETM domain)
@@ -155,8 +154,7 @@ class NestedModel:
     def run(self) -> NestingRun:
         """The :class:`NestingRun` of this model (after :meth:`share_depth`)."""
         if self._run is None:
-            self._run = NestingRun(self.levels, context=self.context, abort_on_error=False,
-                                   interface_comms=self.interface_comms)
+            self._run = NestingRun(self.levels, context=self.context, abort_on_error=False)
         return self._run
 
 
