@@ -185,7 +185,7 @@ class NestedTracers3D(Coupler):
                  break_ring: bool = False, break_rim: bool = False, flux_matching: bool = True,
                  flux_form: str = "consistent", replace_transport: bool = True, ring_velocities: bool = True,
                  ring_detail: bool = True, vertical_map: str = "z", remap_scheme: str = "ppm",
-                 ring_slopes: bool = True, ring_time: str = "hold"):
+                 ring_slopes: bool = True, ring_time: str = "hold", limit_correction: bool = True):
         self.nest, self.sim = nest, sim
         self.lev = nest.level
         self.t = nest.tile
@@ -284,7 +284,20 @@ class NestedTracers3D(Coupler):
         self.t_wait = 0.0
         self.n_sync = 0
         self.max_ring_change = 0.0
+        #: the flux correction (parent side) without new extrema: the corrections of all
+        #: children at a sync are added per cell and layer, the corrected value is clipped
+        #: to the range of the cell, its four neighbours and the layers above and below
+        #: (before the correction); the column's net cut-off amount is spread over its
+        #: layers that have room left within their own range, and only what does not fit
+        #: is kept per cell and layer (``nest_flux_deferred_<k>``, an amount; restart
+        #: state) and added at the next sync. The content is conserved over time (with the deferred amounts, see
+        #: :meth:`deferred_content`). Off: the correction as it comes (new extrema of
+        #: 1e-4 in IDEAL V6).
+        self.limit_correction = bool(limit_correction)
+        self.n_clipped = 0
+        self.max_deferred = 0.0
         self._restart_ring_arrays()  # needs the tracers
+        self._deferred_arrays()
 
     # --- helpers -----------------------------------------------------------
 
@@ -518,6 +531,99 @@ class NestedTracers3D(Coupler):
         self._rs3_set = T.array(name="nest_ring3d_old_set", fill=0.0,
                                 long_name="nesting: previous 3D ring stored (1) or not (0)", attrs=dict(attrs))
 
+    def _deferred_arrays(self):
+        """Arrays (part of the model state) with the amounts of the flux correction
+        deferred by the limiter, per tracer (levels with children)."""
+        self._deferred = None
+        self._acc = None
+        self._corr_cells = []
+        if not self.down or not self.flux_matching or not self.limit_correction:
+            return
+        T = self.sim.T
+        attrs = dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType))
+        n = len(self._tracers(self.sim))
+        self._deferred = [T.array(name=f"nest_flux_deferred_{k}", z=CENTERS, fill=0.0,
+                                  long_name=f"nesting: flux correction of tracer {k} deferred by the limiter (amount)",
+                                  attrs=dict(attrs))
+                          for k in range(n)]
+
+    def deferred_content(self) -> np.ndarray:
+        """The deferred amounts of every tracer in the cells this level computes
+        (this process); add them to :meth:`level_content` for conservation."""
+        n = len(self.tracers)
+        if self._deferred is None:
+            return np.zeros(n)
+        h = self.halo
+        return np.array([float(a.all_values[:, h:-h, h:-h][:, self.computed].sum()) for a in self._deferred])
+
+    def _apply_corrections(self):
+        """The limited flux correction (see ``limit_correction``) of this sync."""
+        if self._deferred is None:
+            return
+        cells = list(self._corr_cells)
+        self._corr_cells = []
+        pend = np.zeros(self.wet.shape, bool)
+        for a in self._deferred:
+            pend |= (a.all_values != 0.0).any(axis=0)
+        if pend.any():
+            cells.append(np.nonzero(pend))
+        if not cells:
+            return
+        J = np.concatenate([c[0] for c in cells])
+        I = np.concatenate([c[1] for c in cells])
+        key = np.unique(J * self.wet.shape[1] + I)
+        J, I = key // self.wet.shape[1], key % self.wet.shape[1]
+        T = self.sim.T
+        ny, nx = self.wet.shape
+        vol = T.hn.all_values[:, J, I] * T.area.all_values[J, I]  # (nz, n)
+        ok = vol > 0.0
+        for n, f in enumerate(self.tracers):
+            a = f.all_values
+            c = a[:, J, I]
+            lo, hi = c.copy(), c.copy()
+            for dj, di in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+                j2, i2 = np.clip(J + dj, 0, ny - 1), np.clip(I + di, 0, nx - 1)
+                w = self.wet[j2, i2] & (T.hn.all_values[:, j2, i2] > 0.0)
+                v = np.where(w, a[:, j2, i2], c)
+                lo, hi = np.minimum(lo, v), np.maximum(hi, v)
+            for dk in (-1, 1):  # the layers below and above (layer 0 at the bottom)
+                v = np.roll(c, dk, axis=0)
+                wk = np.roll(ok, dk, axis=0)
+                if dk == -1:
+                    v[-1], wk[-1] = c[-1], True
+                else:
+                    v[0], wk[0] = c[0], True
+                v = np.where(wk, v, c)
+                lo, hi = np.minimum(lo, v), np.maximum(hi, v)
+            acc = self._acc[n][:, J, I]
+            dfr = self._deferred[n].all_values[:, J, I]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                new = np.where(ok, c + acc + dfr / vol, c)
+            lim = np.clip(new, lo, hi)
+            rest = np.where(ok, (new - lim) * vol, 0.0)
+            clipped = ok & (lim != new)
+            # spread the column's net excess over its layers with room left within their range; defer what does not fit
+            E = rest.sum(axis=0)
+            up = np.where(ok, (hi - lim) * vol, 0.0)
+            down = np.where(ok, (lim - lo) * vol, 0.0)
+            room = np.where(E > 0.0, up, down)
+            R = room.sum(axis=0)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                put = np.where(R > 0.0, np.minimum(np.abs(E), R) / R, 0.0)  # fraction of the room used
+                lim = np.where(ok, lim + np.sign(E) * put * room / vol, lim)
+                left = E - np.sign(E) * put * R  # same sign as E
+                same = np.where(rest * E > 0.0, rest, 0.0)
+                S = same.sum(axis=0)
+                rest = np.where(S != 0.0, same * (left / S), 0.0)
+            rest = np.where(ok, rest, dfr)  # a dry cell keeps its deferred amount
+            a[:, J, I] = np.where(ok, lim, c)
+            self._deferred[n].all_values[:, J, I] = rest
+            self._acc[n][:, J, I] = 0.0
+            self.n_clipped += int(clipped.sum())
+            d = ok & (rest != 0.0)
+            if d.any():
+                self.max_deferred = max(self.max_deferred, float(np.abs(rest[d] / vol[d]).max()))
+
     def _prev_to_restart(self):
         if self._rs3 is None or not self._rj.size:
             return
@@ -671,7 +777,14 @@ class NestedTracers3D(Coupler):
                     dc = np.where(vol > 0.0, sign * amount / vol, 0.0)
                 self.max_correction = max(self.max_correction, float(np.abs(dc).max(initial=0.0)))
                 # np.add.at in face order (several faces may share a cell)
-                np.add.at(f.all_values, (kk[None, :], oj[:, None], oi[:, None]), dc)
+                if self._deferred is not None:  # limited: collected, applied after all children
+                    if self._acc is None:
+                        self._acc = [np.zeros_like(g.all_values) for g in self.tracers]
+                    np.add.at(self._acc[n], (kk[None, :], oj[:, None], oi[:, None]), dc)
+                else:
+                    np.add.at(f.all_values, (kk[None, :], oj[:, None], oi[:, None]), dc)
+            if self._deferred is not None:
+                self._corr_cells.append((oj, oi))
         up = ~ins & (wf["up"][flist] >= 0)
         if up.any():
             for n in range(nt):  # tracers and water, in this level's layers
@@ -854,6 +967,8 @@ class NestedTracers3D(Coupler):
             self._recv_rim(plan, nzc)
             if self.flux_matching and self._fluxes_ready:
                 self._match_fluxes(plan, nzc)
+        if self.down and self.flux_matching and self._fluxes_ready:
+            self._apply_corrections()
         if up and self._up_after_children:
             reqs += self._send_up()
         if self.down:
@@ -963,6 +1078,6 @@ class NestedTracers3D(Coupler):
 
     def timing(self) -> dict:
         return dict(ratio_3d=self.ratio_3d, ring_time=self.ring_time, n_extrapolated=getattr(self, "n_extrapolated", 0), sync=self.t_sync, wait=self.t_wait, n_sync=self.n_sync, max_ring_change=self.max_ring_change,
-                    max_correction=self.max_correction, transport=self.t_transport,
+                    max_correction=self.max_correction, n_clipped=self.n_clipped, max_deferred=self.max_deferred, transport=self.t_transport,
                     parts={k.lstrip("_"): v[0] for k, v in self.parts.items()},
                     parts_wait={k.lstrip("_"): v[1] for k, v in self.parts.items()})
