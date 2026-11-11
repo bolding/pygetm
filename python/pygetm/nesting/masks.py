@@ -134,7 +134,8 @@ def close_faces(lev: Level, domain) -> None:
     """Close :attr:`Level.closed_faces` in ``domain`` (the level's domain
     including its band; its supergrid mask, before the grids are built)."""
     cf = getattr(lev, "closed_faces", None)
-    if cf is None or cf["is_x"].size == 0 or domain.mask is None:
+    # domain.mask raises on processes other than the domain's rank 0 (no global mask there)
+    if cf is None or cf["is_x"].size == 0 or getattr(domain, "_mask", None) is None:
         return
     h = lev.band
     fj, fi = cf["face"][0] + h, cf["face"][1] + h

@@ -90,7 +90,8 @@ def main():
         nest = NestingRun(levels, {"root": world.size - 1, "child": 1})
         lev = nest.level
         H = np.where(wets[lev.name], Hs[lev.name], np.nan)
-        dt = 20.0 / lev.steps_per_root
+        us = (20_000_000 // 3) * 3  # as NestedModel.timestep: whole microseconds on all levels (lcm of steps per root step 3)
+        dt = (us // lev.steps_per_root) / 1e6
     z = run(nest, lev, H, dt)
     if z is not None:
         np.save(f"{out}/{mode}_{lev.name}.npy", np.array(z))

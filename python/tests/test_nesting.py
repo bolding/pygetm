@@ -722,13 +722,25 @@ class TestNestingMasks(unittest.TestCase):
         # in the domain mask: the U point closed, its T neighbours still wet
         import types
         hb = root.band
-        dom = types.SimpleNamespace(mask=np.ones((2 * root.extended_shape[0] + 1, 2 * root.extended_shape[1] + 1), int))
+        m = np.ones((2 * root.extended_shape[0] + 1, 2 * root.extended_shape[1] + 1), int)
+        dom = types.SimpleNamespace(mask=m, _mask=m)
         close_faces(root, dom)
         fj, fi = f["face"][0][n] + hb, f["face"][1][n] + hb
         self.assertEqual(dom.mask[2 * fj + 1, 2 * fi + 2], 0)
         self.assertEqual(dom.mask[2 * fj + 1, 2 * fi + 1], 1)
         self.assertEqual(dom.mask[2 * fj + 1, 2 * fi + 3], 1)
         self.assertEqual(int((dom.mask == 0).sum()), 1)
+
+        # a process other than the domain's rank 0: no global mask, and pyGETM's
+        # Domain.mask raises there; nothing to close
+        class _Other:
+            _mask = None
+
+            @property
+            def mask(self):
+                raise AttributeError("'NoneType' object has no attribute 'flags'")
+
+        close_faces(root, _Other())
 
 
     def test_interface_depths(self):
@@ -1121,6 +1133,56 @@ class TestNestingMPMD(unittest.TestCase):
                 b = np.load(os.path.join(out, f"single_{name}.npy"))
                 self.assertTrue(np.isfinite(a).any())
                 self.assertTrue(np.array_equal(a, b, equal_nan=True), name)
+
+
+
+class TestNestingRestart(unittest.TestCase):
+    """A nested 2D run (root on 2 processes, child with time ratio 3) restarted
+    halfway continues bit-identically (nesting_restart_case.py); a restart file
+    written in the middle of a root step is refused. Starts mpiexec itself."""
+
+    def test_restart(self):
+        import os
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        import xarray as xr
+
+        if parallel.MPI.COMM_WORLD.size > 1:
+            self.skipTest("starts its own mpiexec; run serially")
+        mpiexec = shutil.which("mpiexec")
+        if mpiexec is None:
+            self.skipTest("no mpiexec")
+        here = os.path.dirname(os.path.abspath(__file__))
+        case = os.path.join(here, "nesting_restart_case.py")
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
+                env.pop(k)
+        env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
+        py = sys.executable
+        with tempfile.TemporaryDirectory() as out:
+            def launch(mode):
+                cmd = [mpiexec, "-n", "2", py, case, mode, "root", out, ":", "-n", "1", py, case, mode, "child", out]
+                return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+
+            for mode in ("full", "first", "second", "mid"):
+                r = launch(mode)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            for name in ("root", "child"):
+                with xr.open_dataset(os.path.join(out, f"full_{name}.nc")) as a, \
+                        xr.open_dataset(os.path.join(out, f"second_{name}.nc")) as b:
+                    self.assertIn("nest_root_phase", a)
+                    for v in a.data_vars:
+                        x, y = a[v].values, b[v].values
+                        # pyGETM writes NaN on land after a restart, 0 in a continuous run
+                        same = (x == y) | (np.isnan(x) & np.isnan(y)) | (np.isnan(y) & (x == 0.0))
+                        self.assertTrue(same.all(), f"{name} {v}")
+            r = launch("from_mid")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("middle of a root 3D step (child: 2 of 3 steps)", r.stdout + r.stderr)
 
 
 if __name__ == "__main__":

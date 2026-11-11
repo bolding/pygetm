@@ -409,6 +409,7 @@ class NestedBarotropic(Coupler):
         self._k = 0
         self._fps = []
         self._restart_arrays()
+        self._phase_array()
         #: wall-clock monitoring (seconds, this process): time in the syncs
         #: with parent and children (waiting in MPI + the exchange itself)
         #: and the elapsed time since the end of on_start
@@ -458,6 +459,64 @@ class NestedBarotropic(Coupler):
                     for g, n in self._RESTART]
         self._rs_set = T.array(name="nest_ring_old_set", fill=0.0,
                                long_name="nesting: previous ring state stored (1) or not (0)", attrs=dict(attrs))
+
+    def _phase_array(self):
+        """``nest_root_phase``: this level's steps since the last root 3D step
+        (in a 2D run: the last root step), part of the model state. The nesting
+        restarts its sub-step counters, sums and registers at a root 3D step, so
+        a restart file written in the middle of one is refused (:meth:`on_start`).
+        Optional: a file without it (older, or from upstream pyGETM) loads
+        unchecked."""
+        from ..constants import CellType
+
+        self._phase = self.sim.T.array(
+            name="nest_root_phase", fill=0.0,
+            long_name="nesting: steps of this level since the last root 3D step",
+            attrs=dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType)))
+        self._period = 1
+
+    def _clean_external_after_restart(self, sim):
+        """After a restart: the restart file holds NaN where the writer masks the
+        field, which includes this level's EXTERNAL cells inside the domain (a
+        parent's hole, a child's band); a continuous run has finite values there.
+        Nothing computed uses them (the rim and ring are set by the syncs), but
+        diagnostics such as Coriolis are evaluated there and pyGETM's start-up
+        check would stop at the NaN. Set them to 0."""
+        from ..constants import CellType
+
+        if not getattr(sim, "_restarted", False):
+            return
+        for field in sim.output_manager.fields.values():
+            if not field.attrs.get("_part_of_state", False):
+                continue
+            a = getattr(field, "array", field)
+            if not hasattr(a, "grid") or not hasattr(a, "all_values") or a.ndim == 0 or getattr(a, "on_boundary", False):
+                continue
+            ext = a.grid.mask.all_values == CellType.EXTERNAL
+            v = a.all_values
+            bad = ~np.isfinite(v) & np.broadcast_to(ext, v.shape)
+            v[bad] = 0.0
+
+    def _check_restart_phase(self, sim):
+        """Steps of this level per root 3D step (the longest 3D step of all
+        levels: the root's); after a restart, all levels stop if any file was
+        written in the middle of a root 3D step."""
+        from ..constants import RunType
+
+        own = sim.timestep if sim.runtype == RunType.BAROTROPIC_2D else sim.macrotimestep
+        root_macro = self.world.allreduce(float(own), op=MPI.MAX)
+        self._period = max(1, int(round(root_macro / sim.timestep)))
+        phase = 0
+        if getattr(sim, "_restarted", False):
+            v = self._phase.all_values
+            v = v[np.isfinite(v)]  # a restart file holds NaN on land
+            phase = int(round(float(v.max()))) if v.size else 0
+        bad = sorted({(n, p, P) for n, p, P in self.world.allgather((self.lev.name, phase, self._period)) if p})
+        if bad:
+            raise ValueError(
+                "nesting: restart file(s) written in the middle of a root 3D step ("
+                + ", ".join(f"{n}: {p} of {P} steps" for n, p, P in bad)
+                + "); write restarts at whole root 3D steps")
 
     def _restart_points(self):
         return (self._rj, self._ri), (self._rj, self._ri), (self._rj, self._ri), self._ru, self._rv, self._eu, self._ev
@@ -845,6 +904,8 @@ class NestedBarotropic(Coupler):
         self.sponge_max = float(mom.An.all_values[w > 0].max(initial=0.0))
 
     def on_start(self, sim):
+        self._check_restart_phase(sim)
+        self._clean_external_after_restart(sim)
         if self.sponge_width > 0.0 and self.up is not None:
             self._set_sponge(sim)
         if self.schedule == "sync":
@@ -915,6 +976,7 @@ class NestedBarotropic(Coupler):
         return np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
 
     def after_state_update(self, sim, macro_active):
+        self._phase.all_values[...] = sim.istep % self._period  # restart state (see _phase_array)
         r = self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
         if self.schedule == "sync":

@@ -131,13 +131,32 @@ class NestedModel:
             return out
         return mine_H
 
-    def timestep(self, maxdt: float) -> float:
+    def timestep(self, maxdt: float, whole_microseconds: bool = True) -> float:
         """Collective. ``maxdt``: this level's largest stable time step
         (e.g. safety x ``Domain.cfl_check()``). Returns this level's time step:
         the root step (the smallest over levels of maxdt x steps per root
-        step) divided by this level's steps per root step."""
+        step) divided by this level's steps per root step.
+
+        ``whole_microseconds`` (default): the root step is rounded down so that
+        every level's step is a whole number of microseconds. pyGETM advances
+        its model time by the step as a ``datetime.timedelta`` (microseconds),
+        whereas output and restart files hold the time as steps x step: with
+        other steps a restart starts at a slightly different model time than the
+        unbroken run has (0.4 ms after 6 h in NEAB), and forcing read at the
+        model time (a tide, meteorology) differs."""
+        import math
+
         spr = self.level.steps_per_root
         dt_root = self.world.allreduce(float(maxdt) * spr, op=MPI.MIN)
+        if whole_microseconds:
+            lcm = 1
+            for n in set(self.world.allgather(int(spr))):
+                lcm = lcm * n // math.gcd(lcm, n)
+            us = int(math.floor(dt_root * 1e6 / lcm)) * lcm
+            if us <= 0:
+                raise ValueError(f"time step {dt_root} s too small for whole microseconds on all levels")
+            self.dt_root = us / 1e6
+            return (us // spr) / 1e6
         self.dt_root = dt_root
         return dt_root / spr
 
