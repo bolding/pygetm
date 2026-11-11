@@ -131,34 +131,25 @@ class NestedModel:
             return out
         return mine_H
 
-    def timestep(self, maxdt: float, whole_microseconds: bool = True) -> float:
+    def timestep(self, maxdt: float, period: Optional[float] = 3600.0) -> float:
         """Collective. ``maxdt``: this level's largest stable time step
         (e.g. safety x ``Domain.cfl_check()``). Returns this level's time step:
-        the root step (the smallest over levels of maxdt x steps per root
-        step) divided by this level's steps per root step.
+        the root step divided by this level's steps per root step, the root step
+        at most the smallest over levels of maxdt x steps per root step.
 
-        ``whole_microseconds`` (default): the root step is rounded down so that
-        every level's step is a whole number of microseconds. pyGETM advances
-        its model time by the step as a ``datetime.timedelta`` (microseconds),
-        whereas output and restart files hold the time as steps x step: with
-        other steps a restart starts at a slightly different model time than the
-        unbroken run has (0.4 ms after 6 h in NEAB), and forcing read at the
-        model time (a tide, meteorology) differs."""
-        import math
-
+        ``period`` (default an hour): the root step is a simple one, ``period / n``
+        for the smallest whole n that fits and gives every level a whole number
+        of microseconds (:func:`simple_root_step`; e.g. 18 s with children at
+        6 s), so that output at multiples of the period lands on steps and a
+        restart starts at exactly the model time of the unbroken run (pyGETM
+        advances its time by the step as a ``datetime.timedelta``, in
+        microseconds, while its files hold steps x step). ``None``: the root step
+        only rounded down to whole microseconds on all levels."""
         spr = self.level.steps_per_root
-        dt_root = self.world.allreduce(float(maxdt) * spr, op=MPI.MIN)
-        if whole_microseconds:
-            lcm = 1
-            for n in set(self.world.allgather(int(spr))):
-                lcm = lcm * n // math.gcd(lcm, n)
-            us = int(math.floor(dt_root * 1e6 / lcm)) * lcm
-            if us <= 0:
-                raise ValueError(f"time step {dt_root} s too small for whole microseconds on all levels")
-            self.dt_root = us / 1e6
-            return (us // spr) / 1e6
-        self.dt_root = dt_root
-        return dt_root / spr
+        dt_max = self.world.allreduce(float(maxdt) * spr, op=MPI.MIN)
+        sprs = sorted(set(self.world.allgather(int(spr))))
+        self.dt_root = simple_root_step(dt_max, sprs, period)
+        return level_step(self.dt_root, spr)
 
     @property
     def run(self) -> NestingRun:
@@ -167,3 +158,43 @@ class NestedModel:
             self._run = NestingRun(self.levels, context=self.context, abort_on_error=False,
                                    interface_comms=self.interface_comms)
         return self._run
+
+
+def _lcm(values) -> int:
+    import math
+
+    out = 1
+    for n in values:
+        out = out * int(n) // math.gcd(out, int(n))
+    return out
+
+
+def simple_root_step(dt_max: float, steps_per_root, period: Optional[float] = 3600.0) -> float:
+    """The root step for :meth:`NestedModel.timestep`: the largest ``period / n``
+    (n whole) not above ``dt_max`` for which every level's step (root step / its
+    steps per root step) is a whole number of microseconds; with ``period``
+    None the largest whole number of microseconds that is a multiple of all
+    steps per root step."""
+    import math
+
+    lcm = _lcm(steps_per_root)
+    if period is None:
+        us = int(math.floor(dt_max * 1e6 / lcm)) * lcm
+        if us <= 0:
+            raise ValueError(f"time step {dt_max} s too small for whole microseconds on all levels")
+        return us / 1e6
+    P = int(round(float(period) * 1e6))  # microseconds
+    n = max(1, int(math.ceil(P / (dt_max * 1e6) - 1e-9)))
+    while n <= P:
+        if P % n == 0 and (P // n) % lcm == 0:
+            return (P // n) / 1e6
+        n += 1
+    raise ValueError(f"no simple time step up to {dt_max} s for period {period} s and steps per root step {steps_per_root}")
+
+
+def level_step(dt_root: float, steps_per_root: int) -> float:
+    """A level's step from the root step (whole microseconds when the root step
+    is a multiple of steps_per_root microseconds)."""
+    us = int(round(dt_root * 1e6))
+    return (us // int(steps_per_root)) / 1e6 if us % int(steps_per_root) == 0 else dt_root / steps_per_root
+

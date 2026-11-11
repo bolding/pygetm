@@ -78,7 +78,7 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
   state. The vertical structure of the ring velocities is held (their column totals
   follow the 2D ring, which is extrapolated).
 
-Limited slopes in the ring are an option (``ring_slopes``).
+The ring is linear within each parent cell, with limited slopes (``ring_slopes``, default; off: constant per parent cell).
 """
 
 from typing import List, Optional, Sequence
@@ -185,7 +185,7 @@ class NestedTracers3D(Coupler):
                  break_ring: bool = False, break_rim: bool = False, flux_matching: bool = True,
                  flux_form: str = "consistent", replace_transport: bool = True, ring_velocities: bool = True,
                  ring_detail: bool = True, vertical_map: str = "z", remap_scheme: str = "ppm",
-                 ring_slopes: bool = False, ring_time: str = "hold"):
+                 ring_slopes: bool = True, ring_time: str = "hold"):
         self.nest, self.sim = nest, sim
         self.lev = nest.level
         self.t = nest.tile
@@ -247,13 +247,15 @@ class NestedTracers3D(Coupler):
             raise ValueError(f"remap_scheme {remap_scheme!r}")
         self.scheme = remap_scheme
         #: the ring horizontally linear within each parent cell (as the 2D ring's
-        #: elevation): the parent also sends the columns of the four neighbours of
-        #: every ring source cell; the child remaps all five onto the ring cell's own
-        #: layers and takes minmod-limited slopes layer by layer (zero towards land).
-        #: Flat isopycnals give no slope; no new extrema. Without it the ring is
-        #: piecewise constant per parent cell, with steps at the parent cells' edges
-        #: where the child's interior is smooth (IDEAL V2: the strait's largest
-        #: spurious current at a block edge next to a wall). The same on all levels.
+        #: elevation; default): the parent also sends the columns of the four
+        #: neighbours of every ring source cell; the child remaps all five onto the
+        #: ring cell's own layers and takes minmod-limited slopes layer by layer of
+        #: their anomalies against the child's adjacent column seen through each
+        #: column's layers (see :meth:`_recv_ring`), within the five columns' range.
+        #: Without it the ring is piecewise constant per parent cell, with steps at the
+        #: parent cells' edges. IDEAL V6 (a dye front) against one model at the shelf's
+        #: 1 km: the depth-mean dye error 45 % smaller on the shelf and in the strait;
+        #: V2 (at rest) about as without. The same on all levels.
         self.ring_slopes = bool(ring_slopes)
         #: the ring between two syncs of a child with 3D sub-stepping: "hold" or
         #: "extrapolate" (see the module's description). The same on all levels
@@ -406,27 +408,12 @@ class NestedTracers3D(Coupler):
             return
         hs, cs, hd = hs[ok], cs[:, ok], hd[ok]
         c = remap_column(cs, hs, hd, self.keep, self.zmap, self.scheme)
-        lo = hi = None
-        if self.ring_slopes or self._extrap:
-            # the neighbours on the ring cell's layers; minmod slopes per layer, zero towards land
-            nbs = []
-            for k in range(1, 5):
-                hk, ck = buf[k, 0][ok], buf[k, 1:][:, ok]
-                wk = hk.sum(axis=1) > 0.0
-                ck_d = np.empty_like(c)
-                ck_d[:, ~wk] = c[:, ~wk]
-                if wk.any():
-                    ck_d[:, wk] = remap_column(ck[:, wk], hk[wk], hd[wk], self.keep, self.zmap, self.scheme)
-                nbs.append(np.where(wk[None, :, None], ck_d, c))
-            cw, ce, cs_, cn = nbs
-            if self._extrap:  # the limiter's range (land neighbours count as the cell itself)
-                lo = np.minimum.reduce([c] + nbs)
-                hi = np.maximum.reduce([c] + nbs)
-            if self.ring_slopes:
-                sx = minmod(c - cw, ce - c)
-                sy = minmod(c - cs_, cn - c)
-                c = c + sx * self._ring_ox[ok][None, :, None] + sy * self._ring_oy[ok][None, :, None]
-        if self.ring_detail:
+        z = self.zmap
+        sc = self.scheme
+        # the child's own column next to each ring cell (one cell inwards): its vertical
+        # detail for the ring (ring_detail) and the reference for the slopes
+        m = np.zeros(c.shape[1], bool)
+        if self.ring_detail or self.ring_slopes:
             ij, ii_ = self._rin_j[ok], self._rin_i[ok]
             m = self._rin_ok[ok].copy()
             if m.any():
@@ -435,10 +422,61 @@ class NestedTracers3D(Coupler):
                 for n, f in enumerate(self.tracers):
                     vremap.gather_columns(f.all_values, ij, ii_, out=cin[n])
                 m &= np.isfinite(hin).all(axis=1) & (hin.sum(axis=1) > 0.0)
-                z = self.zmap
-                sc = self.scheme
+
+        def seen_through(h_src):
+            """the child's adjacent column as the ring sees it through a parent column with
+            layers h_src: remapped onto them and back onto the ring cell's layers"""
+            return remap_column(remap_column(cin[:, m], hin[m], h_src[m], self.keep, z, sc), h_src[m], hd[m], self.keep, z, sc)
+
+        lo = hi = None
+        back = None
+        if self.ring_slopes or self._extrap:
+            # the neighbours on the ring cell's layers (land: the cell itself)
+            nbs, wks, hks = [], [], []
+            for k in range(1, 5):
+                hk, ck = buf[k, 0][ok], buf[k, 1:][:, ok]
+                wk = hk.sum(axis=1) > 0.0
+                ck_d = np.empty_like(c)
+                ck_d[:, ~wk] = c[:, ~wk]
+                if wk.any():
+                    ck_d[:, wk] = remap_column(ck[:, wk], hk[wk], hd[wk], self.keep, self.zmap, self.scheme)
+                nbs.append(np.where(wk[None, :, None], ck_d, c))
+                wks.append(wk)
+                hks.append(hk)
+            lo = np.minimum.reduce([c] + nbs)  # the range of the five columns (land: the cell itself)
+            hi = np.maximum.reduce([c] + nbs)
+            if self.ring_slopes:
+                # minmod slopes per layer of the anomalies: each parent column minus the child's
+                # adjacent column seen through that parent column's layers. The remap's errors
+                # (coarse layers of other depths; a horizontally uniform field) are the same in
+                # both and cancel; a one-sided difference counts only in layers above the bottom
+                # of the neighbour, the ring cell and the child's column, and is zero towards land
+                # or where the child has no adjacent column. The result stays within the range of
+                # the five columns. (Without the anomalies: slopes of 0.04-0.08 C per parent cell
+                # in IDEAL V2 at rest, 8-11x larger.)
+                sx = np.zeros_like(c)
+                sy = np.zeros_like(c)
+                if m.any():
+                    back = seen_through(hs)
+                    a0 = c[:, m] - back
+                    zb = np.cumsum(hd[m], axis=1)
+                    dmax = np.minimum(hd[m].sum(axis=1), hin[m].sum(axis=1))
+                    d = []
+                    for k in range(4):
+                        hk = np.where(wks[k][:, None], hks[k], hs)
+                        ak = nbs[k][:, m] - seen_through(hk)
+                        dk = (ak - a0) if k in (1, 3) else (a0 - ak)  # E, N: forward; W, S: backward
+                        lim = np.minimum(dmax, hk[m].sum(axis=1))
+                        dk = np.where((zb <= lim[:, None] + 1e-9)[None] & wks[k][m][None, :, None], dk, 0.0)
+                        d.append(dk)
+                    sx[:, m] = minmod(d[0], d[1])
+                    sy[:, m] = minmod(d[2], d[3])
+                c = np.clip(c + sx * self._ring_ox[ok][None, :, None] + sy * self._ring_oy[ok][None, :, None], lo, hi)
+        if self.ring_detail:
+            if m.any():
                 direct = remap_column(cin[:, m], hin[m], hd[m], self.keep, z, sc)
-                back = remap_column(remap_column(cin[:, m], hin[m], hs[m], self.keep, z, sc), hs[m], hd[m], self.keep, z, sc)
+                if back is None:
+                    back = seen_through(hs)
                 # limited to the range of the parent's value and the child's adjacent one
                 # (layer by layer): the correction adds no new extrema (IDEAL V6)
                 c0 = c[:, m]
