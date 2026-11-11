@@ -184,7 +184,10 @@ class Nested3D(Coupler):
         nest: the level's :class:`NestingRun`
         sim: the level's simulation
         tracers: names of the tracers (attributes of ``sim``, e.g. "temp",
-            "salt") or arrays; default: temp and salt where present
+            "salt") or arrays; default: temp and salt where present and all of
+            FABM's pelagic state variables. FABM's 2D (bottom and surface) state
+            variables need no exchange: they do not move horizontally, and FABM
+            computes only in the cells a level computes (not in its ring or hole)
         remap_scheme: "ppm" or "pcm" (see below), per interface
         ring_slopes: the ring linear within each parent cell (see below)
         ring_time: "hold" or "extrapolate" (children with 3D sub-stepping)
@@ -287,7 +290,9 @@ class Nested3D(Coupler):
     def _tracers(self, sim):
         if self._tracer_spec is None:
             names = [n for n in ("temp", "salt") if getattr(sim, n, None) is not None]
-            return [getattr(sim, n) for n in names]
+            fabm = getattr(sim, "fabm", None)
+            pelagic = [fabm._variable2array[v] for v in fabm.model.interior_state_variables] if fabm else []
+            return [getattr(sim, n) for n in names] + pelagic
         return [getattr(sim, n) if isinstance(n, str) else n for n in self._tracer_spec]
 
     def _up_active(self) -> bool:

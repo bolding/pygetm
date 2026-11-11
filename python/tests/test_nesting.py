@@ -1052,6 +1052,45 @@ class TestNestingMPMD(unittest.TestCase):
 
 
 
+@unittest.skipUnless(__import__("os").environ.get("PYGETM_TEST_FABM"), "FABM tests on demand: PYGETM_TEST_FABM=1")
+class TestNestingFABM(unittest.TestCase):
+    """Two levels in 3D with FABM (nesting_fabm_case.py: npzd + benthic predator, a bottom state variable):
+    Nested3D exchanges FABM's pelagic state by default, nitrogen crosses the interface, and the total over
+    both levels is conserved. On demand only (PYGETM_TEST_FABM=1). Starts mpiexec itself."""
+
+    def test_fabm_conserved(self):
+        import os
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        if parallel.MPI.COMM_WORLD.size > 1:
+            self.skipTest("starts its own mpiexec; run serially")
+        mpiexec = shutil.which("mpiexec")
+        if mpiexec is None:
+            self.skipTest("no mpiexec")
+        here = os.path.dirname(os.path.abspath(__file__))
+        case = os.path.join(here, "nesting_fabm_case.py")
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
+                env.pop(k)
+        env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
+        py = sys.executable
+        with tempfile.TemporaryDirectory() as out:
+            cmd = [mpiexec, "-n", "2", py, case, "root", out, ":", "-n", "1", py, case, "child", out]
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            a, b = (np.load(os.path.join(out, f"{n}.npz")) for n in ("root", "child"))
+            for name in ("npzd_nut", "npzd_phy", "npzd_zoo", "npzd_det"):
+                self.assertIn(name, list(b["tracers"]))
+            total = a["nitrogen"] + b["nitrogen"]
+            child = b["nitrogen"]
+            self.assertGreater(abs(child[-1] - child[0]) / child[0], 1e-6)  # nitrogen crossed the interface
+            self.assertLess(np.abs(total - total[0]).max() / total[0], 1e-7)
+
+
 class TestNestingRestart(unittest.TestCase):
     """A nested 2D run (root on 2 processes, child with time ratio 3) restarted
     halfway continues bit-identically (nesting_restart_case.py); a restart file
