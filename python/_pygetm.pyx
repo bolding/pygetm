@@ -32,6 +32,7 @@ cdef extern void grid_interp_xy(int nx1, int ny1, int nx2, int ny2, int nz, cons
 cdef extern void c_horizontal_filter(int nx, int ny, int nz, int halox, int haloy, int* mask, double w, const double* var) nogil
 cdef extern void c_vertical_filter(int nx, int ny, int nz, int halox, int haloy, int n, int* mask, double w, const double* var) nogil
 cdef extern void c_vertical_remap(int n, int ns, int nd, int nt, int scheme, const double* zs, const double* zd, const double* h, const double* c, double* out) nogil
+cdef extern void c_remap_z(int n, int ns, int nd, int nt, int scheme, const double* hs, const double* hd, const double* D, const double* c, double* out) nogil
 cdef extern void c_gather_columns(int nx, int ny, int nz, const double* arr, int n, const int* jj, const int* ii, double* out) nogil
 cdef extern void c_scatter_columns(int nx, int ny, int nz, double* arr, int n, const int* jj, const int* ii, const double* vals) nogil
 cdef extern void c_gradient_x(int nx1, int ny1, int nx2, int ny2, int nz, const double* source, const double* idx, double* target, int ioffset, int joffset) nogil
@@ -233,6 +234,23 @@ def vertical_remap(const double[:,::1] zs not None, const double[:,::1] zd not N
         return
     with nogil:
         c_vertical_remap(n, ns, nd, nt, scheme, &zs[0,0], &zd[0,0], &h[0,0], &c[0,0,0], &out[0,0,0])
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def remap_z(const double[:,::1] hs not None, const double[:,::1] hd not None, const double[::1] D not None, const double[:,:,::1] c not None, double[:,:,::1] out not None, int scheme=0):
+    """Concentrations on the target layers of n single columns, interfaces kept at their depths
+    (pygetm.nesting.baroclinic.remap_conc_z with one source column each): hs (n, ns) and hd (n, nd)
+    the source and target thicknesses (surface first), D (n) the target depths, c (nt, n, ns), out
+    (nt, n, nd); scheme 0: PCM, 1: PPM."""
+    cdef int n = <int>hs.shape[0], ns = <int>hs.shape[1], nd = <int>hd.shape[1], nt = <int>c.shape[0]
+    if hd.shape[0] != n or D.shape[0] != n or c.shape[1] != n or c.shape[2] != ns:
+        raise ValueError("remap_z: inconsistent shapes")
+    if out.shape[0] != nt or out.shape[1] != n or out.shape[2] != nd:
+        raise ValueError("remap_z: out has the wrong shape")
+    if n == 0 or nt == 0:
+        return
+    with nogil:
+        c_remap_z(n, ns, nd, nt, scheme, &hs[0,0], &hd[0,0], &D[0], &c[0,0,0], &out[0,0,0])
 
 @cython.boundscheck(False)
 @cython.wraparound(False)

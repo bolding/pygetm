@@ -157,6 +157,96 @@ contains
       end do
    end subroutine
 
+   ! The whole z-mode remap of single columns (pygetm.nesting.baroclinic.remap_conc_z with one source column
+   ! per target, weight 1): source interfaces from the thicknesses hs (surface first), kept at their depths
+   ! below the surface, cut at the target's depth D (given, so that it is the same sum as numpy's) and the
+   ! bottom source layer extended to it; contents of the target layers (hd) as c_vertical_remap with the
+   ! effective thicknesses; concentrations = contents / volumes (the volumes as the PCM contents of 1), 0
+   ! where a target layer receives no volume. Arrays (C order): hs(n, ns), hd(n, nd), D(n), c(nt, n, ns),
+   ! out(nt, n, nd). The same numbers as the numpy path, in one pass and without temporaries.
+   subroutine c_remap_z(n, ns, nd, nt, scheme, hs, hd, D, c, out) bind(c)
+      integer(c_int), intent(in), value :: n, ns, nd, nt, scheme
+      real(c_double), intent(in) :: hs(ns, n), hd(nd, n), D(n), c(ns, n, nt)
+      real(c_double), intent(inout) :: out(nd, n, nt)
+
+      real(c_double) :: zs(ns + 1), zd(nd + 1), h(ns), one(ns), V(nd), aL(ns), aR(ns)
+      real(c_double) :: Qz(nd + 1), Qbase, Qtot, hk, f, z, dA_, a6
+      integer :: i, t, m, j, k, pass
+
+      one = 1.0_c_double
+      do i = 1, n
+         zs(1) = 0.0_c_double
+         do k = 1, ns
+            zs(k + 1) = zs(k) + hs(k, i)
+         end do
+         do k = 1, ns + 1
+            zs(k) = min(zs(k), D(i))
+         end do
+         zs(ns + 1) = D(i)
+         do k = 1, ns
+            h(k) = zs(k + 1) - zs(k)
+         end do
+         zd(1) = 0.0_c_double
+         do k = 1, nd
+            zd(k + 1) = zd(k) + hd(k, i)
+         end do
+         ! pass 0: the volumes (PCM contents of 1); then the contents of every tracer
+         do pass = 0, nt
+            t = pass
+            if (pass > 0 .and. scheme == 1) call ppm_edges(ns, c(:, i, t), h, aL, aR)
+            if (pass == 0) then
+               Qtot = sum(one * h)
+            else
+               Qtot = sum(c(:, i, t) * h)
+            end if
+            j = 1
+            Qbase = 0.0_c_double
+            do m = 1, nd + 1
+               z = zd(m)
+               do while (j < ns)
+                  if (zs(j + 1) > z) exit
+                  if (pass == 0) then
+                     Qbase = Qbase + one(j) * h(j)
+                  else
+                     Qbase = Qbase + c(j, i, t) * h(j)
+                  end if
+                  j = j + 1
+               end do
+               hk = zs(j + 1) - zs(j)
+               if (hk > 0.0_c_double) then
+                  f = min(max((z - zs(j)) / hk, 0.0_c_double), 1.0_c_double)
+               else
+                  f = 0.0_c_double
+               end if
+               if (pass == 0) then
+                  Qz(m) = Qbase + f * one(j) * h(j)
+               else if (scheme == 1) then
+                  dA_ = aR(j) - aL(j)
+                  a6 = 6.0_c_double * (c(j, i, t) - 0.5_c_double * (aL(j) + aR(j)))
+                  Qz(m) = Qbase + h(j) * (aL(j) * f + dA_ * f * f / 2 + a6 * (f * f / 2 - f * f * f / 3))
+               else
+                  Qz(m) = Qbase + f * c(j, i, t) * h(j)
+               end if
+            end do
+            Qz(1) = 0.0_c_double
+            Qz(nd + 1) = Qtot
+            if (pass == 0) then
+               do m = 1, nd
+                  V(m) = Qz(m + 1) - Qz(m)
+               end do
+            else
+               do m = 1, nd
+                  if (V(m) > 0.0_c_double) then
+                     out(m, i, t) = (Qz(m + 1) - Qz(m)) / V(m)
+                  else
+                     out(m, i, t) = 0.0_c_double
+                  end if
+               end do
+            end if
+         end do
+      end do
+   end subroutine
+
    ! Columns of a 3D array (pyGETM's all_values: C order (nz, ny, nx), Fortran (nx, ny, nz), layer 1 at
    ! the bottom) at n cells (0-based local indices jj, ii), surface first: out(k, m) = arr(i, j, nz + 1 - k),
    ! that is numpy's arr[::-1, jj, ii].T as one C-contiguous (n, nz) block, without temporaries.

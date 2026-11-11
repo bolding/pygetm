@@ -141,7 +141,15 @@ def remap_conc_z(c, h_src, h_dst, w=None, scheme="ppm"):
 
 def remap_column(c, h_src, h_dst, keep=0.0, z=False, scheme="ppm"):
     if z:
-        return remap_conc_z(c[:, :, None, :], h_src[:, None, :], h_dst, scheme=scheme)
+        k = vremap._kernel("remap_z")
+        if k is None:
+            return remap_conc_z(c[:, :, None, :], h_src[:, None, :], h_dst, scheme=scheme)
+        hs = np.ascontiguousarray(h_src, dtype=float)
+        hd = np.ascontiguousarray(h_dst, dtype=float)
+        cc = np.ascontiguousarray(c, dtype=float)
+        out = np.empty(cc.shape[:2] + (hd.shape[-1],))
+        k(hs, hd, np.ascontiguousarray(hd.sum(axis=-1)), cc, out, 1 if scheme == "ppm" else 0)  # D as numpy sums it
+        return out
     """Concentrations ``c [nt, n, ns]`` of columns with thicknesses ``h_src`` onto
     the layers ``h_dst [n, nd]`` (surface first), the source stretched to the
     target's depth below ``keep`` x min(depths), by volume (uniform stays uniform);
@@ -295,6 +303,7 @@ class NestedTracers3D(Coupler):
         #: 1e-4 in IDEAL V6).
         self.limit_correction = bool(limit_correction)
         self.n_clipped = 0
+        self.n_seen_reused = 0  # ring slopes: neighbours' round trips not remapped (the same layers)
         self.max_deferred = 0.0
         self._restart_ring_arrays()  # needs the tracers
         self._deferred_arrays()
@@ -445,17 +454,19 @@ class NestedTracers3D(Coupler):
         back = None
         if self.ring_slopes or self._extrap:
             # the neighbours on the ring cell's layers (land: the cell itself)
-            nbs, wks, hks = [], [], []
-            for k in range(1, 5):
-                hk, ck = buf[k, 0][ok], buf[k, 1:][:, ok]
-                wk = hk.sum(axis=1) > 0.0
-                ck_d = np.empty_like(c)
-                ck_d[:, ~wk] = c[:, ~wk]
-                if wk.any():
-                    ck_d[:, wk] = remap_column(ck[:, wk], hk[wk], hd[wk], self.keep, self.zmap, self.scheme)
-                nbs.append(np.where(wk[None, :, None], ck_d, c))
-                wks.append(wk)
-                hks.append(hk)
+            # all four in one remap (the columns are independent)
+            hks = [buf[k, 0][ok] for k in range(1, 5)]
+            wks = [hk.sum(axis=1) > 0.0 for hk in hks]
+            W = np.concatenate(wks)
+            nbs = [c.copy() for _ in range(4)]
+            if W.any():
+                r = remap_column(np.concatenate([buf[k, 1:][:, ok] for k in range(1, 5)], axis=1)[:, W],
+                                 np.concatenate(hks)[W], np.tile(hd, (4, 1))[W], self.keep, self.zmap, self.scheme)
+                pos = np.cumsum(W) - 1
+                n0 = c.shape[1]
+                for k in range(4):
+                    sel = W[k * n0:(k + 1) * n0]
+                    nbs[k][:, sel] = r[:, pos[k * n0:(k + 1) * n0][sel]]
             lo = np.minimum.reduce([c] + nbs)  # the range of the five columns (land: the cell itself)
             hi = np.maximum.reduce([c] + nbs)
             if self.ring_slopes:
@@ -470,14 +481,32 @@ class NestedTracers3D(Coupler):
                 sx = np.zeros_like(c)
                 sy = np.zeros_like(c)
                 if m.any():
-                    back = seen_through(hs)
+                    # the child's column seen through the ring cell's parent column and its four neighbours,
+                    # in two remaps of the stacked columns; a neighbour with exactly the ring cell's parent
+                    # layers sees it the same way (the same numbers), so only the others are remapped
+                    hk5 = [hs] + [np.where(wks[k][:, None], hks[k], hs) for k in range(4)]
+                    nm = int(m.sum())
+                    hsm = hs[m]
+                    need = [np.ones(nm, bool)] + [~(h[m] == hsm).all(axis=1) for h in hk5[1:]]
+                    N = np.concatenate(need)
+                    H = np.concatenate([h[m] for h in hk5])[N]
+                    idx = np.tile(np.arange(nm), 5)[N]
+                    r = remap_column(remap_column(cin[:, m][:, idx], hin[m][idx], H, self.keep, z, sc),
+                                     H, hd[m][idx], self.keep, z, sc)
+                    st = np.empty((r.shape[0], 5 * nm, r.shape[2]))
+                    st[:, N] = r
+                    back = st[:, :nm]
+                    for k in range(1, 5):
+                        same = ~need[k]
+                        st[:, k * nm:(k + 1) * nm][:, same] = back[:, same]
+                    self.n_seen_reused += int((~N).sum())
                     a0 = c[:, m] - back
                     zb = np.cumsum(hd[m], axis=1)
                     dmax = np.minimum(hd[m].sum(axis=1), hin[m].sum(axis=1))
                     d = []
                     for k in range(4):
-                        hk = np.where(wks[k][:, None], hks[k], hs)
-                        ak = nbs[k][:, m] - seen_through(hk)
+                        hk = hk5[k + 1]
+                        ak = nbs[k][:, m] - st[:, (k + 1) * nm:(k + 2) * nm]
                         dk = (ak - a0) if k in (1, 3) else (a0 - ak)  # E, N: forward; W, S: backward
                         lim = np.minimum(dmax, hk[m].sum(axis=1))
                         dk = np.where((zb <= lim[:, None] + 1e-9)[None] & wks[k][m][None, :, None], dk, 0.0)
@@ -1078,6 +1107,6 @@ class NestedTracers3D(Coupler):
 
     def timing(self) -> dict:
         return dict(ratio_3d=self.ratio_3d, ring_time=self.ring_time, n_extrapolated=getattr(self, "n_extrapolated", 0), sync=self.t_sync, wait=self.t_wait, n_sync=self.n_sync, max_ring_change=self.max_ring_change,
-                    max_correction=self.max_correction, n_clipped=self.n_clipped, max_deferred=self.max_deferred, transport=self.t_transport,
+                    max_correction=self.max_correction, n_clipped=self.n_clipped, max_deferred=self.max_deferred, n_seen_reused=self.n_seen_reused, transport=self.t_transport,
                     parts={k.lstrip("_"): v[0] for k, v in self.parts.items()},
                     parts_wait={k.lstrip("_"): v[1] for k, v in self.parts.items()})
