@@ -1117,19 +1117,40 @@ class TestNesting3D(unittest.TestCase):
 
 class TestNestingRestart3D(unittest.TestCase):
     """The 3D nest of nesting_3d_case.py with the child on its own 3D step and its ring extrapolated in time,
-    restarted halfway, continues bit-identically on both levels (every state field, and the heat series). In
-    this case the flux limiter does not clip, so its deferred amounts are zero. Starts mpiexec itself."""
+    restarted halfway, continues bit-identically on both levels (every state field, and the heat series): with a
+    smooth front (the flux limiter does not clip), and with a step in temperature at the interface (it clips, and
+    the restart file holds deferred amounts). Starts mpiexec itself."""
 
     def test_restart(self):
+        self.check("sub")
+
+    def test_restart_with_deferred_corrections(self):
+        import os
+
+        import netCDF4
+
+        out = self.check("sub", "sharp", keep=True)
+        try:
+            self.assertGreater(int(np.load(os.path.join(out, "first_root.npz"))["n_clipped"]), 0)
+            with netCDF4.Dataset(os.path.join(out, "first_root.nc")) as nc:
+                d = [np.ma.filled(nc[v][:], 0.0) for v in nc.variables if v.startswith("nest_flux_deferred")]
+            self.assertTrue(d and max(float(np.abs(x).max()) for x in d) > 0.0)
+        finally:
+            import shutil
+
+            shutil.rmtree(out, ignore_errors=True)
+
+    def check(self, *opts, keep=False):
         import os
         import tempfile
 
         import xarray as xr
 
         _skip_unless_mpiexec(self)
-        with tempfile.TemporaryDirectory() as out:
+        out = tempfile.mkdtemp()
+        try:
             for mode in ("full", "first", "second"):
-                r = _launch_3d(mode, out, "sub")
+                r = _launch_3d(mode, out, *opts)
                 self.assertEqual(r.returncode, 0, mode + ": " + r.stdout[-3000:] + r.stderr[-3000:])
             for name in ("root", "child"):
                 with xr.open_dataset(os.path.join(out, f"full_{name}.nc")) as a, \
@@ -1144,6 +1165,13 @@ class TestNestingRestart3D(unittest.TestCase):
                 f = np.load(os.path.join(out, f"full_{name}.npz"))
                 s = np.load(os.path.join(out, f"second_{name}.npz"))
                 self.assertTrue(np.array_equal(f["heat"][-len(s["heat"]):], s["heat"]), name)
+        finally:
+            if not keep:
+                import shutil
+
+                shutil.rmtree(out, ignore_errors=True)
+        return out
+
 
 class TestNestingThreeLevels(unittest.TestCase):
     """Root, child and grandchild in 2D (nesting_levels_case.py; 2 + 2 + 1 processes): the water volume over all

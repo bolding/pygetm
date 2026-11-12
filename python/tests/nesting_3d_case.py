@@ -8,7 +8,9 @@ stays 35 everywhere::
     mpiexec -n 2 python nesting_3d_case.py MODE root OUT [OPTIONS] : -n 1 python nesting_3d_case.py MODE child OUT [OPTIONS]
 
 OPTIONS: ``scheme=ppm|pcm`` (Nested3D remap_scheme, default ppm), ``sub`` (the child its own 3D step, a third of the
-root's, and ring_time "extrapolate"; default: every level the root's 3D step, ring held).
+root's, and ring_time "extrapolate"; default: every level the root's 3D step, ring held), ``sharp`` (a step in
+temperature exactly at the child's west interface and a hill of water across it: the flux correction's limiter clips
+and defers amounts).
 
 MODE: ``run`` (2 x N root 3D steps), ``full`` (the same, restart file OUT/full_<level>.nc), ``first`` (N, OUT/first_<level>.nc),
 ``second`` (N from OUT/first_<level>.nc, OUT/second_<level>.nc). Every level writes OUT/<mode>_<level>.npz: at every
@@ -47,6 +49,7 @@ def main():
     opts = sys.argv[4:]
     scheme = next((o.split("=", 1)[1] for o in opts if o.startswith("scheme=")), "ppm")
     sub = "sub" in opts
+    sharp = "sharp" in opts
     model = NestedModel(LAYOUT, name)
     lev = model.level
     H = model.share_depth(depth(lev))
@@ -81,7 +84,15 @@ def main():
         # in the cells this level computes; the rest (land, a child's ring and band) 0: the ring gets the parent's
         # values at the first sync, and a restart file holds NaN where nothing is computed
         own = (T.mask.all_values == 1)[None]
-        sim.temp.all_values[...] = np.where(own, (10.0 + 3.0 * np.tanh((x - 15.0) / 1.5))[None, None, :], 0.0)
+        if sharp:  # a step at the child's west interface (x = 12), water piled up west of it
+            front = np.where(x < 12.0, 4.0, 16.0)
+            gj, _ = nest.global_indices()
+            y = lev.lat0 + (gj + 0.5) * lev.dlat
+            T.z.all_values[...] = 0.8 * np.exp(-((x[None, :] - 9.0) ** 2 + (y[:, None] - 14.0) ** 2) / 4.0)
+            T.z.all_values[T.mask.all_values == 0] = 0.0
+        else:
+            front = 10.0 + 3.0 * np.tanh((x - 15.0) / 1.5)
+        sim.temp.all_values[...] = np.where(own, front[None, None, :], 0.0)
         sim.salt.all_values[...] = np.where(own, 35.0, 0.0)
 
     h = T.halox
@@ -108,10 +119,13 @@ def main():
         if (s + 1) % per_root_3d == 0:
             series.append(totals())
     sim.finish()
+    n_clipped = model.comm.allreduce(cpl3.n_clipped)  # collective: on every process of the level
+    max_deferred = model.comm.allreduce(cpl3.max_deferred, op=parallel.MPI.MAX)
     if model.comm.rank == 0:
         a = np.array(series)
         np.savez(os.path.join(out, f"{mode}_{name}.npz"), heat=a[:, 0], volume=a[:, 1], salt_min=a[:, 2],
-                 salt_max=a[:, 3], ratio_3d=cpl3.ratio_3d, n_extrapolated=getattr(cpl3, "n_extrapolated", 0))
+                 salt_max=a[:, 3], ratio_3d=cpl3.ratio_3d, n_extrapolated=getattr(cpl3, "n_extrapolated", 0),
+                 n_clipped=n_clipped, max_deferred=max_deferred)
 
 
 if __name__ == "__main__":
