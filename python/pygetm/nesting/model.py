@@ -48,6 +48,8 @@ class NestedModel:
 
     def __init__(self, layout, name: str, comm: Optional[MPI.Comm] = None, halo: int = 2,
                  root_band: Optional[int] = 0, abort_on_error: bool = True):
+        if abort_on_error:  # first: an error below (a bad layout, a level name) must not leave the others waiting
+            install_abort_hook(comm if comm is not None else MPI.COMM_WORLD, name)
         self.config = _load_config(layout)
         if name not in self.config:
             raise ValueError(f"level {name!r} is not in the layout ({[k for k in self.config if k != 'config']})")
@@ -58,8 +60,6 @@ class NestedModel:
         self.comm = self.context.comm
         #: shared nesting communicator (setup, abort)
         self.world = self.context.nesting_comm
-        if abort_on_error:
-            install_abort_hook(self.world, name)
         specs = {k: v for k, v in self.config.items() if k != "config"}
         absent = [k for k in specs if k not in self.context.sizes]
         if absent:

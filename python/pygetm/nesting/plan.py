@@ -16,10 +16,11 @@ so no handshake is needed:
 * R (restriction): child tile -> parent tile, value and weight of the
   child cells of each rim cell's ratio x ratio block (rim-major, a, b);
 * F (flux register): child tile -> parent tile, the child's transports
-  through the interface faces (r sub-faces each). The parent tile handling
+  through the interface faces (r sub-faces each). The parent tile correcting
   a face is the owner of the cell outside the hole (flux matching), or,
   where that cell is not computed by the parent (the parent's own interface),
-  of the hole cell (passed upwards).
+  of the hole cell (passed upwards); the owner of the face's U/V point sets
+  the transport there, and gets the face too where it is another tile.
 
 This is the nesting exchange; it shares no code with pyGETM's halo exchange.
 """
@@ -80,7 +81,7 @@ class LevelTiling:
 
 def gather_tilings(levels: List[Level], world, level: Level, grid, offsets: Dict[str, int]) -> Dict[str, LevelTiling]:
     """Share the tilings of all levels with every rank (one allgather)."""
-    info = LevelTiling.info(grid) if grid is not None and grid.tiling.rank == 0 else None
+    info = LevelTiling.info(grid) if grid.tiling.rank == 0 else None
     tilings = {}
     for name, inf in world.allgather((level.name, info)):
         if inf is not None:
@@ -137,13 +138,26 @@ class Plan:
         wf = par.wfaces[child.name]
         hj, hi = wf["hole"]
         oj, oi = wf["out"]
+        # two roles per face: the correction of the cell outside the hole (elevation, tracers; for a face
+        # passed up: the hole cell's tile) and the transport the parent continues from, at the face's own
+        # U/V point. An x face has its western cell's index, a y face its southern cell's, so with the
+        # hole west or south of the outside cell the point is the hole cell's; where that is another tile
+        # (a subdomain boundary on the interface) both tiles get the face. A point in a removed tile
+        # stays with the correcting tile.
         face_owner = np.where(wf["inside"], ptil.owner(oj, oi), ptil.owner(hj, hi))
-        #: interface face indices n handled by each parent tile
+        point_owner = np.where(wf["inside"], ptil.owner(*wf["face"]), -1)
+        point_owner = np.where(wf["inside"] & (point_owner < 0), face_owner, point_owner)
+        #: interface face indices n handled by each parent tile (sorted), and per entry whether the tile
+        #: applies the correction (:attr:`corr_of`) and sets the transport (:attr:`uv_of`)
         self.faces_of: Dict[int, np.ndarray] = {}
+        self.corr_of: Dict[int, np.ndarray] = {}
+        self.uv_of: Dict[int, np.ndarray] = {}
         self.flx: Dict[Tuple[int, int], tuple] = {}
         for p in range(ptil.ntiles):
-            mine = np.nonzero(face_owner == p)[0]
+            mine = np.nonzero((face_owner == p) | (point_owner == p))[0]
             self.faces_of[p] = mine
+            self.corr_of[p] = face_owner[mine] == p
+            self.uv_of[p] = point_owner[mine] == p
             if not mine.size:
                 continue
             fpos = np.repeat(np.arange(mine.size), r)
@@ -154,6 +168,27 @@ class Plan:
                 sel = own == t
                 if sel.any():
                     self.flx[(t, p)] = (fpos[sel], fa[sel], fk[sel])
+
+    # --- the lists one tile works through (sorted by the other side's tile: the same order on both sides) ---
+
+    def ring_to(self, t: int) -> List[Tuple[int, tuple]]:
+        """P entries child tile ``t`` receives: [(parent tile, (pj, pi, bj, bi, a, b))]."""
+        return [(p, v) for (p, tt), v in sorted(self.pro.items()) if tt == t]
+
+    def ring_cells(self, t: int) -> Dict[str, np.ndarray]:
+        """The ring cells of child tile ``t`` in the order of :meth:`ring_to`: parent cells ``pj, pi``, child cells
+        ``bj, bi`` (global), sub-cell position ``a`` (j), ``b`` (i) within the parent cell."""
+        ring = self.ring_to(t)
+        return {k: (np.concatenate([v[n] for _, v in ring]) if ring else np.zeros(0, int))
+                for n, k in enumerate(("pj", "pi", "bj", "bi", "a", "b"))}
+
+    def faces_to(self, p: int) -> List[Tuple[int, np.ndarray, np.ndarray]]:
+        """F messages parent tile ``p`` receives: [(child tile, position in :attr:`faces_of` [p], sub-face)]."""
+        return [(t, fpos, fa) for (t, pp), (fpos, fa, _) in sorted(self.flx.items()) if pp == p]
+
+    def faces_from(self, t: int) -> List[Tuple[Tuple[int, int], np.ndarray]]:
+        """F messages child tile ``t`` sends: [((t, parent tile), child edge faces fk)]."""
+        return [(key, fk) for key, (_, _, fk) in sorted(self.flx.items()) if key[0] == t]
 
     def describe(self, me: int, role: str, tile: int) -> List[str]:
         """Messages of this rank, in the format of check_print_plan.py

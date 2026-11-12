@@ -101,6 +101,7 @@ class Momentum:
         "coriolis_scheme",
         "curvature",
         "_curv",
+        "_An_timestep_once",
         "An",
         "An_uu",
         "An_uv",
@@ -133,7 +134,8 @@ class Momentum:
         advection_split_2d: operators.AdvectionSplit = operators.AdvectionSplit.FULL,
         coriolis_scheme: CoriolisScheme = CoriolisScheme.DEFAULT,
         avmmol: float = 1.8e-6,
-        curvature: Optional[bool] = None,
+        curvature: Optional[bool] = False,
+        An_timestep_once: bool = False,
     ):
         """Create momentum handler
 
@@ -152,14 +154,21 @@ class Momentum:
             avmmol: molecular viscosity (m2 s-1)
             curvature: include the curvature term of the momentum equations on grids
                 whose metrics vary (``cord_curv`` in legacy GETM): it is added to the
-                Coriolis parameter. ``None`` (default): on for curvilinear grids, off
-                for rectilinear longitude/latitude grids (as in earlier pyGETM; on
-                those the term is u tan(lat) / R); ``True``: on wherever the metrics
-                vary; ``False``: off. On Cartesian grids with constant (or only
-                i-dependent dx and j-dependent dy) metrics the term is zero.
+                Coriolis parameter. ``False`` (default, as upstream pyGETM): off;
+                ``None``: on for curvilinear grids, off for rectilinear
+                longitude/latitude grids (on those the term is u tan(lat) / R);
+                ``True``: on wherever the metrics vary. On Cartesian grids with
+                constant (or only i-dependent dx and j-dependent dy) metrics the
+                term is zero.
+            An_timestep_once: apply the time step to the transport damping (An)
+                once: :attr:`dampU`, :attr:`dampV` are tendencies that the 2D
+                transport update multiplies by the time step, so their increment is
+                taken for a unit step. ``False`` (default, as upstream pyGETM): the
+                increment for the time step, multiplied by it again.
         """
         self.curvature = curvature
         self._curv = None
+        self._An_timestep_once = An_timestep_once
         self._Am_const = Am
         self._An_const = An
         self.cnpar = cnpar
@@ -874,13 +883,15 @@ class Momentum:
 
         if self.An_uu is not None:
             # Numerical damping of transports. dampU/dampV are tendencies
-            # (advance_2d_transport multiplies them by the time step), so the
-            # increment of horizontal_diffusion is taken for a unit time step
+            # (advance_2d_transport multiplies them by the time step): with
+            # An_timestep_once the increment of horizontal_diffusion is taken for a
+            # unit time step (upstream: for the time step)
+            dt = 1.0 if self._An_timestep_once else timestep
             pygetm._pygetm.horizontal_diffusion(
-                self.U, self.An_uu, self.An_uv, 1.0, self.dampU
+                self.U, self.An_uu, self.An_uv, dt, self.dampU
             )
             pygetm._pygetm.horizontal_diffusion(
-                self.V, self.An_vu, self.An_vv, 1.0, self.dampV
+                self.V, self.An_vu, self.An_vv, dt, self.dampV
             )
 
     def advance(

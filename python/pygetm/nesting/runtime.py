@@ -23,11 +23,27 @@ def install_abort_hook(comm: MPI.Comm, label: str):
 
     The levels of a nesting run wait for each other in MPI: if one level
     stops with an exception, the others would wait forever. The hook prints
-    the traceback with the level and rank, then calls ``comm.Abort``."""
+    the traceback with the level and rank, then calls ``comm.Abort``.
+    ``sys.exit`` with a non-zero status or a message aborts as well (Python
+    passes ``SystemExit`` to no hook; a bare ``raise SystemExit(...)`` is
+    not caught: raise another exception in a nested run). Installed once
+    per process."""
     import sys
     import traceback
 
+    if getattr(sys.excepthook, "_nesting_abort", False):
+        return
     previous = sys.excepthook
+    previous_exit = sys.exit
+
+    def exit_(status=None):
+        if status not in (None, 0):
+            if not isinstance(status, int):
+                sys.stderr.write(f"{status}\n")
+            sys.stderr.write(f"[nesting: {label}, rank {comm.rank}] exit with status {status!r} - aborting all levels\n")
+            sys.stderr.flush()
+            comm.Abort(status if isinstance(status, int) else 1)
+        previous_exit(status)
 
     def hook(etype, value, tb):
         traceback.print_exception(etype, value, tb)
@@ -38,8 +54,44 @@ def install_abort_hook(comm: MPI.Comm, label: str):
         finally:
             previous(etype, value, tb)
 
+    hook._nesting_abort = True
     sys.excepthook = hook
+    sys.exit = exit_
 
+
+def check_couplers(sim, coupler, world: MPI.Comm, level: str) -> None:
+    """Collective, from the ``on_start`` of every nesting coupler, done by the first one of the simulation:
+    every level must run the same nesting couplers in the same order and the same run type, else their
+    start-up collectives would not match (a hang). Raises on every process otherwise."""
+    nesting = [c for c in sim._couplers if type(c).__module__.startswith("pygetm.nesting")]
+    if not nesting or nesting[0] is not coupler:
+        return
+    mine = (level, int(sim.runtype), tuple(type(c).__name__ for c in nesting))
+    seen = {}
+    for name, runtype, couplers in world.allgather(mine):
+        seen.setdefault((runtype, couplers), set()).add(name)
+    if len(seen) > 1:
+        detail = "; ".join(f"{sorted(n)}: run type {rt}, couplers {list(c)}" for (rt, c), n in seen.items())
+        raise RuntimeError(f"nesting: the levels differ in run type or nesting couplers (all need the same, "
+                           f"in the same order): {detail}")
+
+def sync_order(send_up: Callable[[], list], recv_children: Callable[[], None], send_down: Callable[[], list],
+               recv_parent: Callable[[], None], *, up: bool, up_after_children: bool) -> list:
+    """One sync point of a coupler, in an order without cycles over the hierarchy: (a) to the parent (what goes
+    up does not depend on the children), (b) from the children, (c) to the children (this level's corrected
+    state), (d) from the parent (what goes down does not depend on the parent). The sweeps up and down do not
+    wait for each other. With ``up_after_children`` (:attr:`Level.sends_up_after_children`) (a) comes after
+    (b). ``up``: this level exchanges with its parent at this sync. Returns the requests of the sends."""
+    reqs = []
+    if up and not up_after_children:
+        reqs += send_up()
+    recv_children()
+    if up and up_after_children:
+        reqs += send_up()
+    reqs += send_down()
+    if up:
+        recv_parent()
+    return reqs
 
 class NestingRun:
     """Processes, grids and exchange plans of a nesting hierarchy (one level
@@ -72,8 +124,9 @@ class NestingRun:
     def build(self, make_domain: Callable, nz: int = 1, **grid_kwargs):
         """Build this level's grids. ``make_domain(level, comm)`` returns the
         pyGETM domain of the level including its band (window extended by
-        ``level.band`` cells on every side). Returns the T grid, or None if
-        pyGETM's tiling leaves this process unused."""
+        ``level.band`` cells on every side). Returns the T grid (pyGETM's tiling
+        gives every process a subdomain: it refuses more processes than
+        subdomains with water)."""
         lev = self.level
         domain = make_domain(lev, self.comm)
         domain.external = lev.external()
@@ -190,14 +243,13 @@ class NestingRun:
         group.Free()
 
     @property
-    def tile(self) -> Optional[int]:
-        return None if self.grid is None else self.grid.tiling.rank
+    def tile(self) -> int:
+        """this process's subdomain in its level's tiling"""
+        return self.grid.tiling.rank
 
     def describe(self) -> List[str]:
         """This process's nesting messages (format of check_print_plan.py)."""
         me, lev = self.world.rank, self.level
-        if self.grid is None:
-            return [f"  [{lev.name} world {me}]  unused by pyGETM's tiling"]
         til, t = self.tilings[lev.name], self.tile
         lines = [f"  [{lev.name} tile {t} / world {me}]  pyGETM tiling {til.map.shape}, nx_sub={til.nx_sub}"
                  f" ny_sub={til.ny_sub} offsets x={til.xoff} y={til.yoff}, removed land tiles {til.removed}"]

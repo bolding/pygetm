@@ -83,9 +83,14 @@ class TestCurvature(unittest.TestCase):
         self.assertFalse(curvature_used(pygetm.domain.create_spherical(lon, lat, H=10.0)))
         self.assertTrue(curvature_used(pygetm.domain.create_spherical(lon, lat, H=10.0), True))
         self.assertFalse(curvature_used(pygetm.domain.create_spherical(lon, lat, H=10.0), False))
-        # curvilinear (polar): on by default
+        # curvilinear (polar): on with curvature=None ("auto")
         x, y = polar_supergrid(36, 10, 50e3, 150e3)
         self.assertTrue(curvature_used(pygetm.domain.Domain(36, 10, x=x, y=y, H=10.0, f=0.0, periodic_x=True)))
+        # pyGETM's default, as upstream: off
+        sim = pygetm.Simulation(pygetm.domain.Domain(36, 10, x=x, y=y, H=10.0, f=0.0, periodic_x=True),
+                                runtype=pygetm.RunType.BAROTROPIC_2D, airsea=pygetm.airsea.Fluxes(taux=0.0, tauy=0.0),
+                                log_level="ERROR")
+        self.assertIsNone(sim.momentum._curv)
 
     def test_exact_area(self):
         nx, ny, r0, r1 = 36, 10, 50e3, 150e3
@@ -142,13 +147,16 @@ class TestRotatedGrids(unittest.TestCase):
     def test_rotated_pole_angle(self):
         # centred on 8 E 56 N: the grid's angle against east is that of its x axis, cos(lat) included
         lon, lat = rotated_pole(self.ri, self.rj, 188.0, 34.0)
-        d = pygetm.domain.Domain(*self.n, lon=lon, lat=lat, H=50.0)
+        d = pygetm.domain.Domain(*self.n, lon=lon, lat=lat, H=50.0, rotation_lonlat=True)
         rot = np.degrees(d._rotation[1::2, 1::2])
         dlon = lon[1::2, 2::2] - lon[1::2, :-2:2]
         dlat = lat[1::2, 2::2] - lat[1::2, :-2:2]
         expected = np.degrees(np.arctan2(dlat, dlon * np.cos(np.radians(lat[1::2, 1::2]))))
         np.testing.assert_allclose(rot, expected, atol=1e-5)
         self.assertGreater(np.abs(rot).max(), 2.0)
+        # pyGETM's default, as upstream: the angle from the unscaled differences
+        up = np.degrees(pygetm.domain.Domain(*self.n, lon=lon, lat=lat, H=50.0)._rotation[1::2, 1::2])
+        self.assertGreater(np.abs(up - rot).max(), 0.1)
 
     def test_rotated_pole_metrics(self):
         # distances do not change under a rotation of the sphere: the same metrics and
@@ -173,9 +181,17 @@ class TestRotatedGrids(unittest.TestCase):
     def test_left_handed_refused(self):
         lon, lat = rotated_pole(self.ri, self.rj, 188.0, 34.0, mirrored=True)
         with self.assertRaisesRegex(Exception, "left-handed"):
-            pygetm.domain.Domain(*self.n, lon=lon, lat=lat, H=50.0)
+            pygetm.domain.Domain(*self.n, lon=lon, lat=lat, H=50.0, refuse_left_handed=True)
         with self.assertRaisesRegex(Exception, "left-handed"):
-            pygetm.domain.create_cartesian(np.arange(5) * 1e3, np.arange(4)[::-1] * 1e3, H=10.0, f=1e-4)
+            pygetm.domain.create_cartesian(np.arange(5) * 1e3, np.arange(4)[::-1] * 1e3, H=10.0, f=1e-4,
+                                           refuse_left_handed=True)
+        # pyGETM's default, as upstream: built, with a warning
+        import logging
+
+        with self.assertLogs("left_handed_test", level="WARNING") as log:
+            pygetm.domain.create_cartesian(np.arange(5) * 1e3, np.arange(4)[::-1] * 1e3, H=10.0, f=1e-4,
+                                           logger=logging.getLogger("left_handed_test"))
+        self.assertTrue(any("left-handed" in m for m in log.output))
 
 
 if __name__ == "__main__":

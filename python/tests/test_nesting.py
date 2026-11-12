@@ -6,8 +6,7 @@ import numpy as np
 import pygetm
 from pygetm import parallel
 from pygetm.simulation import Coupler, COUPLING_STAGES
-from pygetm.nesting import split_world, CellSet, outer_halo, hole_rim
-from pygetm.nesting import variables
+from pygetm.nesting import split_world
 from pygetm.util.interpolate import interp_columns
 
 
@@ -134,137 +133,6 @@ def barotropic_simulation(nx=20, ny=10):
 
 def allsum(value):
     return parallel.MPI.COMM_WORLD.allreduce(value)
-
-
-class TestCellSet(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.nx, cls.ny = 20, 10
-        cls.sim = barotropic_simulation(cls.nx, cls.ny)
-
-    def test_outer_halo_t(self):
-        T = self.sim.T
-        ring = outer_halo(T)
-        h = T.halox
-        self.assertEqual(T.haloy, h)
-        expected = (self.nx + 2 * h) * (self.ny + 2 * h) - self.nx * self.ny
-        # Neighbouring subdomains may both hold a ring cell (in their halos),
-        # so count unique cells over all ranks
-        jg, ig = ring.global_indices()
-        cells = set(zip(jg.tolist(), ig.tolist()))
-        allcells = set().union(*parallel.MPI.COMM_WORLD.allgather(cells))
-        self.assertEqual(len(allcells), expected)
-        for j, i in cells:
-            self.assertTrue(j < 0 or j >= self.ny or i < 0 or i >= self.nx)
-            self.assertTrue(-h <= j < self.ny + h and -h <= i < self.nx + h)
-
-    def test_outer_halo_x_grid_has_overlap(self):
-        # X grid (corners) has one more point in each direction
-        X = self.sim.X
-        h = X.halox
-        jg, ig = outer_halo(X).global_indices()
-        cells = set(zip(jg.tolist(), ig.tolist()))
-        allcells = set().union(*parallel.MPI.COMM_WORLD.allgather(cells))
-        nx, ny = self.nx + 1, self.ny + 1
-        self.assertEqual(len(allcells), (nx + 2 * h) * (ny + 2 * h) - nx * ny)
-
-    def test_gather_scatter_2d(self):
-        T = self.sim.T
-        a = T.array(fill=0.0)
-        rng = np.random.default_rng(parallel.MPI.COMM_WORLD.rank)
-        a.all_values[...] = rng.random(a.all_values.shape)
-        cells = outer_halo(T)
-        values = cells.gather(a)
-        self.assertEqual(values.shape, (cells.size,))
-        self.assertEqual(cells.count(a), cells.size)
-        b = T.array(fill=-1.0)
-        cells.scatter(b, values)
-        np.testing.assert_array_equal(b.all_values[cells.j, cells.i], values)
-        untouched = np.ones(b.all_values.shape, dtype=bool)
-        untouched[cells.j, cells.i] = False
-        self.assertTrue((b.all_values[untouched] == -1.0).all())
-
-    def test_gather_scatter_3d(self):
-        # 3D layout: all cells of level 0 first, then level 1, ...
-        T = self.sim.T
-        nz = 3
-        data = np.arange(nz * T.ny_ * T.nx_, dtype=float).reshape(nz, T.ny_, T.nx_)
-        cells = CellSet(T, [0, 1, 2], [3, 4, 5])
-        a = T.array(fill=0.0)
-        a3 = _FakeArray(T, data)
-        values = cells.gather(a3)
-        self.assertEqual(cells.count(a3), nz * 3)
-        np.testing.assert_array_equal(values[:3], data[0, [0, 1, 2], [3, 4, 5]])
-        np.testing.assert_array_equal(values[3:6], data[1, [0, 1, 2], [3, 4, 5]])
-        b3 = _FakeArray(T, np.zeros_like(data))
-        cells.scatter(b3, values)
-        np.testing.assert_array_equal(
-            b3.all_values[:, [0, 1, 2], [3, 4, 5]], data[:, [0, 1, 2], [3, 4, 5]]
-        )
-        # pack a 2D and a 3D array into one buffer, then unpack
-        a.all_values[...] = 7.0
-        buf = cells.pack([a, a3])
-        self.assertEqual(buf.size, 3 + nz * 3)
-        a.all_values[...] = 0.0
-        b3.all_values[...] = 0.0
-        cells.unpack([a, b3], buf)
-        np.testing.assert_array_equal(a.all_values[[0, 1, 2], [3, 4, 5]], 7.0)
-        np.testing.assert_array_equal(
-            b3.all_values[:, [0, 1, 2], [3, 4, 5]], data[:, [0, 1, 2], [3, 4, 5]]
-        )
-
-    def test_wrong_grid(self):
-        cells = CellSet(self.sim.T, [0], [0])
-        with self.assertRaises(ValueError):
-            cells.gather(self.sim.U.array(fill=0.0))
-
-    def test_hole_rim(self):
-        T = self.sim.T
-        hole = np.zeros((self.ny, self.nx), dtype=bool)
-        hole[2:8, 5:15] = True
-        width = 2
-        rim = hole_rim(T, hole, width)
-        jg, ig = rim.global_indices()
-        self.assertTrue(hole[jg, ig].all())
-        # Each rim cell is within `width` of a cell outside the hole
-        for j, i in zip(jg, ig):
-            window = hole[
-                max(j - width, 0) : j + width + 1, max(i - width, 0) : i + width + 1
-            ]
-            self.assertFalse(window.all())
-        cells = set(zip(jg.tolist(), ig.tolist()))
-        allcells = set().union(*parallel.MPI.COMM_WORLD.allgather(cells))
-        # hole 6 x 10 with a rim of depth 2 leaves an inner 2 x 6 block
-        self.assertEqual(len(allcells), 6 * 10 - 2 * 6)
-
-
-class _FakeArray:
-    # Minimal stand-in for a 3D core.Array (2D runs have no vertical dimension)
-    def __init__(self, grid, values):
-        self.grid = grid
-        self.all_values = values
-        self.name = "fake"
-
-
-class TestVariables(unittest.TestCase):
-    def test_stages_are_known(self):
-        for group in variables.EXCHANGE_GROUPS:
-            self.assertIn(group.stage, COUPLING_STAGES)
-            self.assertIn(group.grid, ("T", "U", "V"))
-
-    def test_resolve_barotropic(self):
-        sim = barotropic_simulation()
-        found = {
-            g.name: [a.name for a in variables.resolve(sim, g)]
-            for g in variables.EXCHANGE_GROUPS
-        }
-        self.assertEqual(found["U"], ["U"])
-        self.assertEqual(found["V"], ["V"])
-        self.assertEqual(found["z"], ["zt"])
-        self.assertEqual(found["ts"], [])
-        for g in variables.EXCHANGE_GROUPS:
-            for a in variables.resolve(sim, g):
-                self.assertIs(a.grid, getattr(sim, g.grid))
 
 
 class TestAdvectionFlux(unittest.TestCase):
@@ -544,7 +412,7 @@ class TestNestingGeometry(unittest.TestCase):
         cfg = dict(
             root=dict(nx=10, ny=8, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
             east=dict(parent="root", istart=6, istop=10, jstart=0, jstop=5, ratio=2),
-            inner=dict(parent="root", istart=1, istop=4, jstart=2, jstop=6, ratio=2),
+            inner=dict(parent="root", istart=2, istop=5, jstart=2, jstop=6, ratio=2),  # 2 cells from the edges
         )
         levels = {l.name: l for l in load_levels(cfg, halo=2, root_band=0)}
         east, inner = levels["east"], levels["inner"]
@@ -583,7 +451,7 @@ class TestNestingGeometry(unittest.TestCase):
 
         cfg = dict(
             root=dict(nx=10, ny=8, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
-            east=dict(parent="root", istart=5, istop=10, jstart=1, jstop=6, ratio=2),
+            east=dict(parent="root", istart=5, istop=10, jstart=2, jstop=6, ratio=2),
             # reaches east's east edge (outer) and its south edge (not outer)
             gc=dict(parent="east", istart=4, istop=10, jstart=0, jstop=6, ratio=3),
         )
@@ -609,6 +477,33 @@ class TestNestingGeometry(unittest.TestCase):
         self.assertFalse(wet2["gc"][gc.outer_mask()].any())
         self.assertFalse(any(masks.check_consistent(levels.values(), wet2)["gc"].values()))
 
+
+    def test_parent_rim_in_hole(self):
+        """A grandchild within halo parent cells of its parent's interface (not touching it): the root's rim
+        blocks lie partly in the child's hole, so the child must send up after its own children."""
+        from pygetm.nesting.geometry import load_levels
+
+        def child_flag(gi0):
+            spec = {"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
+                    "child": dict(parent="root", istart=10, istop=30, jstart=5, jstop=25, ratio=3),
+                    "grand": dict(parent="child", istart=gi0, istop=gi0 + 20, jstart=15, jstop=40, ratio=2)}
+            return {lev.name: lev.parent_rim_in_hole for lev in load_levels(spec, root_band=0)}
+
+        near = child_flag(3)  # one root cell inside the child's west edge
+        self.assertTrue(near["child"])
+        self.assertFalse(near["root"])
+        self.assertFalse(near["grand"])
+        self.assertFalse(child_flag(12)["child"])  # four root cells inside: clear of the root's rim
+
+    def test_layout_refusals(self):
+        """A window 1 cell from the root's outer edge, and a layout with two roots, are refused."""
+        from pygetm.nesting.geometry import load_levels
+
+        root = dict(nx=10, ny=8, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0)
+        with self.assertRaisesRegex(ValueError, "from the root's outer edge"):
+            load_levels(dict(root=root, c=dict(parent="root", istart=1, istop=4, jstart=2, jstop=6, ratio=2)), root_band=0)
+        with self.assertRaisesRegex(ValueError, "exactly one root"):
+            load_levels(dict(a=root, b=dict(root)), root_band=0)
 
 class TestNestingSponge(unittest.TestCase):
     def test_water_distance_and_weight(self):
@@ -1050,6 +945,71 @@ class TestNestingMPMD(unittest.TestCase):
                 self.assertTrue(np.isfinite(a).any())
                 self.assertTrue(np.array_equal(a, b, equal_nan=True), name)
 
+
+
+class TestNestingDecomposition(unittest.TestCase):
+    """The same nest with the root on 1 and on 4 processes (2 x 2) is bit-identical; the child's east and
+    north edges lie on the root's subdomain boundaries there (nesting_mpmd_case.LAYOUT_EDGE), where the
+    transports at the interface faces belong to another tile than the cells they correct (Plan.uv_of).
+    Starts mpiexec itself."""
+
+    def test_root_tiling(self):
+        import os
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        if parallel.MPI.COMM_WORLD.size > 1:
+            self.skipTest("starts its own mpiexec; run serially")
+        mpiexec = shutil.which("mpiexec")
+        if mpiexec is None:
+            self.skipTest("no mpiexec")
+        case = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nesting_mpmd_case.py")
+        env = dict(os.environ)
+        for k in list(env):  # a fresh MPI launch, not this process's singleton
+            if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
+                env.pop(k)
+        with tempfile.TemporaryDirectory() as out:
+            for n in (2, 5):
+                r = subprocess.run([mpiexec, "-n", str(n), sys.executable, case, "single", "-", out, "edge"], env=env,
+                                   capture_output=True, text=True, timeout=600)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            for name in ("root", "child"):
+                a = np.load(os.path.join(out, f"single2_{name}.npy"))
+                b = np.load(os.path.join(out, f"single5_{name}.npy"))
+                self.assertTrue(np.isfinite(a).any())
+                self.assertTrue(np.array_equal(a, b, equal_nan=True), name)
+
+    def test_plan_roles(self):
+        """Plan: with the root split at the child's east edge, the faces there are corrected by the eastern tile
+        and their transports set by the western one."""
+        from pygetm.nesting.plan import LevelTiling, Plan
+        from pygetm.nesting.geometry import load_levels
+
+        spec = {"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
+                "child": dict(parent="root", istart=10, istop=20, jstart=6, jstop=15, ratio=3)}
+        levels = load_levels(spec, root_band=0)
+        root, child = levels
+        ptil = LevelTiling(dict(map=[[0, 1]], nx_sub=20, ny_sub=30, xoffset_global=0, yoffset_global=0, halo=2), 0, 0)
+        ctil = LevelTiling(dict(map=[[0]], nx_sub=child.nx + 2 * child.band, ny_sub=child.ny + 2 * child.band,
+                                xoffset_global=0, yoffset_global=0, halo=2), child.band, 2)
+        plan = Plan(child, ptil, ctil, 0)
+        wf = root.wfaces["child"]
+        east = wf["inside"] & wf["is_x"] & (wf["out"][1] == 20)
+        n_east = int(east.sum())
+        self.assertGreater(n_east, 0)
+        for p, other in ((0, 1), (1, 0)):
+            f = plan.faces_of[p]
+            e = east[f]
+            # tile 1 owns the cells east of the hole, tile 0 the U points of those faces (i = 19)
+            self.assertEqual(int((e & plan.corr_of[p]).sum()), n_east if p == 1 else 0)
+            self.assertEqual(int((e & plan.uv_of[p]).sum()), n_east if p == 0 else 0)
+        # every inside face is corrected once and has its transport set once
+        for role in (plan.corr_of, plan.uv_of):
+            seen = np.concatenate([plan.faces_of[p][role[p]] for p in (0, 1)])
+            inside = np.nonzero(wf["inside"])[0]
+            self.assertTrue(np.array_equal(np.sort(seen[np.isin(seen, inside)]), inside))
 
 
 @unittest.skipUnless(__import__("os").environ.get("PYGETM_TEST_FABM"), "FABM tests on demand: PYGETM_TEST_FABM=1")

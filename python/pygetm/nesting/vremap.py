@@ -19,18 +19,9 @@ The work is split so that it can be shared between scalars:
 - :func:`apply` (per scalar): cumulative content at the source interfaces,
   gathered and interpolated at the prepared positions, differenced.
 
-The rim (child -> parent) in the two forms of the plan:
-
-- :func:`rim_average` (A): average layer heights and contents of the r x r
-  child columns by layer index, then one remap onto the parent's layers;
-- :func:`rim_columns` (B): every child column stretched to the parent's depth
-  and remapped onto the parent's layers, contents added area-weighted.
-  ``keep`` > 0 gives B': the upper ``keep`` x min(D_c, D_p) of the column is
-  not stretched, only the part below.
-
-Both conserve the children's content exactly. With sigma layers in the
-child (fixed fractions of the depth) A and B are the same: the stretched
-child layer k lands exactly on layer k of the mean column.
+:func:`stretch` maps a column's interfaces onto another depth (Nested3D's remaps of amounts),
+:func:`contents` and :func:`gather_columns` / :func:`scatter_columns` are the compiled kernels Nested3D
+uses; :func:`remap` (``prepare`` + ``apply``) is their numpy reference (tests).
 """
 
 import numpy as np
@@ -195,72 +186,6 @@ def remap(h_src, c_src, h_dst, scheme="pcm"):
 #
 # Child columns of one parent cell are along axis -2 (r*r, land columns weight 0):
 #   h_c [..., m, nzc], c_c [(tracers,) ..., m, nzc], a_c [..., m]; parent layers h_p [..., nzp].
-
-
-def rim_average_prepare(h_c, a_c, h_p):
-    """A, the part shared by all scalars: mean layer heights and their
-    positions in the parent's column."""
-    w = a_c / a_c.sum(axis=-1, keepdims=True)
-    hbar = (w[..., None] * h_c).sum(axis=-2)
-    # the mean column has the parent's depth when the depths are consistent; scale
-    # out the round-off so that both columns end at the same depth
-    hbar = hbar * (h_p.sum(axis=-1, keepdims=True) / hbar.sum(axis=-1, keepdims=True))
-    return w, hbar, prepare(interfaces(hbar), interfaces(h_p))
-
-
-def rim_average_apply(shared, c_c, h_c, h_p):
-    """A, per scalar: contents averaged by layer index, then remapped."""
-    w, hbar, prep = shared
-    Cbar = (w[..., None] * c_c * h_c).sum(axis=-2)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        cbar = Cbar / hbar
-    return apply(prep, cbar, hbar) / h_p
-
-
-def rim_columns_prepare(h_c, a_c, h_p, keep=0.0):
-    """B, the part shared by all scalars: every child column stretched to the
-    parent's depth, and the parent's interfaces located in each stretched
-    child column. Also the child water volume each parent layer receives
-    (per unit area), ``V``: equal to the parent's layer thickness for the
-    linear stretch with consistent depths, not for B'."""
-    w = a_c / a_c.sum(axis=-1, keepdims=True)
-    Dc = h_c.sum(axis=-1)
-    Dp = h_p.sum(axis=-1)
-    zc = stretch(interfaces(h_c), Dc, Dp[..., None], keep)
-    zp = np.broadcast_to(interfaces(h_p)[..., None, :], zc.shape[:-1] + (h_p.shape[-1] + 1,))
-    prep = prepare(zc, zp)
-    V = (w[..., None] * apply(prep, np.ones_like(h_c), h_c)).sum(axis=-2)
-    return w, prep, V
-
-
-def rim_columns_apply(shared, c_c, h_c, h_p, by_volume=False, fix=None):
-    """B, per scalar: the content of every child layer (c h_c) spread evenly
-    over its stretched layer, the parts inside each parent layer added
-    area-weighted.
-
-    Default: concentration = content / parent layer thickness. The sum over
-    the parent's layers is the children's content exactly.
-    ``by_volume``: content / child volume received (``V``): a uniform field
-    stays uniform exactly, but the content is conserved only when V = h_p
-    (linear stretch, consistent depths); for B' it is not. ``fix`` ("add" or
-    "scale") then restores the content exactly (B'')."""
-    w, prep, V = shared
-    C = (w[..., None] * apply(prep, c_c, h_c)).sum(axis=-2)
-    if not by_volume:
-        return C / h_p
-    with np.errstate(invalid="ignore", divide="ignore"):
-        c = np.where(V > 0.0, C / V, 0.0)
-    if fix is None:
-        return c
-    # B'': by volume, then the column's content restored exactly (uniform fields stay
-    # uniform, since then nothing is missing): "scale" multiplies (keeps the sign,
-    # for positive tracers), "add" shifts by the missing content / D_p
-    total = C.sum(axis=-1, keepdims=True)
-    have = (c * h_p).sum(axis=-1, keepdims=True)
-    if fix == "scale":
-        with np.errstate(invalid="ignore", divide="ignore"):
-            return c * np.where(have != 0.0, total / have, 1.0)
-    return c + (total - have) / h_p.sum(axis=-1, keepdims=True)
 
 
 def contents(zs, zd, c, h, scheme="pcm"):

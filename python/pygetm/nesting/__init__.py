@@ -1,4 +1,4 @@
-"""Nesting of pyGETM domains (work in progress, `nesting` branch).
+"""Two-way, multi-level nesting of pyGETM domains (branch ``nesting-mpmd`` of the fork bolding/pygetm).
 
 Each domain of a nested setup runs as its own :class:`pygetm.Simulation` on its own
 group of MPI processes. Domains exchange information through
@@ -7,16 +7,8 @@ group of MPI processes. Domains exchange information through
 
 This package currently provides:
 
-* :mod:`pygetm.nesting.exchange`: planning and execution of MPI exchanges of
-  rectangular strips between independently decomposed parent and child domains
 * :func:`split_world`: division of the MPI processes over the domains;
   :func:`split_mpmd` for an MPMD launch (one ``mpiexec`` component per domain)
-* :mod:`pygetm.nesting.halo`: :class:`CellSet`, generic gather/scatter/pack of
-  any 2D or 3D array at a fixed set of cells; :func:`outer_halo` (the child's
-  ring outside its global domain) and :func:`hole_rim` (the parent's cells
-  around the hole occupied by the child)
-* :mod:`pygetm.nesting.variables`: which variables are exchanged, at which
-  stage of the time step (:data:`pygetm.simulation.COUPLING_STAGES`), and why
 * :mod:`pygetm.nesting.geometry`: the hierarchy (:class:`Level`,
   :func:`load_levels`): windows, ratios, holes, rims, ring cells and the faces
   at every interface; :meth:`Level.external` for
@@ -30,6 +22,11 @@ This package currently provides:
   launched with one ``mpiexec`` component per level (MPMD)
 * :mod:`pygetm.nesting.plan`: the M:N exchange lists between a parent and a
   child on their pyGETM tilings (:class:`LevelTiling`, :class:`Plan`)
+* :mod:`pygetm.nesting.runtime`: :class:`NestingRun` (processes, grids and
+  plans of a run), the abort hook and the couplers' start-up check
+* :mod:`pygetm.nesting.nested2d`, :mod:`pygetm.nesting.nested3d`: the couplers
+  (:class:`Nested2D`: elevation and transports; :class:`Nested3D`: tracers and
+  3D transports, with :mod:`pygetm.nesting.vremap` between differing layers)
 
 Two complementary exchange paradigms
 ------------------------------------
@@ -51,8 +48,6 @@ package writes there are kept.
 """
 
 from .hierarchy import NestingContext, split_world, split_mpmd, mpmd_blocks
-from .halo import CellSet, outer_halo, hole_rim
-from .variables import ExchangeGroup, EXCHANGE_GROUPS
 from .geometry import Level, active_region, load_levels
 from .plan import LevelTiling, Plan
 from .model import NestedModel
@@ -63,11 +58,6 @@ __all__ = [
     "split_mpmd",
     "NestedModel",
     "mpmd_blocks",
-    "CellSet",
-    "outer_halo",
-    "hole_rim",
-    "ExchangeGroup",
-    "EXCHANGE_GROUPS",
     "Level",
     "load_levels",
     "LevelTiling",

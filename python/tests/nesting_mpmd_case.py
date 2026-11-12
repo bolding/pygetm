@@ -9,6 +9,13 @@ Single program (NestingRun with rank counts), the reference::
     mpiexec -n 3 python nesting_mpmd_case.py single - OUT
 
 Each level writes its gathered z to OUT/<mode>_<level>.npy.
+
+Decomposition (test_nesting.TestNestingDecomposition): ``single`` with a fourth argument ``edge`` uses
+:data:`LAYOUT_EDGE`, a child whose window ends at i = 20, j = 15, where a 2 x 2 tiling of the root splits it;
+the root gets all processes but one, the files are OUT/single<processes>_<level>.npy::
+
+    mpiexec -n 2 python nesting_mpmd_case.py single - OUT edge
+    mpiexec -n 5 python nesting_mpmd_case.py single - OUT edge
 """
 
 import datetime
@@ -26,6 +33,12 @@ LAYOUT = {
     "root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
     "child": dict(parent="root", istart=12, istop=24, jstart=8, jstop=20, ratio=3,
                   active=dict(seed=[18.0, 14.0], barriers=[{"lat_lt": 11.0, "lon_lt": 15.0}])),
+}
+#: the child's east and north edges on the root's subdomain boundaries of a 2 x 2 tiling
+LAYOUT_EDGE = {
+    "root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
+    "child": dict(parent="root", istart=10, istop=20, jstart=6, jstop=15, ratio=3,
+                  active=dict(seed=[16.0, 12.0], barriers=[{"lat_lt": 9.0, "lon_lt": 13.0}])),
 }
 
 
@@ -73,17 +86,19 @@ def run(nest, lev, H, dt):
 
 def main():
     mode, name, out = sys.argv[1:4]
+    edge = len(sys.argv) > 4 and sys.argv[4] == "edge"
+    layout = LAYOUT_EDGE if edge else LAYOUT
     if mode == "mpmd":
-        model = NestedModel(LAYOUT, name)
+        model = NestedModel(layout, name)
         lev = model.level
         H = model.share_depth(depth(lev))
         dt = model.timestep(20.0)
         nest, lev = model.run, model.level
     else:
         world = parallel.MPI.COMM_WORLD
-        geo = load_levels(LAYOUT, root_band=0, active=False)
+        geo = load_levels(layout, root_band=0, active=False)
         Hs = {l.name: depth(l) for l in geo}
-        levels = load_levels(LAYOUT, root_band=0, wet={k: np.isfinite(v) for k, v in Hs.items()})
+        levels = load_levels(layout, root_band=0, wet={k: np.isfinite(v) for k, v in Hs.items()})
         from pygetm.nesting import masks
 
         wets, Hs, _ = masks.make_consistent(levels, {k: np.isfinite(v) for k, v in Hs.items()}, Hs)
@@ -95,7 +110,8 @@ def main():
         dt = level_step(simple_root_step(20.0, [l.steps_per_root for l in levels]), lev.steps_per_root)  # as NestedModel.timestep
     z = run(nest, lev, H, dt)
     if z is not None:
-        np.save(f"{out}/{mode}_{lev.name}.npy", np.array(z))
+        tag = f"{mode}{parallel.MPI.COMM_WORLD.size}" if edge else mode
+        np.save(f"{out}/{tag}_{lev.name}.npy", np.array(z))
 
 
 if __name__ == "__main__":

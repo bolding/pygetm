@@ -88,7 +88,7 @@ from mpi4py import MPI
 
 from ..constants import CENTERS, CellType
 from ..simulation import Coupler
-from .runtime import NestingRun
+from .runtime import NestingRun, check_couplers, sync_order
 from . import vremap
 from .operators import minmod, subcell_offset
 
@@ -339,9 +339,7 @@ class Nested3D(Coupler):
         reqs = []
         if self._fluxes_ready:
             e = self.lev.edge
-            for (tt, p), (_, _, fk) in self.up.flx.items():
-                if tt != self.t:
-                    continue
+            for (_, p), fk in self.up.faces_from(self.t):
                 hface = self._face_profiles((self.sim.U.hn, self.sim.V.hn), e["is_x"][fk], e["face"][0][fk], e["face"][1][fk])
                 hface = np.where(np.isfinite(hface), hface, 0.0)
                 buf = np.ascontiguousarray(np.concatenate([hface.T] + [r[fk].T for r in self.reg], axis=0))
@@ -393,7 +391,6 @@ class Nested3D(Coupler):
         sc = self.scheme
         # the child's own column next to each ring cell (one cell inwards): its vertical
         # detail for the ring (ring_detail) and the reference for the slopes
-        m = np.zeros(c.shape[1], bool)
         ij, ii_ = self._rin_j[ok], self._rin_i[ok]
         m = self._rin_ok[ok].copy()
         if m.any():
@@ -588,13 +585,17 @@ class Nested3D(Coupler):
             return
         cells = list(self._corr_cells)
         self._corr_cells = []
+        # amounts deferred earlier, in this tile's own cells (after a restart the halos hold the neighbours')
+        h = self.halo
         pend = np.zeros(self.wet.shape, bool)
         for a in self._deferred:
-            pend |= (a.all_values != 0.0).any(axis=0)
+            pend[h:-h, h:-h] |= (a.all_values[:, h:-h, h:-h] != 0.0).any(axis=0)
         if pend.any():
             cells.append(np.nonzero(pend))
         if not cells:
             return
+        if self._acc is None:  # no corrections of this tile's own yet (e.g. right after a restart)
+            self._acc = [np.zeros_like(g.all_values) for g in self.tracers]
         J = np.concatenate([c[0] for c in cells])
         I = np.concatenate([c[1] for c in cells])
         key = np.unique(J * self.wet.shape[1] + I)
@@ -674,18 +675,29 @@ class Nested3D(Coupler):
         """At the child's m-th macro step after a sync: the ring continued in time."""
         R = self.ratio_3d
         m = (sim.istep // sim.split_factor - 1) % R  # macro steps since the last sync, before this one
-        if m == 0 or self._rc is None:
+        if m == 0:
             return
-        new, prev, lo, hi = self._rc
-        a = m / R
-        ok = np.isfinite(new).all(axis=(0, 2)) & np.isfinite(prev).all(axis=(0, 2)) & self.wet[self._rj, self._ri]
-        if not ok.any():
-            return
-        c = np.clip(new[:, ok] + a * (new[:, ok] - prev[:, ok]), lo[:, ok], hi[:, ok])
-        jo, io = self._rj[ok], self._ri[ok]
-        for f, cf in zip(self.tracers, c):
-            vremap.scatter_columns(f.all_values, jo, io, cf)
-        self.n_extrapolated += 1
+        c = None
+        if self._rc is not None:
+            new, prev, lo, hi = self._rc
+            a = m / R
+            ok = np.isfinite(new).all(axis=(0, 2)) & np.isfinite(prev).all(axis=(0, 2)) & self.wet[self._rj, self._ri]
+            if ok.any():
+                c = np.clip(new[:, ok] + a * (new[:, ok] - prev[:, ok]), lo[:, ok], hi[:, ok])
+                jo, io = self._rj[ok], self._ri[ok]
+        # the tracers' halo exchange for the advection was started in the freshwater step (it copies what it
+        # sends at its start): on every tile of the level (the exchange is pairwise), finish it, write the
+        # ring, and start it again, so that the neighbouring tiles advect against the same ring as this one
+        # (the advection finishes it as usual)
+        key = sim.tracers._advection.halo1
+        for n, f in enumerate(self.tracers):
+            hu = f.halo_updaters[key]
+            hu.finish()
+            if c is not None:
+                vremap.scatter_columns(f.all_values, jo, io, c[n])
+            hu.start()
+        if c is not None:
+            self.n_extrapolated += 1
 
     # --- parent side -------------------------------------------------------------
 
@@ -755,9 +767,7 @@ class Nested3D(Coupler):
         nt = len(self.tracers) + 1  # the tracers and the water
         H = np.zeros((flist.size, r, nzc))
         F = np.zeros((nt, flist.size, r, nzc))
-        for (tt, p), (fpos, fa, _) in sorted(plan.flx.items()):
-            if p != self.t:
-                continue
+        for tt, fpos, fa in plan.faces_to(self.t):
             buf = np.empty(((1 + nt) * nzc, fpos.size))
             self._recv(plan.comm, buf, plan.coff + tt, plan.tag_f + TAG_3D)
             H[fpos, fa] = buf[:nzc].T
@@ -768,7 +778,8 @@ class Nested3D(Coupler):
         hp = np.where(np.isfinite(hp), hp, 0.0)
         # child amounts on the parent face's layers, r sub-faces added
         fc = remap_amounts(F, H, np.broadcast_to(hp[:, None, :], H.shape[:2] + hp.shape[-1:]), self.keep).sum(axis=-2)
-        ins = wf["inside"][flist]
+        # the cells outside the hole this tile owns (Plan.corr_of)
+        ins = wf["inside"][flist] & plan.corr_of[self.t]
         m_in = flist[ins]
         if m_in.size:
             oj, oi = self.loc(wf["out"][0][m_in], wf["out"][1][m_in])
@@ -793,7 +804,7 @@ class Nested3D(Coupler):
                     np.add.at(f.all_values, (kk[None, :], oj[:, None], oi[:, None]), dc)
             if self._deferred is not None:
                 self._corr_cells.append((oj, oi))
-        up = ~ins & (wf["up"][flist] >= 0)
+        up = ~wf["inside"][flist] & plan.corr_of[self.t] & (wf["up"][flist] >= 0)
         if up.any():
             for n in range(nt):  # tracers and water, in this level's layers
                 np.add.at(self.reg[n], wf["up"][flist][up], fc[n][up])
@@ -803,9 +814,7 @@ class Nested3D(Coupler):
     def _add_water_up(self):
         """Add this macro step's water through the edge faces (every macro step)."""
         e = self.lev.edge
-        for key, (_, _, fk) in self.up.flx.items():
-            if key[0] != self.t:
-                continue
+        for key, fk in self.up.faces_from(self.t):
             vol = self._volume_profiles(e["is_x"][fk], e["face"][0][fk], e["face"][1][fk])
             if key in self._water_sum:
                 self._water_sum[key] += vol
@@ -815,10 +824,8 @@ class Nested3D(Coupler):
     def _send_transports_up(self) -> List[MPI.Request]:
         reqs = []
         e = self.lev.edge
-        for key, (_, _, fk) in self.up.flx.items():
-            tt, p = key
-            if tt != self.t:
-                continue
+        for key, fk in self.up.faces_from(self.t):
+            p = key[1]
             args = (e["is_x"][fk], e["face"][0][fk], e["face"][1][fk])
             h = self._face_profiles((self.sim.U.hn, self.sim.V.hn), *args)
             h = np.where(np.isfinite(h), h, 0.0)
@@ -835,15 +842,13 @@ class Nested3D(Coupler):
         r = plan.child.ratio
         H = np.zeros((flist.size, r, nzc))
         Q = np.zeros((flist.size, r, nzc))
-        for (tt, p), (fpos, fa, _) in sorted(plan.flx.items()):
-            if p != self.t:
-                continue
+        for tt, fpos, fa in plan.faces_to(self.t):
             buf = np.empty((2 * nzc, fpos.size))
             self._recv(plan.comm, buf, plan.coff + tt, plan.tag_f + TAG_3D + 300)
             H[fpos, fa] = buf[:nzc].T
             Q[fpos, fa] = buf[nzc:].T
         wf = self.lev.wfaces[plan.child.name]
-        ins = wf["inside"][flist]
+        ins = wf["inside"][flist] & plan.uv_of[self.t]  # the face points this tile owns (Plan.uv_of)
         if not ins.any():
             return False
         m_in = flist[ins]
@@ -963,34 +968,42 @@ class Nested3D(Coupler):
     # --- sync --------------------------------------------------------------------
 
     def _sync(self):
+        """One sync point (:func:`~pygetm.nesting.runtime.sync_order`): up, the rim and the flux registers; from
+        the children, their rims, flux matching and the limited corrections; down, the rings' tracers and 3D
+        transports; from the parent, this level's ring."""
         t0 = MPI.Wtime()
-        reqs = []
         up = self._up_active()
         if self._fluxes_ready and self.up is not None:
             self._own_edge_fluxes()
-        if up and not self._up_after_children:
-            reqs += self._send_up()
-        for plan, nzc in zip(self.down, self.child_nz):
-            self._recv_rim(plan, nzc)
-            if self._fluxes_ready:
-                self._match_fluxes(plan, nzc)
-        if self.down and self._fluxes_ready:
-            self._apply_corrections()
-        if up and self._up_after_children:
-            reqs += self._send_up()
-        if self.down:
-            for f in self.tracers:
-                f.update_halos()
-            for plan, tx in zip(self.down, self._ring_tx_down):
-                reqs += self._send_down(plan)
-                reqs += self._send_ring_uv(plan, tx)
-        if up:
+
+        def recv_children():
+            for plan, nzc in zip(self.down, self.child_nz):
+                self._recv_rim(plan, nzc)
+                if self._fluxes_ready:
+                    self._match_fluxes(plan, nzc)
+            if self.down and self._fluxes_ready:
+                self._apply_corrections()
+
+        def send_down():
+            reqs = []
+            if self.down:
+                for f in self.tracers:
+                    f.update_halos()
+                for plan, tx in zip(self.down, self._ring_tx_down):
+                    reqs += self._send_down(plan)
+                    reqs += self._send_ring_uv(plan, tx)
+            return reqs
+
+        def recv_parent():
             for f in self.tracers:  # the interior cells next to the ring may lie in the halo
                 f.update_halos()
             self._recv_ring()
             self._recv_ring_uv()
             for f in self.tracers:
                 f.update_halos()
+
+        reqs = sync_order(self._send_up, recv_children, send_down, recv_parent, up=up,
+                          up_after_children=self.lev.sends_up_after_children)
         MPI.Request.Waitall(reqs)
         for fl in self.fluxes:
             fl[0].all_values[...] = 0.0
@@ -1001,6 +1014,7 @@ class Nested3D(Coupler):
     # --- Coupler hooks -------------------------------------------------------------
 
     def on_start(self, sim):
+        check_couplers(sim, self, self.nest.world, self.lev.name)
         T = sim.T
         self.tracers = self._tracers(sim)
         self.wet = T.mask.all_values != 0
@@ -1024,18 +1038,16 @@ class Nested3D(Coupler):
         self.child_nz = [nz[plan.child.name] for plan in self.down]
         # the remap scheme belongs to the interface: the child's decides its ring and its rim in the parent
         self.child_scheme = [{d[0]: d[8] for d in dts}[plan.child.name] for plan in self.down]
-        self._up_after_children = any(
-            bool((np.asarray(self.lev.wfaces[plan.child.name]["up"]) >= 0).any()) for plan in self.down)
         self._ring = []
         if self.up is not None:
-            self._ring = [(p, v) for (p, tt), v in sorted(self.up.pro.items()) if tt == self.t]
-            cat = lambda k: np.concatenate([v[k] for _, v in self._ring]) if self._ring else np.zeros(0, int)
-            self._rj, self._ri = self.loc(cat(2), cat(3))
+            self._ring = self.up.ring_to(self.t)
+            rc = self.up.ring_cells(self.t)
+            self._rj, self._ri = self.loc(rc["bj"], rc["bi"])
             r = self.lev.ratio
-            self._ring_ox, self._ring_oy = subcell_offset(cat(5), r), subcell_offset(cat(4), r)  # x: b, y: a
+            self._ring_ox, self._ring_oy = subcell_offset(rc["b"], r), subcell_offset(rc["a"], r)  # x: b, y: a
             # the child's interior cell next to each ring cell (within the halo)
-            gj = np.clip(cat(2), 0, self.lev.ny - 1)
-            gi = np.clip(cat(3), 0, self.lev.nx - 1)
+            gj = np.clip(rc["bj"], 0, self.lev.ny - 1)
+            gi = np.clip(rc["bi"], 0, self.lev.nx - 1)
             self._rin_ok = self.lev.computed[gj, gi]
             self._rin_j, self._rin_i = self.loc(gj, gi)
         self.fluxes = []

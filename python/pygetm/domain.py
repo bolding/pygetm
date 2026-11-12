@@ -477,6 +477,8 @@ class Domain:
         comm: Optional[parallel.MPI.Comm] = None,
         logger: Optional[logging.Logger] = None,
         exact_area: bool = False,
+        rotation_lonlat: bool = False,
+        refuse_left_handed: bool = False,
     ):
         """Create new domain.
 
@@ -505,6 +507,14 @@ class Domain:
                 each cell (as legacy GETM's iow branch) instead of dx * dy. Only with
                 x and y (planar coordinates); it matters on strongly curved or
                 non-orthogonal grids
+            rotation_lonlat: on a longitude/latitude grid that is not rectilinear
+                (rotated pole, curvilinear), the grid angle from the local east and
+                north components of the grid lines (longitude differences scaled by
+                cos(latitude)); ``False`` (default, as upstream pyGETM): from the
+                longitude and latitude differences as they are. A rectilinear grid
+                has angle 0 either way
+            refuse_left_handed: stop with an error on a left-handed (mirrored)
+                grid; ``False`` (default): a warning
         """
         if nx <= 0:
             raise Exception(f"Number of x points is {nx} but must be > 0")
@@ -611,10 +621,14 @@ class Domain:
                 and (self._lon == self._lon[0, 0]).any()
                 and has_xy
             ):
-                # Proper rotation with respect to true North, from the local east and
-                # north components of the grid lines (longitude differences scaled
-                # by cos(latitude))
-                rotation = _rotation_lonlat(lon_rad_ex, lat_rad_ex)
+                # Proper rotation with respect to true North: with rotation_lonlat
+                # from the local east and north components of the grid lines
+                # (longitude differences scaled by cos(latitude)); else (upstream)
+                # from the longitude and latitude differences as they are
+                if rotation_lonlat:
+                    rotation = _rotation_lonlat(lon_rad_ex, lat_rad_ex)
+                else:
+                    rotation = _rotation(lon_rad_ex, lat_rad_ex)
             else:
                 # Rotation with respect to y-axis - assumes y-axis always points to
                 # true North (can be valid only for infinitesimally small domain)
@@ -648,11 +662,14 @@ class Domain:
 
         n_left_handed = self.comm.bcast(n_left_handed)
         if n_left_handed:
-            raise Exception(
+            msg = (
                 f"The grid is left-handed (mirrored) at {n_left_handed} supergrid points:"
                 " i must increase to the right of j (x or longitude east, y or latitude"
                 " north). Reverse the order of one axis."
             )
+            if refuse_left_handed:
+                raise Exception(msg)
+            self.logger.warning(msg + " The sense of rotation (Coriolis) is then wrong.")
 
         self.open_boundaries = open_boundaries.GlobalOpenBoundaryCollection(
             nx, ny, self.logger.getChild("open_boundaries"), **self._tcoords()

@@ -172,6 +172,7 @@ class BaseSimulation:
         "_couplers",
         "_split_order",
         "_restarted",
+        "exact_restart",
     )
 
     def __init__(
@@ -630,6 +631,7 @@ class Simulation(BaseSimulation):
         log_level: Optional[int] = None,
         delay_slow_ip: bool = False,
         tiling: Optional[parallel.Tiling] = None,
+        exact_restart: Optional[bool] = None,
     ):
         """Simulation
 
@@ -646,8 +648,16 @@ class Simulation(BaseSimulation):
             tiling: subdomain decomposition. If not provided, an optimal subdomain
                 division is determined automatically based on the land-sea mask and
                 the number of active CPU cores
+            exact_restart: continue from a restart file exactly as the unbroken run
+                would (the elevation at open boundaries from before their update,
+                the transports summed over the current macrotimestep and the order
+                of the split steps from the file, the depths and thicknesses along
+                open boundaries kept instead of mirrored, no sponge relaxation at
+                the start). ``None`` (default): only with couplers (nesting), else
+                as upstream pyGETM; ``True``/``False``: always/never
         """
         super().__init__(domain, log_level=log_level, tiling=tiling)
+        self.exact_restart = exact_restart
 
         if Dmin <= 0.0:
             self.logger.error(f"Dmin ({Dmin} m) must exceed zero")
@@ -1139,7 +1149,23 @@ class Simulation(BaseSimulation):
     def _store_split_order(self):
         self._split_order.all_values[...] = self.momentum._ufirst + 2 * self.momentum._u3dfirst
 
+    @property
+    def _exact_restart(self) -> bool:
+        """whether a restart continues exactly (see ``exact_restart``)"""
+        return bool(self._couplers) if self.exact_restart is None else bool(self.exact_restart)
+
     def _after_restart(self, initialized_variables: set[str]):
+        if not self._exact_restart:
+            # as upstream pyGETM
+            if self.runtype > RunType.BAROTROPIC_2D:
+                # Restore elevation from before open boundary condition was applied
+                self.T.z.all_values = self.T.zin.all_values
+                self.momentum.U_cum.fill(0.0)
+                self.momentum.V_cum.fill(0.0)
+            keep_ho = "hot" in initialized_variables
+            keep_hn = "hnt" in initialized_variables
+            self.initialize_depth(keep_all_z=True, keep_ho=keep_ho, keep_hn=keep_hn)
+            return
         if self._split_order.name in initialized_variables:
             order = int(round(np.nanmax(self._split_order.all_values)))
             self.momentum._ufirst, self.momentum._u3dfirst = bool(order & 1), bool(order & 2)
@@ -1197,15 +1223,16 @@ class Simulation(BaseSimulation):
         # the neighbouring U/V points would give other values.
         for grid in (self.U, self.V):
             edges = grid._edge_x | grid._edge_y
-            if self._restarted:
+            restarted = self._restarted and self._exact_restart
+            if restarted:
                 edges = edges & (grid.mask.all_values == CellType.UNRESOLVED)
             grid.D.all_values[edges] = FILL_VALUE
-            if not self._restarted:
+            if not restarted:
                 grid.D.mirror()
             if grid.hn is not None:
                 grid.hn.all_values[..., edges] = FILL_VALUE
                 grid.ho.all_values[..., edges] = FILL_VALUE
-                if not self._restarted:
+                if not restarted:
                     grid.ho.mirror()
                     grid.hn.mirror()
 
@@ -1483,7 +1510,7 @@ class Simulation(BaseSimulation):
                 for tracer in self.tracers:
                     # After a restart, the sponge relaxation of the last macro step is
                     # already in the restarted state: set the boundary values only
-                    tracer.open_boundaries.update(relax=not (starting and self._restarted))
+                    tracer.open_boundaries.update(relax=not (starting and self._restarted and self._exact_restart))
 
             # Interpolate surface velocities to T grid.
             # These are used by airsea as offset for wind speeds

@@ -126,6 +126,14 @@ class Level:
             #: the child's own open boundary there
             at_edge = (i0 == 0, i1 == parent.nx, j0 == 0, j1 == parent.ny)
             self.outer_sides = "".join(s for s, at in zip(SIDES, at_edge) if at and parent.is_outer(s))
+            # a window 1 .. halo-1 cells from the root's outer edge would take its ring from the edge's open
+            # boundary cells (and faces beyond them): on the edge (an outer side) or at least halo cells in
+            gap = dict(W=i0, E=parent.nx - i1, S=j0, N=parent.ny - j1)
+            close = [s for s in SIDES if 0 < gap[s] < halo and parent.is_outer(s)
+                     and (parent.band == 0 or parent.parent is not None)]  # no band of the parent's beyond it
+            if close:
+                raise ValueError(f"{name}: window {gap} cells from the root's outer edge on side(s) {close}: put it "
+                                 f"on the edge (its own open boundary there) or at least {halo} cells in")
             self.lon0 = parent.lon0 + i0 * parent.dlon
             self.lat0 = parent.lat0 + j0 * parent.dlat
             parent.children.append(self)
@@ -294,6 +302,13 @@ class Level:
         lat = self.lat0 + np.arange(-h, self.ny + h + 1) * self.dlat
         return lon, lat
 
+    @property
+    def sends_up_after_children(self) -> bool:
+        """Whether this level's sync sends up only after its children's: a child passes fluxes on up (it touches
+        this level's interface), or the parent's rim reaches into this level's hole (a child near it)."""
+        return bool(self.children) and (self.parent_rim_in_hole or any(
+            bool((np.asarray(self.wfaces[c.name]["up"]) >= 0).any()) for c in self.children))
+
     def hole_of(self, child: "Level") -> np.ndarray:
         """The child's active region in this level's cells (ny, nx)."""
         i0, i1, j0, j1 = child.window
@@ -326,13 +341,18 @@ class Level:
         #: cells this level computes
         self.computed = self.cactive & ~hole
         needed = dilate(self.computed, h)
+        #: the parent's rim reaches into this level's hole (a child near, not only on, this level's
+        #: interface): what goes up must then wait for the children's restriction
+        self.parent_rim_in_hole = False
         if self.parent is not None:
             prim = self.parent.rims[self.name]
             r = self.ratio
             i0, _, j0, _ = self.window
             for a in range(r):
                 for b in range(r):
-                    needed[(prim[:, 0] - j0) * r + a, (prim[:, 1] - i0) * r + b] = True
+                    jj, ii = (prim[:, 0] - j0) * r + a, (prim[:, 1] - i0) * r + b
+                    needed[jj, ii] = True
+                    self.parent_rim_in_hole |= bool(hole[jj, ii].any())
         self.rims: Dict[str, np.ndarray] = {}
         if self.has_overhang and self.children:
             raise ValueError(f"{self.name}: a level with an overhang cannot have children")
@@ -482,11 +502,6 @@ def _child_edge(c: Level, f: Dict[str, Any]) -> Dict[str, Any]:
     return dict(is_x=is_x, face=(fj, fi), inner=(cj, ci), sign=sign)
 
 
-def in_window(c: Level, j, i):
-    i0, i1, j0, j1 = c.window
-    return (j >= j0) & (j < j1) & (i >= i0) & (i < i1)
-
-
 def dilate(mask: np.ndarray, width: int) -> np.ndarray:
     """Cells within ``width`` (Chebyshev distance) of a true cell."""
     out = mask.copy()
@@ -604,6 +619,9 @@ def load_levels(config, halo: int = 2, root_band: Optional[int] = None,
     if not isinstance(config, Mapping):
         config = read_layout(config)
     specs = {k: v for k, v in config.items() if k != "config"}
+    roots = [k for k, v in specs.items() if not v.get("parent")]
+    if len(roots) != 1:
+        raise ValueError(f"a nesting layout needs exactly one root (a level without parent), not {roots}")
     levels: List[Level] = []
     done: Dict[str, Level] = {}
     while len(done) < len(specs):
