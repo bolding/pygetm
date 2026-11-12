@@ -29,8 +29,11 @@ def install_abort_hook(comm: MPI.Comm, label: str):
     not caught: raise another exception in a nested run). Installed once
     per process."""
     import sys
+    import time
     import traceback
 
+    #: seconds between the message and the abort, so that mpiexec forwards the message before the job ends
+    drain = 0.5
     if getattr(sys.excepthook, "_nesting_abort", False):
         return
     previous = sys.excepthook
@@ -42,6 +45,7 @@ def install_abort_hook(comm: MPI.Comm, label: str):
                 sys.stderr.write(f"{status}\n")
             sys.stderr.write(f"[nesting: {label}, rank {comm.rank}] exit with status {status!r} - aborting all levels\n")
             sys.stderr.flush()
+            time.sleep(drain)
             comm.Abort(status if isinstance(status, int) else 1)
         previous_exit(status)
 
@@ -49,6 +53,7 @@ def install_abort_hook(comm: MPI.Comm, label: str):
         traceback.print_exception(etype, value, tb)
         sys.stderr.write(f"[nesting: {label}, rank {comm.rank}] unhandled exception - aborting all levels\n")
         sys.stderr.flush()
+        time.sleep(drain)
         try:
             comm.Abort(1)
         finally:

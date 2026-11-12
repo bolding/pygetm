@@ -1145,6 +1145,128 @@ class TestNestingRestart3D(unittest.TestCase):
                 s = np.load(os.path.join(out, f"second_{name}.npz"))
                 self.assertTrue(np.array_equal(f["heat"][-len(s["heat"]):], s["heat"]), name)
 
+class TestNestingThreeLevels(unittest.TestCase):
+    """Root, child and grandchild in 2D (nesting_levels_case.py; 2 + 2 + 1 processes): the water volume over all
+    three levels is conserved to round-off and water reaches the grandchild, with the grandchild on the child's
+    interface with the root (its fluxes passed up through the child) and one root cell inside it (the root's rim
+    reaches into the child's hole); in both the child sends up after its grandchild. Starts mpiexec itself."""
+
+    def check(self, where):
+        import os
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        _skip_unless_mpiexec(self)
+        here = os.path.dirname(os.path.abspath(__file__))
+        case = os.path.join(here, "nesting_levels_case.py")
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
+                env.pop(k)
+        env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
+        py = sys.executable
+        with tempfile.TemporaryDirectory() as out:
+            cmd = [shutil.which("mpiexec"), "-n", "2", py, case, "root", out, where, ":", "-n", "2", py, case, "child",
+                   out, where, ":", "-n", "1", py, case, "grand", out, where]
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+            self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+            v = {n: np.load(os.path.join(out, f"{n}.npz")) for n in ("root", "child", "grand")}
+            total = sum(x["volume"] for x in v.values())
+            scale = max(np.abs(x["volume"]).max() for x in v.values())
+            self.assertLess(np.abs(total - total[0]).max() / scale, 1e-12)
+            self.assertGreater(np.abs(v["grand"]["volume"] - v["grand"]["volume"][0]).max() / scale, 0.1)
+            self.assertTrue(bool(v["child"]["up_after_children"]))
+            self.assertFalse(bool(v["root"]["up_after_children"]))
+
+    def test_grandchild_on_interface(self):
+        self.check("on")
+
+    def test_grandchild_near_interface(self):
+        self.check("near")
+
+class TestNestingErrors(unittest.TestCase):
+    """A failing level stops the whole nested job instead of leaving the others waiting (nesting_error_case.py:
+    the child raises, asks for a level not in the layout, calls sys.exit(3) in the run, or runs 3D without
+    Nested3D); each within the time-out, with its message. Starts mpiexec itself."""
+
+    def check(self, what, message, status=None):
+        import os
+        import shutil
+        import subprocess
+        import sys
+
+        _skip_unless_mpiexec(self)
+        here = os.path.dirname(os.path.abspath(__file__))
+        case = os.path.join(here, "nesting_error_case.py")
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
+                env.pop(k)
+        env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
+        py = sys.executable
+        cmd = [shutil.which("mpiexec"), "-n", "2", py, case, what, "root", ":", "-n", "1", py, case, what, "child"]
+        try:
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail(f"{what}: the other levels kept waiting (no abort within 60 s)")
+        self.assertNotEqual(r.returncode, 0)
+        if status is not None:
+            self.assertEqual(r.returncode, status)
+        log = r.stdout + r.stderr
+        self.assertIn("aborting all levels", log)
+        self.assertIn(message, log)
+
+    def test_exception(self):
+        self.check("raise", "the child fails before the run")
+
+    def test_unknown_level(self):
+        self.check("badname", "is not in the layout")
+
+    def test_sys_exit(self):
+        self.check("exit", "exit with status 3", status=3)
+
+    def test_couplers_differ(self):
+        self.check("no3d", "differ in run type or nesting couplers")
+
+class TestNestingRemovedTiles(unittest.TestCase):
+    """A root whose tiling removes a subdomain (nesting_removed_case.py: 3 x 3 on 8 processes, the centre all in the
+    hole's interior) runs bit-identically to the root on 1 process (both levels; the root outside the removed
+    subdomain, which the gather fills), and conserves the volume over both levels. Starts mpiexec itself."""
+
+    def test_removed_subdomain(self):
+        import os
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        _skip_unless_mpiexec(self)
+        here = os.path.dirname(os.path.abspath(__file__))
+        case = os.path.join(here, "nesting_removed_case.py")
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
+                env.pop(k)
+        env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
+        py = sys.executable
+        with tempfile.TemporaryDirectory() as out:
+            for n in (1, 8):
+                cmd = [shutil.which("mpiexec"), "-n", str(n), py, case, "root", out, ":", "-n", "1", py, case, "child", out]
+                r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+                self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+            load = lambda lev, n: np.load(os.path.join(out, f"{lev}_{n}.npz"))
+            self.assertEqual(int(load("root", 8)["removed"]), 1)
+            self.assertEqual(int(load("root", 1)["removed"]), 0)
+            a, b = load("root", 1)["z"], load("root", 8)["z"]
+            kept = np.abs(b) < 1e10  # the removed subdomain: the gather's fill value
+            self.assertEqual(int((~kept).sum()), 14 * 10)
+            self.assertTrue(np.array_equal(a[kept], b[kept], equal_nan=True))
+            self.assertTrue(np.array_equal(load("child", 1)["z"], load("child", 8)["z"], equal_nan=True))
+            v = load("root", 8)["volume"] + load("child", 8)["volume"]
+            self.assertLess(np.abs(v - v[0]).max() / np.abs(load("child", 8)["volume"]).max(), 1e-12)
+
 class TestNestingRestart(unittest.TestCase):
     """A nested 2D run (root on 2 processes, child with time ratio 3) restarted
     halfway continues bit-identically (nesting_restart_case.py); a restart file
