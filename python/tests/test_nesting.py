@@ -1138,6 +1138,12 @@ class TestNestingRestart(unittest.TestCase):
             r = launch("from_mid")
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("middle of a root 3D step (child: 2 of 3 steps)", r.stdout + r.stderr)
+            r = subprocess.run([mpiexec, "-n", "2", py, case, "alone", "root", out], env=env, capture_output=True, text=True,
+                               timeout=600)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("restart file(s) of root written with another set of levels", r.stdout + r.stderr)
+            with xr.open_dataset(os.path.join(out, "full_root.nc")) as a:
+                self.assertIn("nest_layout_id", a)
 
 
 if __name__ == "__main__":

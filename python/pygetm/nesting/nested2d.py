@@ -394,6 +394,34 @@ class Nested2D(Coupler):
             long_name="nesting: steps of this level since the last root 3D step",
             attrs=dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType)))
         self._period = 1
+        #: ``nest_layout_id``: :meth:`layout_signature` of this level, part of the model state, so that a restart file
+        #: written with another set of levels around this one is refused (:meth:`on_start`). Optional: a file without
+        #: it loads unchecked (the array keeps this run's own value).
+        self._layout_id = self.sim.T.array(
+            name="nest_layout_id", fill=self.layout_signature(),
+            long_name="nesting: signature of this level, its parent and its children (geometry, active regions)",
+            attrs=dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType)))
+
+    def layout_signature(self) -> float:
+        """CRC32 (exact in a double) of what this level's state depends on: its own grid and window, its parent's grid,
+        and its children (names, windows, ratios, time ratios, active regions). A parent's former hole holds no valid
+        state once a child is left out, and a child's ring cells move with its window."""
+        import zlib
+
+        def one(lev, with_active):
+            geo = (lev.name, lev.parent.name if lev.parent is not None else "", lev.window, lev.ratio, lev.time_ratio,
+                   lev.nx, lev.ny, getattr(lev, "lon0", None), getattr(lev, "lat0", None),
+                   getattr(lev, "dlon", None), getattr(lev, "dlat", None))
+            b = repr(geo).encode()
+            act = getattr(lev, "active", None) if with_active else None
+            if act is not None:
+                b += np.ascontiguousarray(np.asarray(act, dtype=np.uint8)).tobytes()
+            return b
+
+        lev = self.lev
+        data = one(lev, True) + (one(lev.parent, False) if lev.parent is not None else b"")
+        data += b"".join(one(c, True) for c in lev.children)
+        return float(zlib.crc32(data))
 
     def _clean_external_after_restart(self, sim):
         """After a restart: the restart file holds NaN where the writer masks the
@@ -437,6 +465,21 @@ class Nested2D(Coupler):
                 "nesting: restart file(s) written in the middle of a root 3D step ("
                 + ", ".join(f"{n}: {p} of {P} steps" for n, p, P in bad)
                 + "); write restarts at whole root 3D steps")
+        # a restart file written with another set of levels around a level (a child left out or added, a window moved)
+        own_id = self.layout_signature()
+        changed = False
+        if getattr(sim, "_restarted", False):
+            v = self._layout_id.all_values
+            v = v[np.isfinite(v)]
+            changed = bool(v.size) and float(v.max()) != own_id
+        self._layout_id.fill(own_id)
+        moved = sorted({n for n, c in self.world.allgather((self.lev.name, changed)) if c})
+        if moved:
+            raise ValueError(
+                "nesting: restart file(s) of " + ", ".join(moved) + " written with another set of levels around them (a "
+                "child left out or added, or a window, ratio or active region changed): a parent's former hole holds no "
+                "valid state. Start these levels from initial conditions, or restart with the levels the files were "
+                "written with")
 
     def _restart_points(self):
         return (self._rj, self._ri), (self._rj, self._ri), (self._rj, self._ri), self._ru, self._rv

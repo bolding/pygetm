@@ -11,7 +11,9 @@ MODE:
   (must equal ``full``);
 * ``mid``: 7 root steps with a restart file every 4 steps of the level (the child's last,
   after 20 of its 21 steps, is in the middle of a root step);
-* ``from_mid``: from OUT/mid_<level>.nc (must be refused).
+* ``from_mid``: from OUT/mid_<level>.nc (must be refused);
+* ``alone``: the root alone (the child left out of the layout) from OUT/first_root.nc, written with the child (must be
+  refused: the root's former hole holds no valid state).
 """
 
 import datetime
@@ -26,7 +28,8 @@ from nesting_mpmd_case import LAYOUT, depth, make_domain, make_sim
 
 def main():
     mode, name, out = sys.argv[1:4]
-    model = NestedModel(LAYOUT, name)
+    layout = {"root": LAYOUT["root"]} if mode == "alone" else LAYOUT  # alone: the child left out
+    model = NestedModel(layout, name)
     lev = model.level
     H = model.share_depth(depth(lev))
     dt = model.timestep(20.0)
@@ -35,11 +38,11 @@ def main():
     sim.add_coupler(Nested2D(nest, sim))
     if mode == "mid":
         sim.output_manager.add_restart(f"{out}/mid_{name}.nc", interval=4)
-    elif mode != "from_mid":
+    elif mode not in ("from_mid", "alone"):
         sim.output_manager.add_restart(f"{out}/{mode}_{name}.nc")
     start = datetime.datetime(2000, 1, 1)
-    if mode in ("second", "from_mid"):
-        start = sim.load_restart(f"{out}/{'first' if mode == 'second' else 'mid'}_{name}.nc")
+    if mode in ("second", "from_mid", "alone"):
+        start = sim.load_restart(f"{out}/{'mid' if mode == 'from_mid' else 'first'}_{name}.nc")
     else:
         import numpy as np
 
