@@ -1051,6 +1051,100 @@ class TestNestingFABM(unittest.TestCase):
             self.assertLess(np.abs(total - total[0]).max() / total[0], 1e-7)
 
 
+def _launch_3d(mode, out, *opts):
+    """nesting_3d_case.py: root on 2 processes, child on 1 (one mpiexec component per level)."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    case = os.path.join(here, "nesting_3d_case.py")
+    env = dict(os.environ)
+    for k in list(env):  # a fresh MPI launch, not this process's singleton
+        if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
+            env.pop(k)
+    env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
+    py = sys.executable
+    cmd = [shutil.which("mpiexec"), "-n", "2", py, case, mode, "root", out, *opts,
+           ":", "-n", "1", py, case, mode, "child", out, *opts]
+    return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+
+
+def _skip_unless_mpiexec(test):
+    import shutil
+
+    if parallel.MPI.COMM_WORLD.size > 1:
+        test.skipTest("starts its own mpiexec; run serially")
+    if shutil.which("mpiexec") is None:
+        test.skipTest("no mpiexec")
+
+
+class TestNesting3D(unittest.TestCase):
+    """Two levels in 3D (nesting_3d_case.py: sigma layers 5 and 8, a temperature front across the child's west
+    interface, uniform salinity, a closed basin): heat crosses the interface and the heat over both levels is
+    conserved (with the limiter's deferred amounts; to the coupling's 1e-7, the sync follows the tracer step),
+    salinity stays uniform, with the PPM and PCM remaps, and with a child on its own 3D step (3D sub-stepping)
+    whose ring is extrapolated in time. Starts mpiexec itself."""
+
+    def check(self, *opts, ratio_3d=1):
+        import os
+        import tempfile
+
+        _skip_unless_mpiexec(self)
+        with tempfile.TemporaryDirectory() as out:
+            r = _launch_3d("run", out, *opts)
+            self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+            a, b = (np.load(os.path.join(out, f"run_{n}.npz")) for n in ("root", "child"))
+            heat = a["heat"] + b["heat"]
+            self.assertGreater(abs(b["heat"][-1] - b["heat"][0]) / abs(b["heat"][0]), 1e-6)  # heat crossed
+            self.assertLess(np.abs(heat - heat[0]).max() / abs(heat[0]), 1e-7)
+            for lev in (a, b):
+                self.assertLess(max(abs(lev["salt_min"].min() - 35.0), abs(lev["salt_max"].max() - 35.0)), 1e-10)
+            self.assertEqual(int(b["ratio_3d"]), ratio_3d)
+            if ratio_3d > 1:
+                self.assertGreater(int(b["n_extrapolated"]), 0)
+
+    def test_ppm(self):
+        self.check("scheme=ppm")
+
+    def test_pcm(self):
+        self.check("scheme=pcm")
+
+    def test_substeps_extrapolate(self):
+        self.check("scheme=ppm", "sub", ratio_3d=3)
+
+
+class TestNestingRestart3D(unittest.TestCase):
+    """The 3D nest of nesting_3d_case.py with the child on its own 3D step and its ring extrapolated in time,
+    restarted halfway, continues bit-identically on both levels (every state field, and the heat series). In
+    this case the flux limiter does not clip, so its deferred amounts are zero. Starts mpiexec itself."""
+
+    def test_restart(self):
+        import os
+        import tempfile
+
+        import xarray as xr
+
+        _skip_unless_mpiexec(self)
+        with tempfile.TemporaryDirectory() as out:
+            for mode in ("full", "first", "second"):
+                r = _launch_3d(mode, out, "sub")
+                self.assertEqual(r.returncode, 0, mode + ": " + r.stdout[-3000:] + r.stderr[-3000:])
+            for name in ("root", "child"):
+                with xr.open_dataset(os.path.join(out, f"full_{name}.nc")) as a, \
+                        xr.open_dataset(os.path.join(out, f"second_{name}.nc")) as b:
+                    for v in ("temp", "salt", "nest_layout_id"):
+                        self.assertIn(v, a)
+                    for v in a.data_vars:
+                        x, y = a[v].values, b[v].values
+                        # pyGETM writes NaN where nothing is computed after a restart, 0 in a continuous run
+                        same = (x == y) | (np.isnan(x) & np.isnan(y)) | (np.isnan(y) & (x == 0.0))
+                        self.assertTrue(same.all(), f"{name} {v}")
+                f = np.load(os.path.join(out, f"full_{name}.npz"))
+                s = np.load(os.path.join(out, f"second_{name}.npz"))
+                self.assertTrue(np.array_equal(f["heat"][-len(s["heat"]):], s["heat"]), name)
+
 class TestNestingRestart(unittest.TestCase):
     """A nested 2D run (root on 2 processes, child with time ratio 3) restarted
     halfway continues bit-identically (nesting_restart_case.py); a restart file
