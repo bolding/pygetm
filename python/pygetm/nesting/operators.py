@@ -126,3 +126,8 @@ __all__ = [
     "restrict",
     "face_sum",
 ]
+
+
+def interp_time(s0, s1, a):
+    """Linear in time between two snapshots: s0 at a = 0, s1 at a = 1 (a > 1 extrapolates)."""
+    return (1.0 - a) * s0 + a * s1

@@ -43,8 +43,8 @@ from mpi4py import MPI
 
 from ..simulation import Coupler
 from .geometry import Level
-from .plan import LevelTiling
-from .runtime import NestingRun, check_couplers, ops_interp, sync_order
+from .plan import LevelTiling, Tag
+from .runtime import NestingRun, check_couplers, sync_order
 from . import operators as ops
 
 
@@ -268,16 +268,16 @@ def rim_faces(child: Level, axis: str):
     return (pj, pf), (src_j, src_i), weights
 
 
-def face_transfers(child: Level, plan, link: int, tag_base: int = 600):
+def face_transfers(child: Level, plan):
     """U/V ring (parent -> child) and rim (child -> parent) transfers of the
     interface of *plan* (on ``plan.comm``)."""
     ptil, ctil, po, co = plan.ptil, plan.ctil, plan.poff, plan.coff
     out = {}
     for n, axis in enumerate("xy"):
         dst, src, w = ring_faces(child, axis)
-        out[f"ring_{axis}"] = PointTransfer(ptil, ctil, dst, src, w, tag_base + 4 * link + n, "UV"[n] + "r", po, co)
+        out[f"ring_{axis}"] = PointTransfer(ptil, ctil, dst, src, w, (Tag.RING_U, Tag.RING_V)[n], "UV"[n] + "r", po, co)
         dst, src, w = rim_faces(child, axis)
-        out[f"rim_{axis}"] = PointTransfer(ctil, ptil, dst, src, w, tag_base + 4 * link + 2 + n, "UV"[n] + "R", co, po)
+        out[f"rim_{axis}"] = PointTransfer(ctil, ptil, dst, src, w, (Tag.RIM_U, Tag.RIM_V)[n], "UV"[n] + "R", co, po)
     return out
 
 
@@ -308,11 +308,10 @@ class Nested2D(Coupler):
         self.area = T.area.all_values
         self.H = T.H.all_values
         self.dyu, self.dxv = T.ugrid.dy.all_values, T.vgrid.dx.all_values
-        links = {c.name: k for k, c in enumerate(nest.levels[1:])}
         self.up_faces = None
         if lev.parent is not None:
-            self.up_faces = face_transfers(lev, self.up, links[lev.name])
-        self.down_faces = [face_transfers(c, plan, links[c.name]) for c, plan in zip(lev.children, self.down)]
+            self.up_faces = face_transfers(lev, self.up)
+        self.down_faces = [face_transfers(c, plan) for c, plan in zip(lev.children, self.down)]
         self.reg = np.zeros(lev.edge["is_x"].size)
         self.own_edge = self.til.owner(*lev.edge["inner"]) == self.t
         if self.up is not None:
@@ -530,7 +529,7 @@ class Nested2D(Coupler):
         parts = []
         for p, v in self._ring:
             buf = np.empty((3, v[2].size))
-            self.clock.recv(self.up.comm, buf, self.up.poff + p, self.up.tag_p)
+            self.clock.recv(self.up.comm, buf, self.up.poff + p, Tag.RING)
             parts.append(buf)
         z = np.concatenate(parts, axis=1) if parts else np.zeros((3, 0))
         u = self.up_faces["ring_x"].recv(self.up.comm, self.t, self.clock)
@@ -581,13 +580,13 @@ class Nested2D(Coupler):
                 jj, ii = self.loc(cj, ci)
                 weight = np.where(self.wetmask[jj, ii], self.area[jj, ii], 0.0)
                 buf = np.ascontiguousarray(np.stack([np.where(weight > 0, z[jj, ii], 0.0), weight]))
-                reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=self.up.tag_r))
+                reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=Tag.RIM))
         reqs += self.up_faces["rim_x"].send(self.up.comm, self.t, self.U.all_values, self.loc)
         reqs += self.up_faces["rim_y"].send(self.up.comm, self.t, self.V.all_values, self.loc)
         if fluxes:
             for (_, p), fk in self.up.faces_from(self.t):
                 vals = np.ascontiguousarray(self.reg[fk])
-                reqs.append(self.up.comm.Isend(vals, dest=self.up.poff + p, tag=self.up.tag_f))
+                reqs.append(self.up.comm.Isend(vals, dest=self.up.poff + p, tag=Tag.FLUX))
             self.reg = np.zeros_like(self.reg)
         if not wait:
             return reqs
@@ -609,7 +608,7 @@ class Nested2D(Coupler):
                 jj, ii = self.loc(pj, pi)
                 sx, sy = ops.limited_slopes_at(z, self.wetmask, jj, ii)
                 buf = np.ascontiguousarray(np.stack([z[jj, ii], sx, sy]))
-                reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=plan.tag_p))
+                reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=Tag.RING))
         reqs += faces["ring_x"].send(plan.comm, self.t, self.U.all_values, self.loc)
         reqs += faces["ring_y"].send(plan.comm, self.t, self.V.all_values, self.loc)
         return reqs
@@ -620,91 +619,120 @@ class Nested2D(Coupler):
         return self._face_volume(wf["is_x"][m], wf["face"][0][m], wf["face"][1][m])
 
     def _recv_child(self, plan, faces, fp):
-        # rim z (area-weighted mean over wet child cells)
+        """From one child at a sync: its rim (elevation and transports) in this level's hole and, with flux
+        matching (``fp``: this level's own volumes through the interface faces), its flux registers."""
+        self._recv_rim_z(plan)
+        self._recv_rim_uv(plan, faces)
+        if fp is None:
+            return
+        fc = self._recv_face_sums(plan)
+        if fc is None:
+            return
+        self._correct_elevation(plan, fp, fc)
+        self._continue_transports(plan, fc)
+        self._pass_up(plan, fc)
+
+    def _recv_rim_z(self, plan):
+        """The rim's elevation: the area-weighted mean over the wet child cells of each rim cell."""
         mine = plan.rim_of[self.t]
-        if len(mine):
-            r = plan.child.ratio
-            blk = np.zeros((len(mine), r, r))
-            wgt = np.zeros((len(mine), r, r))
-            for (tt, p), (k, a, b, _, _) in plan.res.items():
-                if p == self.t:
-                    buf = np.empty((2, k.size))
-                    self.clock.recv(plan.comm, buf, plan.coff + tt, plan.tag_r)
-                    blk[k, a, b] = buf[0]
-                    wgt[k, a, b] = buf[1]
-            vals = blk[:, 0, 0].copy() if r == 1 else ops.restrict(blk, wgt)
-            if r == 1:
-                vals[wgt[:, 0, 0] <= 0] = np.nan
-            jj, ii = self.loc(mine[:, 0], mine[:, 1])
-            ok = np.isfinite(vals)
-            self.z.all_values[jj[ok], ii[ok]] = vals[ok]
-            if ok.any():  # diagnostic
-                d = self.H[jj[ok], ii[ok]] + vals[ok]
-                self.min_depth_rim = min(self.min_depth_rim, float(d.min()))
-        # rim U, V (mean over child faces)
+        if not len(mine):
+            return
+        r = plan.child.ratio
+        blk = np.zeros((len(mine), r, r))
+        wgt = np.zeros((len(mine), r, r))
+        for (tt, p), (k, a, b, _, _) in plan.res.items():
+            if p == self.t:
+                buf = np.empty((2, k.size))
+                self.clock.recv(plan.comm, buf, plan.coff + tt, Tag.RIM)
+                blk[k, a, b] = buf[0]
+                wgt[k, a, b] = buf[1]
+        vals = blk[:, 0, 0].copy() if r == 1 else ops.restrict(blk, wgt)
+        if r == 1:
+            vals[wgt[:, 0, 0] <= 0] = np.nan
+        jj, ii = self.loc(mine[:, 0], mine[:, 1])
+        ok = np.isfinite(vals)
+        self.z.all_values[jj[ok], ii[ok]] = vals[ok]
+        if ok.any():  # diagnostic
+            d = self.H[jj[ok], ii[ok]] + vals[ok]
+            self.min_depth_rim = min(self.min_depth_rim, float(d.min()))
+
+    def _recv_rim_uv(self, plan, faces):
+        """The rim's U, V: the mean over the child faces, only at faces open in this level (a land face keeps no
+        transport; beyond a curvilinear child's conforming band the child's faces lie elsewhere)."""
         u = faces["rim_x"].recv(plan.comm, self.t, self.clock)
         v = faces["rim_y"].recv(plan.comm, self.t, self.clock)
-        # only at faces open in this level: a land face keeps no transport (beyond a
-        # curvilinear child's conforming band the child's faces lie elsewhere)
         for arr, f, val in ((self.U, faces["rim_x"], u), (self.V, faces["rim_y"], v)):
             fj, fi = self.loc(*f.points(self.t))
             op = arr.grid.mask.all_values[fj, fi] != 0
             arr.all_values[fj[op], fi[op]] = val[op]
-        # volume flux matching
-        if fp is None:
-            return
+
+    def _recv_face_sums(self, plan) -> Optional[np.ndarray]:
+        """The child's volumes through this tile's interface faces (:attr:`Plan.faces_of`), its r sub-faces
+        added; None if the tile has no interface faces."""
         flist = plan.faces_of[self.t]
         if not flist.size:
-            return
-        r = plan.child.ratio
-        sub = np.zeros((flist.size, r))
+            return None
+        sub = np.zeros((flist.size, plan.child.ratio))
         for tt, fpos, fa in plan.faces_to(self.t):
             buf = np.empty(fpos.size)
-            self.clock.recv(plan.comm, buf, plan.coff + tt, plan.tag_f)
+            self.clock.recv(plan.comm, buf, plan.coff + tt, Tag.FLUX)
             sub[fpos, fa] = buf
-        fc = ops.face_sum(sub)
+        return ops.face_sum(sub)
+
+    def _correct_elevation(self, plan, fp, fc):
+        """Flux matching: the cells outside the hole that this tile owns (:attr:`Plan.corr_of`) get the difference
+        of this level's and the child's volume through their interface faces (all faces at once; np.add.at adds
+        in face order, as a loop would)."""
         wf = self.lev.wfaces[plan.child.name]
-        # all faces at once; np.add.at adds in face order, as a loop would
-        # this tile corrects the cells outside the hole it owns (and passes up its faces) and sets the
-        # transports at the face points it owns (Plan: both roles, possibly on two tiles)
-        ins = wf["inside"][flist]
-        corr = ins & plan.corr_of[self.t]
-        uv = ins & plan.uv_of[self.t]
+        flist = plan.faces_of[self.t]
+        corr = wf["inside"][flist] & plan.corr_of[self.t]
         m_in = flist[corr]
-        if m_in.size:
-            oj, oi = self.loc(wf["out"][0][m_in], wf["out"][1][m_in])
-            fpi, fci = fp[corr], fc[corr]
-            dz = wf["sign"][m_in] * (fpi - fci) / self.area[oj, oi]
-            np.add.at(self.z.all_values, (oj, oi), dz)
-            d = np.where(self.wetmask[oj, oi], self.H[oj, oi] + self.z.all_values[oj, oi], np.inf)  # diagnostic
-            k = int(np.argmin(d))
-            if d[k] < self.min_depth_corrected:
-                self.min_depth_corrected = float(d[k])
-                self.min_depth_corrected_info = (self._k, int(oj[k]), int(oi[k]), float(dz[k]), float(d[k] - dz[k]))
-            k = int(np.argmax(np.abs(dz)))
-            if abs(dz[k]) > self.max_correction:  # diagnostic
-                m = m_in[k]
-                self.max_correction = abs(dz[k])
-                face = (wf["face"][0][m], wf["face"][1][m])
-                self.max_correction_info = (self._k, "U" if wf["is_x"][m] else "V", face, float(fpi[k]), float(fci[k]), float(dz[k]))
+        if not m_in.size:
+            return
+        oj, oi = self.loc(wf["out"][0][m_in], wf["out"][1][m_in])
+        fpi, fci = fp[corr], fc[corr]
+        dz = wf["sign"][m_in] * (fpi - fci) / self.area[oj, oi]
+        np.add.at(self.z.all_values, (oj, oi), dz)
+        d = np.where(self.wetmask[oj, oi], self.H[oj, oi] + self.z.all_values[oj, oi], np.inf)  # diagnostic
+        k = int(np.argmin(d))
+        if d[k] < self.min_depth_corrected:
+            self.min_depth_corrected = float(d[k])
+            self.min_depth_corrected_info = (self._k, int(oj[k]), int(oi[k]), float(dz[k]), float(d[k] - dz[k]))
+        k = int(np.argmax(np.abs(dz)))
+        if abs(dz[k]) > self.max_correction:  # diagnostic
+            m = m_in[k]
+            self.max_correction = abs(dz[k])
+            face = (wf["face"][0][m], wf["face"][1][m])
+            self.max_correction_info = (self._k, "U" if wf["is_x"][m] else "V", face, float(fpi[k]), float(fci[k]), float(dz[k]))
+
+    def _continue_transports(self, plan, fc):
+        """The parent continues from the child's mean transport, at the interface faces whose U/V point this tile
+        owns (:attr:`Plan.uv_of`). In 3D runs the transports summed over the macro step for the 3D momentum (Ui,
+        Vi) hold this step's own U, V; the volume that moved is the child's (the elevation correction)."""
+        wf = self.lev.wfaces[plan.child.name]
+        flist = plan.faces_of[self.t]
+        uv = wf["inside"][flist] & plan.uv_of[self.t]
         m_uv = flist[uv]
-        if m_uv.size:
-            # the parent continues from the child's mean transport
-            fcu = fc[uv]
-            fj, fi = self.loc(wf["face"][0][m_uv], wf["face"][1][m_uv])
-            x = wf["is_x"][m_uv]
-            newU = fcu[x] / (self.dyu[fj[x], fi[x]] * self._dt())
-            newV = fcu[~x] / (self.dxv[fj[~x], fi[~x]] * self._dt())
-            # 3D runs: the transports summed over the macro step for the
-            # 3D momentum (Ui, Vi) hold this step's own U, V; the volume
-            # that moved is the child's (the z correction)
-            mom = self.sim.momentum
-            if getattr(mom, "_U_cum", None) is not None and self.sim.runtype > 1:
-                mom._U_cum[fj[x], fi[x]] += newU - self.U.all_values[fj[x], fi[x]]
-                mom._V_cum[fj[~x], fi[~x]] += newV - self.V.all_values[fj[~x], fi[~x]]
-            self.U.all_values[fj[x], fi[x]] = newU
-            self.V.all_values[fj[~x], fi[~x]] = newV
-        up = ~ins & plan.corr_of[self.t] & (wf["up"][flist] >= 0)
+        if not m_uv.size:
+            return
+        fcu = fc[uv]
+        fj, fi = self.loc(wf["face"][0][m_uv], wf["face"][1][m_uv])
+        x = wf["is_x"][m_uv]
+        newU = fcu[x] / (self.dyu[fj[x], fi[x]] * self._dt())
+        newV = fcu[~x] / (self.dxv[fj[~x], fi[~x]] * self._dt())
+        mom = self.sim.momentum
+        if getattr(mom, "_U_cum", None) is not None and self.sim.runtype > 1:
+            mom._U_cum[fj[x], fi[x]] += newU - self.U.all_values[fj[x], fi[x]]
+            mom._V_cum[fj[~x], fi[~x]] += newV - self.V.all_values[fj[~x], fi[~x]]
+        self.U.all_values[fj[x], fi[x]] = newU
+        self.V.all_values[fj[~x], fi[~x]] = newV
+
+    def _pass_up(self, plan, fc):
+        """The child's volumes through faces on this level's own interface (a child touching it): into this
+        level's register, for its parent."""
+        wf = self.lev.wfaces[plan.child.name]
+        flist = plan.faces_of[self.t]
+        up = ~wf["inside"][flist] & plan.corr_of[self.t] & (wf["up"][flist] >= 0)
         if up.any():
             np.add.at(self.reg, wf["up"][flist][up], fc[up])
 
@@ -805,13 +833,13 @@ class Nested2D(Coupler):
         if stage == "transports_2d" and self.up is not None:
             if ex:  # parent U at n-1/2 and n-3/2 -> child half step n + (k+1/2)/r
                 a = 1.0 + (k + 0.5) / r
-                self._set_ring_uv(*(ops_interp(self._snap_old[m], self._snap[m], a) for m in (1, 2)))
+                self._set_ring_uv(*(ops.interp_time(self._snap_old[m], self._snap[m], a) for m in (1, 2)))
             else:
                 self._set_ring_uv(*self._snap[1:3])
         elif stage == "elevation":
             if self.up is not None:
                 if ex:  # parent z at n and n-1 -> child time n + (k+1)/r
-                    self._set_ring_z(ops_interp(self._snap_old[0], self._snap[0], 1.0 + (k + 1) / r))
+                    self._set_ring_z(ops.interp_time(self._snap_old[0], self._snap[0], 1.0 + (k + 1) / r))
                 else:
                     self._set_ring_z(self._snap[0])
                 self._own_edge_fluxes()

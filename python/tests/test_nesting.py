@@ -675,7 +675,7 @@ class TestNestingPlan(unittest.TestCase):
             off += tilings[lev.name].ntiles
         sends, recvs = {}, {}
         for k, lev in enumerate(levels[1:]):
-            plan = Plan(lev, tilings[lev.parent.name], tilings[lev.name], k)
+            plan = Plan(lev, tilings[lev.parent.name], tilings[lev.name])
             chk = plan.check()
             self.assertEqual(chk["ring_duplicates"], 0)
             self.assertEqual(chk["block_duplicates"], 0)
@@ -994,7 +994,7 @@ class TestNestingDecomposition(unittest.TestCase):
         ptil = LevelTiling(dict(map=[[0, 1]], nx_sub=20, ny_sub=30, xoffset_global=0, yoffset_global=0, halo=2), 0, 0)
         ctil = LevelTiling(dict(map=[[0]], nx_sub=child.nx + 2 * child.band, ny_sub=child.ny + 2 * child.band,
                                 xoffset_global=0, yoffset_global=0, halo=2), child.band, 2)
-        plan = Plan(child, ptil, ctil, 0)
+        plan = Plan(child, ptil, ctil)
         wf = root.wfaces["child"]
         east = wf["inside"] & wf["is_x"] & (wf["out"][1] == 20)
         n_east = int(east.sum())

@@ -214,11 +214,10 @@ class NestingRun:
         lev = self.level
         self.grid = grid
         self.tilings = gather_tilings(self.levels, self.world, lev, self.grid, self.offsets)
-        links = {c.name: k for k, c in enumerate(self.levels[1:])}
         til = self.tilings[lev.name]
         if lev.parent is not None:
-            self.up = Plan(lev, self.tilings[lev.parent.name], til, links[lev.name])
-        self.down = [Plan(c, til, self.tilings[c.name], links[c.name]) for c in lev.children]
+            self.up = Plan(lev, self.tilings[lev.parent.name], til)
+        self.down = [Plan(c, til, self.tilings[c.name]) for c in lev.children]
         self._interface_comms()
         return self.grid
 
@@ -273,10 +272,6 @@ class NestingRun:
         y0, x0 = self.tilings[lev.name].origin(self.tile)
         h = T.halox
         return np.arange(T.ny_) - h + y0, np.arange(T.nx_) - h + x0
-
-
-def ops_interp(s0, s1, a):
-    return (1.0 - a) * s0 + a * s1
 
 
 def _river_in(domain, river, computed: np.ndarray) -> bool:

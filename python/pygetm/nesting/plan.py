@@ -25,6 +25,7 @@ so no handshake is needed:
 This is the nesting exchange; it shares no code with pyGETM's halo exchange.
 """
 
+import enum
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -90,12 +91,30 @@ def gather_tilings(levels: List[Level], world, level: Level, grid, offsets: Dict
     return tilings
 
 
+class Tag(enum.IntEnum):
+    """The kinds of nesting messages (the MPI tag). Every interface has its own communicator
+    (:attr:`Plan.comm`), so the kind alone tells messages between two processes apart."""
+
+    RING = 1  # P: parent cells (value and slopes) for the child's ring, 2D
+    RIM = 2  # R: child cells of the parent's rim blocks, 2D
+    FLUX = 3  # F: the child's flux registers through the interface faces, 2D
+    RING_U = 4  # U, V transports for the child's ring faces
+    RING_V = 5
+    RIM_U = 6  # mean child U, V transports at the parent's rim faces
+    RIM_V = 7
+    RING_3D = 11  # 3D: the parent's columns for the child's ring
+    RIM_3D = 12  # 3D: the child's columns of the rim blocks
+    FLUX_3D = 13  # 3D: layer thicknesses and amounts through the interface faces
+    TRANSPORT_3D = 14  # 3D: the child's layer transports through the interface faces (momentum_3d stage)
+    RING_U_3D = 15  # 3D: layer transports for the child's ring faces
+    RING_V_3D = 16
+
+
 class Plan:
     """Exchange lists for one parent/child link."""
 
-    def __init__(self, child: Level, ptil: LevelTiling, ctil: LevelTiling, link: int, tag_base: int = 200):
+    def __init__(self, child: Level, ptil: LevelTiling, ctil: LevelTiling):
         self.child, self.ptil, self.ctil = child, ptil, ctil
-        self.tag_p, self.tag_r, self.tag_f = tag_base + 3 * link, tag_base + 3 * link + 1, tag_base + 3 * link + 2
         r = child.ratio
         i0, _, j0, _ = child.window
         par = child.parent
@@ -197,19 +216,19 @@ class Plan:
         pw, cw = self.ptil.offset, self.ctil.offset
         for (p, t), v in self.pro.items():
             if role == "parent" and p == tile:
-                out.append(f"[rank {me}]  P  local[ring of {self.child.name}]  → rank {cw + t}  tag={self.tag_p}  n={3 * v[0].size}")
+                out.append(f"[rank {me}]  P  local[ring of {self.child.name}]  → rank {cw + t}  tag={int(Tag.RING)}  n={3 * v[0].size}")
             if role == "child" and t == tile:
-                out.append(f"[rank {me}]  P  from rank {pw + p}  tag={self.tag_p}  n_parent={3 * v[0].size}")
+                out.append(f"[rank {me}]  P  from rank {pw + p}  tag={int(Tag.RING)}  n_parent={3 * v[0].size}")
         for (t, p), v in self.res.items():
             if role == "parent" and p == tile:
-                out.append(f"[rank {me}]  R  from rank {cw + t}  tag={self.tag_r}  n_parent={2 * v[0].size}")
+                out.append(f"[rank {me}]  R  from rank {cw + t}  tag={int(Tag.RIM)}  n_parent={2 * v[0].size}")
             if role == "child" and t == tile:
-                out.append(f"[rank {me}]  R  local[rim block]  → rank {pw + p}  tag={self.tag_r}  n={2 * v[0].size}")
+                out.append(f"[rank {me}]  R  local[rim block]  → rank {pw + p}  tag={int(Tag.RIM)}  n={2 * v[0].size}")
         for (t, p), v in self.flx.items():
             if role == "parent" and p == tile:
-                out.append(f"[rank {me}]  F  from rank {cw + t}  tag={self.tag_f}  n_parent={v[0].size}")
+                out.append(f"[rank {me}]  F  from rank {cw + t}  tag={int(Tag.FLUX)}  n_parent={v[0].size}")
             if role == "child" and t == tile:
-                out.append(f"[rank {me}]  F  local[flux register]  → rank {pw + p}  tag={self.tag_f}  n={v[0].size}")
+                out.append(f"[rank {me}]  F  local[flux register]  → rank {pw + p}  tag={int(Tag.FLUX)}  n={v[0].size}")
         return out
 
     def check(self) -> Dict[str, int]:
