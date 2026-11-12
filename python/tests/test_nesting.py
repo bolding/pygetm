@@ -1267,6 +1267,68 @@ class TestNestingRemovedTiles(unittest.TestCase):
             v = load("root", 8)["volume"] + load("child", 8)["volume"]
             self.assertLess(np.abs(v - v[0]).max() / np.abs(load("child", 8)["volume"]).max(), 1e-12)
 
+class TestNestingFeatures(unittest.TestCase):
+    """Two levels in 2D with the features that meet the nesting (nesting_features_case.py), the volume over both
+    levels conserved to round-off (or grown by exactly the rivers' inflow): a child whose window reaches the root's
+    edge (an outer side), rivers given to every level (each kept by one), a dam in each level, a sluice between the
+    levels, a bank in the child that falls dry. Starts mpiexec itself."""
+
+    def run_case(self, what):
+        import os
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        _skip_unless_mpiexec(self)
+        here = os.path.dirname(os.path.abspath(__file__))
+        case = os.path.join(here, "nesting_features_case.py")
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
+                env.pop(k)
+        env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
+        py = sys.executable
+        with tempfile.TemporaryDirectory() as out:
+            cmd = [shutil.which("mpiexec"), "-n", "2", py, case, what, "root", out, ":", "-n", "1", py, case, what,
+                   "child", out]
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+            self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+            a, b = (dict(np.load(os.path.join(out, f"{n}.npz"))) for n in ("root", "child"))
+        V = a["volume"] + b["volume"]
+        scale = max(np.abs(a["volume"]).max(), np.abs(b["volume"]).max())
+        return a, b, V, scale
+
+    def assertConserved(self, V, scale, inflow=None):
+        expected = V[0] + (0.0 if inflow is None else inflow)
+        self.assertLess(np.abs(V - expected).max() / scale, 1e-12)
+
+    def test_outer_side(self):
+        a, b, V, scale = self.run_case("outer")
+        self.assertEqual(str(b["outer_sides"]), "E")
+        self.assertConserved(V, scale)
+
+    def test_rivers(self):
+        a, b, V, scale = self.run_case("rivers")
+        self.assertEqual((int(a["rivers"]), int(b["rivers"])), (1, 1))  # each kept by one level
+        self.assertConserved(V, scale, inflow=100.0 * a["time"])  # 2 x 50 m3 s-1
+
+    def test_dams(self):
+        a, b, V, scale = self.run_case("dam")
+        self.assertGreater(int(a["dam_faces"]), 0)
+        self.assertGreater(int(b["dam_faces"]), 0)
+        self.assertConserved(V, scale)
+
+    def test_sluice(self):
+        a, b, V, scale = self.run_case("sluice")
+        self.assertGreater(float(b["sluice_volume"]), 1e4)  # water went from the root to the child
+        self.assertConserved(V, scale)
+
+    def test_drying(self):
+        a, b, V, scale = self.run_case("drying")
+        self.assertGreater(int(b["dry_seen"]), 0)
+        self.assertConserved(V, scale)
+
 class TestNestingRestart(unittest.TestCase):
     """A nested 2D run (root on 2 processes, child with time ratio 3) restarted
     halfway continues bit-identically (nesting_restart_case.py); a restart file
