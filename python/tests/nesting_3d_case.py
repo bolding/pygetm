@@ -94,6 +94,8 @@ def main():
             front = 10.0 + 3.0 * np.tanh((x - 15.0) / 1.5)
         sim.temp.all_values[...] = np.where(own, front[None, None, :], 0.0)
         sim.salt.all_values[...] = np.where(own, 35.0, 0.0)
+        if sharp:  # the depths and layer thicknesses from the elevation just set (pyGETM derives them when the
+            sim.initialize_depth()  # simulation is created; else they catch up in the first 3D step)
 
     h = T.halox
     computed = T.mask.all_values[h:-h, h:-h] == 1
