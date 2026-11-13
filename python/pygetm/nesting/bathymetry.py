@@ -37,12 +37,21 @@ def read_level_depth(path, lev: Level, depth_variable: str, lon_variable: str, l
     H, wet = H[cj:cj + ny, ci:ci + nx], wet[cj:cj + ny, ci:ci + nx]
     lon = lon[ci:ci + nx] if lon.ndim == 1 else lon[cj:cj + ny, ci:ci + nx]
     lat = lat[cj:cj + ny] if lat.ndim == 1 else lat[cj:cj + ny, ci:ci + nx]
-    lon_e, lat_e = lev.edges()
-    lonc, latc = 0.5 * (lon_e[1:] + lon_e[:-1]), 0.5 * (lat_e[1:] + lat_e[:-1])
-    lon1 = lon if lon.ndim == 1 else lon[0]
-    lat1 = lat if lat.ndim == 1 else lat[:, 0]
-    if np.abs(lon1 - lonc).max() > 1e-3 * lev.dlon or np.abs(lat1 - latc).max() > 1e-3 * lev.dlat:
-        raise ValueError(f"{lev.name}: the cell centres of the bathymetry {path} are not those of the layout")
+    if lev.grid is not None:  # curvilinear (with an overhang: its whole domain): the supergrid's cell centres
+        xs, ys = lev.domain_supergrid()
+        xc, yc = xs[1::2, 1::2], ys[1::2, 1::2]
+        lon2, lat2 = np.broadcast_to(lon if lon.ndim == 2 else lon[None, :], H.shape), \
+            np.broadcast_to(lat if lat.ndim == 2 else lat[:, None], H.shape)
+        if np.abs(lon2 - xc).max() > 1e-3 * lev.dlon or np.abs(lat2 - yc).max() > 1e-3 * lev.dlat:
+            raise ValueError(f"{lev.name}: the cell centres of the bathymetry {path} are not those of the level's grid "
+                             f"({lev.grid})")
+    else:
+        lon_e, lat_e = lev.edges()
+        lonc, latc = 0.5 * (lon_e[1:] + lon_e[:-1]), 0.5 * (lat_e[1:] + lat_e[:-1])
+        lon1 = lon if lon.ndim == 1 else lon[0]
+        lat1 = lat if lat.ndim == 1 else lat[:, 0]
+        if np.abs(lon1 - lonc).max() > 1e-3 * lev.dlon or np.abs(lat1 - latc).max() > 1e-3 * lev.dlat:
+            raise ValueError(f"{lev.name}: the cell centres of the bathymetry {path} are not those of the layout")
     if min_depth is not None:
         wet &= H >= float(min_depth)  # min_depth: shallower cells are land (as Domain.mask_shallow)
     return np.where(wet, H, np.nan)
