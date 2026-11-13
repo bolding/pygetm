@@ -10,12 +10,16 @@ from .geometry import Level
 
 def read_level_depth(path, lev: Level, depth_variable: str, lon_variable: str, lat_variable: str,
                      mask_variable: Optional[str] = None, fill_value: Optional[float] = None,
-                     min_depth: Optional[float] = None) -> np.ndarray:
+                     min_depth: Optional[float] = None, scale: float = 1.0) -> np.ndarray:
     """The depth of level ``lev`` (NaN on land) on its domain (window plus band, :attr:`Level.domain_shape`) from the
     NetCDF file ``path``. A file larger by the same number of cells on every side (ocean-prep's level files carry a band
     of 2 cells, also around the root) is cut to the level's grid; the file's cell centres must then lie on the
     layout's (to 1e-3 of a cell). Water: ``mask_variable`` > 0 if given, else depth != ``fill_value`` if given, else a
-    finite depth; ``min_depth``: shallower cells are land (as :meth:`pygetm.domain.Domain.mask_shallow`)."""
+    finite depth; ``min_depth``: shallower cells are land (as :meth:`pygetm.domain.Domain.mask_shallow`). A curvilinear
+    level (``grid``; with an overhang its whole domain): the file's cell centres (2D, or 1D where the grid is separable)
+    must be those of the level's supergrid. ``lon_variable``, ``lat_variable``: the file's coordinates (for a Cartesian
+    level its x and y); ``scale``: the file's coordinate units per layout unit (e.g. 1000: the file in metres, the
+    layout in km)."""
     import netCDF4
 
     with netCDF4.Dataset(path) as nc:
@@ -27,8 +31,8 @@ def read_level_depth(path, lev: Level, depth_variable: str, lon_variable: str, l
             wet = H != fill_value
         else:
             wet = np.isfinite(H)
-        lon = np.asarray(nc[lon_variable][:], dtype=float)
-        lat = np.asarray(nc[lat_variable][:], dtype=float)
+        lon = np.asarray(nc[lon_variable][:], dtype=float) / scale  # in layout units
+        lat = np.asarray(nc[lat_variable][:], dtype=float) / scale
     ny, nx = lev.domain_shape
     cj, ci = (H.shape[0] - ny) // 2, (H.shape[1] - nx) // 2  # a file larger by the same on every side: cut
     if cj < 0 or ci < 0 or H.shape != (ny + 2 * cj, nx + 2 * ci):

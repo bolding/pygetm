@@ -68,29 +68,30 @@ def edge_segments(wet, band=0, sides="WESN", exclude=None):
     return segs
 
 
-def level_edge_segments(lev: Level, wet: np.ndarray) -> List[Tuple[str, int, int, int]]:
+def level_edge_segments(lev: Level, wet: np.ndarray, sides: str = None) -> List[Tuple[str, int, int, int]]:
     """The open boundary stretches of level ``lev`` (:func:`edge_segments`): the root along all its edges (its band is
     0: the boundary is its outer cells), a child along its outer sides (on its last window row/column, the band beyond
     is dry); without the cells the level does not compute (:meth:`Level.external`: the root's hole, the part of its
     edge a child owns). ``wet``: the level's wet cells on its domain (band included), e.g. ``np.isfinite(H)`` of the
-    depth after :meth:`~pygetm.nesting.NestedModel.share_depth`. A child without outer sides: none."""
-    if lev.parent is None:
-        sides, band = "WESN", lev.band
-    else:
-        sides, band = lev.outer_sides, lev.band
-    if not sides:
+    depth after :meth:`~pygetm.nesting.NestedModel.share_depth`. A child without outer sides: none. ``sides``: only
+    these of them (e.g. "W"; default all)."""
+    own = "WESN" if lev.parent is None else lev.outer_sides
+    if sides is not None:
+        own = "".join(c for c in own if c in sides)
+    if not own:
         return []
-    return edge_segments(np.asarray(wet, dtype=bool), band, sides, lev.external())
+    return edge_segments(np.asarray(wet, dtype=bool), lev.band, own, lev.external())
 
 
 def add_edge_boundaries(domain, lev: Level, wet: np.ndarray, type_2d: int, type_3d: int,
-                        prefix: str = "") -> List[Tuple[str, int, int, int]]:
+                        prefix: str = "", sides: str = None) -> List[Tuple[str, int, int, int]]:
     """Add the open boundaries of :func:`level_edge_segments` to ``domain`` (before its grids are created), named
     ``<prefix><side letter><k>`` (k counting all of them, in the order added: W, E, S, N), with the given 2D and 3D
-    boundary types (e.g. ``pygetm.FLATHER_TRANSPORT``, ``pygetm.ZERO_GRADIENT``). Returns the stretches."""
+    boundary types (e.g. ``pygetm.FLATHER_TRANSPORT``, ``pygetm.ZERO_GRADIENT``); ``sides``: only these (default
+    all of the level's). Returns the stretches."""
     from ..open_boundaries import Side
 
-    segs = level_edge_segments(lev, wet)
+    segs = level_edge_segments(lev, wet, sides)
     for k, (side, l, m0, m1) in enumerate(segs):
         domain.open_boundaries.add_by_index(side=getattr(Side, SIDES[side]), l=int(l), mstart=int(m0), mstop=int(m1),
                                             type_2d=type_2d, type_3d=type_3d, name=f"{prefix}{side}{k}")

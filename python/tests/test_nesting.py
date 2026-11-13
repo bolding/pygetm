@@ -561,6 +561,16 @@ class TestLevelDepthAndEdges(unittest.TestCase):
         child = self.levels["east"]
         self.assertEqual(read_level_depth(self.write(child, extra=0), child, "depth", "lon", "lat").shape,
                          child.domain_shape)
+        # a file in other units than the layout (scale: its units per layout unit)
+        import netCDF4
+
+        path = self.write(root)  # (the file above was shifted)
+        with netCDF4.Dataset(path, "a") as nc:
+            nc["lon"][:] = nc["lon"][:] * 1000.0
+            nc["lat"][:] = nc["lat"][:] * 1000.0
+        self.assertTrue(np.isfinite(read_level_depth(path, root, "depth", "lon", "lat", scale=1000.0)).all())
+        with self.assertRaisesRegex(ValueError, "cell centres"):
+            read_level_depth(path, root, "depth", "lon", "lat")
 
     def test_edges(self):
         import pygetm
@@ -574,6 +584,9 @@ class TestLevelDepthAndEdges(unittest.TestCase):
         self.assertEqual(east, [(1, 2), (6, 7)])  # rows 2..5 are the child's
         self.assertEqual(level_edge_segments(child, wet["east"]), [("E", child.band + child.nx - 1, child.band,
                                                                       child.band + child.ny)])
+        # only W open: its corners are its own (they are left out only where the perpendicular side is open too)
+        self.assertEqual(level_edge_segments(root, wet["root"], sides="W"), [("W", 0, 0, root.ny)])
+        self.assertEqual(level_edge_segments(child, wet["east"], sides="W"), [])  # not one of its outer sides
         lon_e, lat_e = root.edges()
         domain = pygetm.domain.create_spherical(lon_e, lat_e, interfaces=True, H=np.full(root.domain_shape, 10.0),
                                                 logger=pygetm.parallel.get_logger(level="ERROR"))
