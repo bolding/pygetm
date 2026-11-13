@@ -505,6 +505,83 @@ class TestNestingGeometry(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one root"):
             load_levels(dict(a=root, b=dict(root)), root_band=0)
 
+class TestLevelDepthAndEdges(unittest.TestCase):
+    """pygetm.nesting.bathymetry.read_level_depth (a file with a band of 2 cut to the level's grid, a wrong grid
+    refused, min_depth) and pygetm.nesting.boundaries (the root's and a child's edge stretches; added to a domain
+    in the order W, E, S, N with their names)."""
+
+    def setUp(self):
+        import tempfile
+
+        self.dir = tempfile.TemporaryDirectory()
+        from pygetm.nesting.geometry import load_levels
+
+        spec = {"root": dict(nx=10, ny=8, lon0=0.0, lat0=50.0, dlon=0.1, dlat=0.1),
+                "east": dict(parent="root", istart=6, istop=10, jstart=2, jstop=6, ratio=2)}
+        self.levels = {l.name: l for l in load_levels(spec, root_band=0, active=False)}
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write(self, lev, extra=2, shift=0.0):
+        import netCDF4
+        import os
+
+        ny, nx = lev.domain_shape
+        lon_e, lat_e = lev.edges()
+        d = lev.dlon
+        lon = np.concatenate([lon_e[0] - d * (np.arange(extra, 0, -1) - 0.5), 0.5 * (lon_e[1:] + lon_e[:-1]),
+                              lon_e[-1] + d * (np.arange(extra) + 0.5)]) + shift
+        lat = np.concatenate([lat_e[0] - lev.dlat * (np.arange(extra, 0, -1) - 0.5), 0.5 * (lat_e[1:] + lat_e[:-1]),
+                              lat_e[-1] + lev.dlat * (np.arange(extra) + 0.5)])
+        H = np.full((lat.size, lon.size), 10.0)
+        H[:, :extra + 1] = 1.0  # shallow first columns
+        path = os.path.join(self.dir.name, f"{lev.name}.nc")
+        with netCDF4.Dataset(path, "w") as nc:
+            nc.createDimension("lon", lon.size)
+            nc.createDimension("lat", lat.size)
+            nc.createVariable("lon", "f8", ("lon",))[:] = lon
+            nc.createVariable("lat", "f8", ("lat",))[:] = lat
+            nc.createVariable("depth", "f8", ("lat", "lon"))[:] = H
+            nc.createVariable("mask", "i1", ("lat", "lon"))[:] = 1
+        return path
+
+    def test_read_level_depth(self):
+        from pygetm.nesting.bathymetry import read_level_depth
+
+        root = self.levels["root"]
+        path = self.write(root)
+        H = read_level_depth(path, root, "depth", "lon", "lat", mask_variable="mask")
+        self.assertEqual(H.shape, root.domain_shape)
+        self.assertTrue(np.isfinite(H).all())
+        H = read_level_depth(path, root, "depth", "lon", "lat", mask_variable="mask", min_depth=2.0)
+        self.assertTrue(np.isnan(H[:, 0]).all() and np.isfinite(H[:, 1:]).all())  # the shallow first column: land
+        with self.assertRaisesRegex(ValueError, "cell centres"):
+            read_level_depth(self.write(root, shift=0.05), root, "depth", "lon", "lat")
+        child = self.levels["east"]
+        self.assertEqual(read_level_depth(self.write(child, extra=0), child, "depth", "lon", "lat").shape,
+                         child.domain_shape)
+
+    def test_edges(self):
+        import pygetm
+        from pygetm.nesting.boundaries import add_edge_boundaries, level_edge_segments
+
+        root, child = self.levels["root"], self.levels["east"]
+        wet = {n: np.ones(l.domain_shape, bool) for n, l in self.levels.items()}
+        segs = level_edge_segments(root, wet["root"])
+        self.assertEqual([s[0] for s in segs], ["W", "E", "E", "S", "N"])  # the east edge split by the child's window
+        east = [(s[2], s[3]) for s in segs if s[0] == "E"]
+        self.assertEqual(east, [(1, 2), (6, 7)])  # rows 2..5 are the child's
+        self.assertEqual(level_edge_segments(child, wet["east"]), [("E", child.band + child.nx - 1, child.band,
+                                                                      child.band + child.ny)])
+        lon_e, lat_e = root.edges()
+        domain = pygetm.domain.create_spherical(lon_e, lat_e, interfaces=True, H=np.full(root.domain_shape, 10.0),
+                                                logger=pygetm.parallel.get_logger(level="ERROR"))
+        domain.external = root.external()
+        added = add_edge_boundaries(domain, root, wet["root"], pygetm.FLATHER_TRANSPORT, pygetm.ZERO_GRADIENT)
+        self.assertEqual(added, segs)
+        self.assertEqual(domain.open_boundaries.i.size, sum(m1 - m0 for _, _, m0, m1 in segs))  # the points added
+
 class TestNestingSponge(unittest.TestCase):
     def test_water_distance_and_weight(self):
         from pygetm.nesting.sponge import sponge_weight, water_distance
