@@ -96,7 +96,7 @@ subroutine c_update_adaptive(nx, ny, nz, halox, haloy, &
    do k=1,kmax
       do j=jmin,jmax
          do i=imin,imax
-            if (mask(i,j) == 1) haux(i,j,k) = D(i,j) * (ga(i,j,k) - ga(i,j,k-1))
+            if (mask(i,j) >= 1) haux(i,j,k) = D(i,j) * (ga(i,j,k) - ga(i,j,k-1))
          end do
       end do
    end do

@@ -402,6 +402,10 @@ class GlobalRiverCollection(Mapping[str, GlobalRiver]):
 
         return LocalRiverCollection(grid, local_rivers, self.logger)
 
+    def remove(self, name: str):
+        """Remove the river ``name`` (e.g. one that another nested level computes)."""
+        self._rivers = [r for r in self._rivers if r.name != name]
+
     def __getitem__(self, key: str) -> GlobalRiver:
         for river in self._rivers:
             if key == river.name:

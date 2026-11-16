@@ -1,6 +1,8 @@
 import enum
 import logging
-from typing import Optional
+from typing import Callable, Optional
+
+from mpi4py import MPI
 
 import numpy as np
 
@@ -85,6 +87,8 @@ class Momentum:
         "logger",
         "_U_cum",
         "_V_cum",
+        "U_cum",
+        "V_cum",
         "_ufirst",
         "_u3dfirst",
         "diffuse_momentum",
@@ -95,6 +99,9 @@ class Momentum:
         "advection_scheme",
         "advection_split_2d",
         "coriolis_scheme",
+        "curvature",
+        "_curv",
+        "_An_timestep_once",
         "An",
         "An_uu",
         "An_uv",
@@ -127,6 +134,8 @@ class Momentum:
         advection_split_2d: operators.AdvectionSplit = operators.AdvectionSplit.FULL,
         coriolis_scheme: CoriolisScheme = CoriolisScheme.DEFAULT,
         avmmol: float = 1.8e-6,
+        curvature: Optional[bool] = False,
+        An_timestep_once: bool = False,
     ):
         """Create momentum handler
 
@@ -143,7 +152,23 @@ class Momentum:
             coriolis_scheme: interpolation method to use to recontruct velocities for
                 Coriolis terms
             avmmol: molecular viscosity (m2 s-1)
+            curvature: include the curvature term of the momentum equations on grids
+                whose metrics vary (``cord_curv`` in legacy GETM): it is added to the
+                Coriolis parameter. ``False`` (default, as upstream pyGETM): off;
+                ``None``: on for curvilinear grids, off for rectilinear
+                longitude/latitude grids (on those the term is u tan(lat) / R);
+                ``True``: on wherever the metrics vary. On Cartesian grids with
+                constant (or only i-dependent dx and j-dependent dy) metrics the
+                term is zero.
+            An_timestep_once: apply the time step to the transport damping (An)
+                once: :attr:`dampU`, :attr:`dampV` are tendencies that the 2D
+                transport update multiplies by the time step, so their increment is
+                taken for a unit step. ``False`` (default, as upstream pyGETM): the
+                increment for the time step, multiplied by it again.
         """
+        self.curvature = curvature
+        self._curv = None
+        self._An_timestep_once = An_timestep_once
         self._Am_const = Am
         self._An_const = An
         self.cnpar = cnpar
@@ -493,8 +518,26 @@ class Momentum:
             ),
         )
 
-        self._U_cum = np.zeros_like(self.Ui.all_values)
-        self._V_cum = np.zeros_like(self.Vi.all_values)
+        # Depth-integrated transports summed over the microtimesteps of the current
+        # macrotimestep. Part of the state (optional, for restart files without
+        # them): a coupler (nesting) may add a correction after the macrotimestep's
+        # reset, which then belongs to the next macrotimestep.
+        self.U_cum = ugrid.array(
+            name="U_cum",
+            units="m2 s-1",
+            long_name="depth-integrated velocity in x-direction summed over current macrotimestep",
+            fill=0.0,
+            attrs=dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType)),
+        )
+        self.V_cum = vgrid.array(
+            name="V_cum",
+            units="m2 s-1",
+            long_name="depth-integrated velocity in y-direction summed over current macrotimestep",
+            fill=0.0,
+            attrs=dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType)),
+        )
+        self._U_cum = self.U_cum.all_values
+        self._V_cum = self.V_cum.all_values
 
         self.udev = ugrid.array(
             name="udev",
@@ -561,6 +604,8 @@ class Momentum:
 
         self.logger = logger
         self.runtype = runtype
+
+        self._curv = self._curvature_coefficients(tgrid)
 
         # Disable bottom friction if minimum hydrodynamic bottom roughness is 0 everywhere
         z0b_u = ugrid.z0b_min.all_values[~ugrid.z0b_min.all_mask] == 0.0
@@ -669,7 +714,9 @@ class Momentum:
             attrs=dict(
                 _require_halos=True,
                 _time_varying=False,
-                _valid_at=(CellType.BOUNDARY,),
+                # EXTERNAL: valid in cells set from outside (nesting), so the
+                # damping at faces next to them (a child's interface) is defined
+                _valid_at=(CellType.BOUNDARY, CellType.EXTERNAL),
             ),
         )
         self.An.fill(self._An_const)
@@ -703,6 +750,12 @@ class Momentum:
             self.qk.mirror()
             self.Ui.mirror()
             self.Vi.mirror()
+
+            # Sums over the current macrotimestep (zero, or from a restart)
+            for cum in (self.U_cum, self.V_cum):
+                np.nan_to_num(cum.all_values, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            self._U_cum = self.U_cum.all_values
+            self._V_cum = self.V_cum.all_values
 
         # If horizontal diffusivity [damping] is specified, interpolate it to
         # U and V grids
@@ -829,12 +882,16 @@ class Momentum:
         )
 
         if self.An_uu is not None:
-            # Numerical damping of transports
+            # Numerical damping of transports. dampU/dampV are tendencies
+            # (advance_2d_transport multiplies them by the time step): with
+            # An_timestep_once the increment of horizontal_diffusion is taken for a
+            # unit time step (upstream: for the time step)
+            dt = 1.0 if self._An_timestep_once else timestep
             pygetm._pygetm.horizontal_diffusion(
-                self.U, self.An_uu, self.An_uv, timestep, self.dampU
+                self.U, self.An_uu, self.An_uv, dt, self.dampU
             )
             pygetm._pygetm.horizontal_diffusion(
-                self.V, self.An_vu, self.An_vv, timestep, self.dampV
+                self.V, self.An_vu, self.An_vv, dt, self.dampV
             )
 
     def advance(
@@ -848,6 +905,7 @@ class Momentum:
         idpdx: core.Array,
         idpdy: core.Array,
         viscosity: core.Array,
+        before_diagnostics: Optional[Callable[[], None]] = None,
     ):
         """Update depth-explicit transports (:attr:`pk`, :attr:`qk`) and velocities
         (:attr:`uk`, :attr:`vk`). This will also update their halos.
@@ -862,6 +920,10 @@ class Momentum:
             idpdx: internal pressure gradient (m2 s-2) in x-direction
             idpdy: internal pressure gradient (m2 s-2) in y-direction
             viscosity: turbulent viscosity (m2 s-1)
+            before_diagnostics: optional; called after the transports are updated and
+                before the diagnostics (:meth:`update_diagnostics`), which then follow
+                whatever it changed, the Coriolis term included (couplers, e.g. nesting,
+                may replace transports there)
         """
         # Start the halo exchange for viscosity, as this needs to be interpolated
         # to the U and V grids. For that, information from the halos is used.
@@ -938,7 +1000,11 @@ class Momentum:
             u()
         self._u3dfirst = not self._u3dfirst
 
-        self.update_diagnostics(timestep, viscosity, skip_coriolis=True)
+        if before_diagnostics is None:
+            self.update_diagnostics(timestep, viscosity, skip_coriolis=True)
+        else:
+            before_diagnostics()
+            self.update_diagnostics(timestep, viscosity)
 
     def update_diagnostics(
         self, timestep: float, viscosity: core.Array, skip_coriolis: bool = False
@@ -1199,6 +1265,55 @@ class Momentum:
         pygetm._pygetm.bottom_friction(u, v_U, DU, self.avmmol, ru, update_z0b)
         pygetm._pygetm.bottom_friction(u_V, v, DV, self.avmmol, rv, update_z0b)
 
+    def _curvature_coefficients(self, tgrid: core.Grid) -> Optional[dict]:
+        """Metric coefficients of the curvature term (legacy GETM ``cord_curv``):
+        on U points (x-momentum) ``(dy_T(i+1) - dy_T(i)) / area`` for the
+        interpolated V and ``(dx_X(north) - dx_X(south)) / area`` for U itself; on V
+        points (y-momentum) ``(dy_X(east) - dy_X(west)) / area`` for V itself and
+        ``(dx_T(j+1) - dx_T(j)) / area`` for the interpolated U. None if the term is
+        not used."""
+        if self.curvature is False:
+            return None
+        ugrid, vgrid, xgrid = tgrid.ugrid, tgrid.vgrid, tgrid.xgrid
+        dxT, dyT = tgrid.dx.all_values, tgrid.dy.all_values
+        dxX, dyX = xgrid.dx.all_values, xgrid.dy.all_values
+        u_cross, v_cross = np.zeros_like(dyT), np.zeros_like(dxT)
+        with np.errstate(invalid="ignore"):
+            u_cross[:, :-1] = dyT[:, 1:] - dyT[:, :-1]
+            u_own = dxX[1:, 1:] - dxX[:-1, 1:]
+            v_own = dyX[1:, 1:] - dyX[1:, :-1]
+            v_cross[:-1, :] = dxT[1:, :] - dxT[:-1, :]
+        coef = dict(u_cross=u_cross, u_own=u_own, v_own=v_own, v_cross=v_cross)
+        for key, grid in (("u", ugrid), ("v", vgrid)):
+            for part in ("cross", "own"):
+                a = coef[f"{key}_{part}"] * grid.iarea.all_values
+                a[~np.isfinite(a) | grid._land] = 0.0
+                coef[f"{key}_{part}"] = a
+        nonzero = any(np.any(a != 0.0) for a in coef.values())
+
+        # Rectilinear longitude/latitude grid: metrics from longitude and latitude
+        # (no x, y), longitude depending on i only and latitude on j only
+        lonlat_rect = tgrid.x is None and tgrid.lon is not None
+        if lonlat_rect:
+            h = tgrid.halox, tgrid.haloy
+            lon = tgrid.lon.all_values[h[1] : -h[1], h[0] : -h[0]]
+            lat = tgrid.lat.all_values[h[1] : -h[1], h[0] : -h[0]]
+            lonlat_rect = bool(
+                (np.ptp(lon, axis=0) == 0.0).all() and (np.ptp(lat, axis=1) == 0.0).all()
+            )
+        if tgrid.tiling is not None and tgrid.tiling.n > 1:
+            flags = np.array([nonzero, not lonlat_rect], dtype=np.intc)
+            nonzero, curvilinear = (bool(v) for v in tgrid.tiling.allreduce(flags, op=MPI.MAX))
+            lonlat_rect = not curvilinear
+        use = nonzero and (self.curvature is True or not lonlat_rect)
+        if nonzero and lonlat_rect and not use:
+            self.logger.info(
+                "Curvature term off (rectilinear longitude/latitude grid; use curvature=True to include it)"
+            )
+        elif use:
+            self.logger.info("Curvature term of the momentum equations included")
+        return coef if use else None
+
     def coriolis(self, U: core.Array, out: core.Array, x_direction: bool):
         """Calculate change in transport due to Coriolis force
 
@@ -1219,8 +1334,29 @@ class Momentum:
             out.all_values *= np.sqrt(Dout.all_values, where=out.grid._water)
         else:
             U.interp(out)
-        # todo: cord_curv
-        out.all_values *= out.grid.cor.all_values
+        if self._curv is None:
+            out.all_values *= out.grid.cor.all_values
+        else:
+            # Curvature term (legacy GETM cord_curv), added to the Coriolis parameter:
+            # x-momentum (V interpolated to U, out on U):
+            #   (Vloc (dy_T(i+1) - dy_T(i)) - U (dx_X(north) - dx_X(south))) / (D area)
+            # y-momentum (U interpolated to V, out on V):
+            #   (V (dy_X(east) - dy_X(west)) - Uloc (dx_T(j+1) - dx_T(j))) / (D area)
+            loc = out.all_values
+            if U.ndim == 2:
+                own = self.V if x_direction else self.U
+                D = own.grid.D.all_values
+            else:
+                own = self.qk if x_direction else self.pk
+                D = own.grid.hn.all_values
+            c = self._curv
+            if x_direction:
+                num = own.all_values * c["v_own"] - loc * c["v_cross"]
+            else:
+                num = loc * c["u_cross"] - own.all_values * c["u_own"]
+            water = np.broadcast_to(out.grid._water, num.shape)
+            curv = np.divide(num, D, out=np.zeros_like(num), where=water)
+            loc *= out.grid.cor.all_values + curv
         if x_direction:
             np.negative(out.all_values, out=out.all_values)
 

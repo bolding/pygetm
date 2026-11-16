@@ -6,6 +6,10 @@ module advection_base
 
    private
 
+   !> mask value of a cell computed by another model (pygetm.constants.CellType.EXTERNAL: a nesting level's ring,
+   !> its parent's hole): wet, its faces open, so it takes part in advection as water
+   integer, parameter, public :: MASK_EXTERNAL = 5
+
    type, abstract, public :: type_advection_base
    contains
       procedure(u2d), deferred, nopass :: u2d
@@ -14,7 +18,7 @@ module advection_base
    end type
 
    interface
-SUBROUTINE u2d(imin,imax,jmin,jmax,halo,umask,idxu,dyu,hu,u,tmask,iA,apply_diffusion,Ah,dt,h,f)
+SUBROUTINE u2d(imin,imax,jmin,jmax,halo,umask,idxu,dyu,hu,u,tmask,iA,apply_diffusion,Ah,dt,h,f,flux_acc)
    import real64
    ! Subroutine arguments
    integer, intent(in) :: imin,imax,jmin,jmax
@@ -32,10 +36,11 @@ SUBROUTINE u2d(imin,imax,jmin,jmax,halo,umask,idxu,dyu,hu,u,tmask,iA,apply_diffu
    real(real64), intent(in) :: dt
    real(real64), intent(inout) :: h(_A_)
    real(real64), intent(inout) :: f(_A_)
+   real(real64), intent(inout), optional :: flux_acc(_A_)
 #undef _A_
 END SUBROUTINE
 
-SUBROUTINE v2d(imin,imax,jmin,jmax,halo,vmask,dxv,idyv,hv,v,tmask,iA,apply_diffusion,Ah,dt,h,f)
+SUBROUTINE v2d(imin,imax,jmin,jmax,halo,vmask,dxv,idyv,hv,v,tmask,iA,apply_diffusion,Ah,dt,h,f,flux_acc)
    import real64
    ! Subroutine arguments
    integer, intent(in) :: imin,imax,jmin,jmax
@@ -53,6 +58,7 @@ SUBROUTINE v2d(imin,imax,jmin,jmax,halo,vmask,dxv,idyv,hv,v,tmask,iA,apply_diffu
    real(real64), intent(in) :: dt
    real(real64), intent(inout) :: h(_A_)
    real(real64), intent(inout) :: f(_A_)
+   real(real64), intent(inout), optional :: flux_acc(_A_)
 #undef _A_
 END SUBROUTINE
 
