@@ -88,6 +88,7 @@ from mpi4py import MPI
 
 from ..constants import CENTERS, CellType
 from ..simulation import Coupler
+from .endpoint import Endpoint
 from .plan import Tag
 from .runtime import NestingRun, check_couplers, sync_order
 from . import vremap
@@ -194,10 +195,10 @@ class Nested3D(Coupler):
     def __init__(self, nest: NestingRun, sim, tracers: Optional[Sequence] = None, remap_scheme: str = "ppm",
                  ring_slopes: bool = True, ring_time: str = "hold"):
         self.nest, self.sim = nest, sim
-        self.lev = nest.level
-        self.t = nest.tile
-        self.til = nest.tilings[self.lev.name]
-        self.up, self.down = nest.up, nest.down
+        #: this process's end of the level's interfaces (shared with Nested2D)
+        self.ep = ep = Endpoint(nest)
+        self.lev, self.t, self.til = ep.lev, ep.t, ep.til
+        self.up, self.down = ep.up, ep.down
         #: the stretch of the amounts (flux register, transports) between columns of
         #: different depth: the upper KEEP of min(D_c, D_p) at its depth, the rest
         #: stretched; their sums over the layers are kept exactly
@@ -286,7 +287,7 @@ class Nested3D(Coupler):
         setattr(self, name, wrapper)
 
     def loc(self, j, i):
-        return self.til.local(self.t, j, i)
+        return self.ep.loc(j, i)
 
     def _tracers(self, sim):
         if self._tracer_spec is None:
@@ -798,13 +799,10 @@ class Nested3D(Coupler):
             return
         r = plan.child.ratio
         nt = len(self.tracers) + 1  # the tracers and the water
-        H = np.zeros((flist.size, r, nzc))
-        F = np.zeros((nt, flist.size, r, nzc))
-        for tt, fpos, fa in plan.faces_to(self.t):
-            buf = np.empty(((1 + nt) * nzc, fpos.size))
-            self._recv(plan.comm, buf, plan.coff + tt, Tag.FLUX_3D)
-            H[fpos, fa] = buf[:nzc].T
-            F[:, fpos, fa] = buf[nzc:].reshape(nt, nzc, -1).transpose(0, 2, 1)
+        # per sub-face: its layer thicknesses, then per tracer (and the water) its amounts, child layers
+        sub = self.ep.recv_subfaces(plan, (1 + nt) * nzc, Tag.FLUX_3D, self._recv)  # (rows, faces, r)
+        H = np.ascontiguousarray(sub[:nzc].transpose(1, 2, 0))  # (faces, r, nzc)
+        F = np.ascontiguousarray(sub[nzc:].reshape(nt, nzc, flist.size, r).transpose(0, 2, 3, 1))  # (nt, faces, r, nzc)
         wf = self.lev.wfaces[plan.child.name]
         args = (wf["is_x"][flist], wf["face"][0][flist], wf["face"][1][flist])
         hp = self._face_profiles((self.sim.U.hn, self.sim.V.hn), *args)  # (nf, nzp)
@@ -873,13 +871,9 @@ class Nested3D(Coupler):
         if not flist.size:
             return False
         r = plan.child.ratio
-        H = np.zeros((flist.size, r, nzc))
-        Q = np.zeros((flist.size, r, nzc))
-        for tt, fpos, fa in plan.faces_to(self.t):
-            buf = np.empty((2 * nzc, fpos.size))
-            self._recv(plan.comm, buf, plan.coff + tt, Tag.TRANSPORT_3D)
-            H[fpos, fa] = buf[:nzc].T
-            Q[fpos, fa] = buf[nzc:].T
+        sub = self.ep.recv_subfaces(plan, 2 * nzc, Tag.TRANSPORT_3D, self._recv)  # (rows, faces, r)
+        H = np.ascontiguousarray(sub[:nzc].transpose(1, 2, 0))  # (faces, r, nzc): layer thicknesses
+        Q = np.ascontiguousarray(sub[nzc:].transpose(1, 2, 0))  # and transports
         wf = self.lev.wfaces[plan.child.name]
         ins = wf["inside"][flist] & plan.uv_of[self.t]  # the face points this tile owns (Plan.uv_of)
         if not ins.any():
@@ -1072,9 +1066,9 @@ class Nested3D(Coupler):
         self.child_scheme = [{d[0]: d[8] for d in dts}[plan.child.name] for plan in self.down]
         self._ring = []
         if self.up is not None:
-            self._ring = self.up.ring_to(self.t)
-            rc = self.up.ring_cells(self.t)
-            self._rj, self._ri = self.loc(rc["bj"], rc["bi"])
+            self._ring = self.ep.ring
+            rc = self.ep.ring_cells
+            self._rj, self._ri = self.ep.rj, self.ep.ri
             r = self.lev.ratio
             self._ring_ox, self._ring_oy = subcell_offset(rc["b"], r), subcell_offset(rc["a"], r)  # x: b, y: a
             # the child's interior cell next to each ring cell (within the halo)
@@ -1093,7 +1087,7 @@ class Nested3D(Coupler):
             sim.tracers.get_flux = lambda t: flux_of.get(t.name)
         if self.up is not None:
             e = self.lev.edge
-            self._own_edge = self.til.owner(*e["inner"]) == self.t
+            self._own_edge = self.ep.own_edge
         # this level's register: amount per tracer, edge face and layer (surface first)
         nedge = self.lev.edge["is_x"].size if self.up is not None else 0
         self.reg = np.zeros((len(self.tracers) + 1, nedge, self.nz))  # tracers, then the water

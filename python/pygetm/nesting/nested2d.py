@@ -46,6 +46,7 @@ from .geometry import Level
 from .plan import LevelTiling, Tag
 from .runtime import NestingRun, check_couplers, sync_order
 from . import operators as ops
+from .endpoint import Endpoint
 
 
 
@@ -275,11 +276,11 @@ class Nested2D(Coupler):
 
     def __init__(self, nest: NestingRun, sim, sponge_width=0.0, sponge_alpha=0.1):
         self.nest, self.sim = nest, sim
-        self.lev = lev = nest.level
-        self.t = nest.tile
-        self.til = nest.tilings[lev.name]
-        self.world = nest.world
-        self.up, self.down = nest.up, nest.down
+        #: this process's end of the level's interfaces (shared with Nested3D)
+        self.ep = ep = Endpoint(nest)
+        self.lev = lev = ep.lev
+        self.t, self.til, self.world = ep.t, ep.til, ep.world
+        self.up, self.down = ep.up, ep.down
         #: sponge (child levels; see :mod:`pygetm.nesting.sponge`): damping of
         #: the transports over ``sponge_width`` parent cells next to the
         #: interface (counted through water), with An dt / dx^2 =
@@ -301,12 +302,12 @@ class Nested2D(Coupler):
             self.up_faces = face_transfers(lev, self.up)
         self.down_faces = [face_transfers(c, plan) for c, plan in zip(lev.children, self.down)]
         self.reg = np.zeros(lev.edge["is_x"].size)
-        self.own_edge = self.til.owner(*lev.edge["inner"]) == self.t
+        self.own_edge = ep.own_edge
         if self.up is not None:
-            self._ring = self.up.ring_to(self.t)
-            rc = self.up.ring_cells(self.t)
+            self._ring = ep.ring
+            rc = ep.ring_cells
             self._ring_a, self._ring_b = rc["a"], rc["b"]
-            self._rj, self._ri = self.loc(rc["bj"], rc["bi"])
+            self._rj, self._ri = ep.rj, ep.ri
             self._ru = self.loc(*self.up_faces["ring_x"].points(self.t))
             self._rv = self.loc(*self.up_faces["ring_y"].points(self.t))
             #: lowest ring elevation: the bed + Dmin (drying)
@@ -498,7 +499,7 @@ class Nested2D(Coupler):
     # --- helpers --------------------------------------------------------------
 
     def loc(self, j, i):
-        return self.til.local(self.t, j, i)
+        return self.ep.loc(j, i)
 
     def _dt(self):
         return self.sim.timestep
@@ -660,11 +661,7 @@ class Nested2D(Coupler):
         flist = plan.faces_of[self.t]
         if not flist.size:
             return None
-        sub = np.zeros((flist.size, plan.child.ratio))
-        for tt, fpos, fa in plan.faces_to(self.t):
-            buf = np.empty(fpos.size)
-            self.clock.recv(plan.comm, buf, plan.coff + tt, Tag.FLUX)
-            sub[fpos, fa] = buf
+        sub = self.ep.recv_subfaces(plan, 1, Tag.FLUX, self.clock.recv)[0]
         return ops.face_sum(sub)
 
     def _correct_elevation(self, plan, fp, fc):
@@ -832,6 +829,12 @@ class Nested2D(Coupler):
                     self._set_ring_z(self._snap[0])
                 self._own_edge_fluxes()
             self._fps = [self._window_volumes(plan) for plan in self.down]
+            if macro_active and sim.runtype > 1:
+                # the 3D step's summed transports, corrected by the flux matching (after the last state update) in
+                # the subdomain that owns each face only: the halos made to agree before the 3D momentum uses them
+                # (nothing changes them between this stage and the 3D momentum)
+                sim.momentum.U_cum.update_halos()
+                sim.momentum.V_cum.update_halos()
 
     def after_state_update(self, sim, macro_active):
         self._phase.all_values[...] = sim.istep % self._period  # restart state (see _phase_array)

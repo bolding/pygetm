@@ -1403,14 +1403,6 @@ class Simulation(BaseSimulation):
             # add_freshwater_inputs above.
             self.update_depth(_3d=True, timestep=self.macrotimestep)
 
-            if self._couplers:
-                # Couplers (nesting) may have corrected the summed transports of
-                # this macrotimestep where they replaced U/V, in the subdomain that
-                # owns the face only: make the halos agree before the 3D momentum
-                # uses them (as they do after a restart).
-                self.momentum.U_cum.update_halos()
-                self.momentum.V_cum.update_halos()
-
             # Update momentum from time=-1/2 to 1/2 of the macrotimestep, using forcing
             # defined at time=0. For this purpose, surface stresses (tausxo, tausyo)
             # and surface pressure gradients (dpdxo, dpdyo) at the end of the previous
@@ -1427,18 +1419,16 @@ class Simulation(BaseSimulation):
                 self.internal_pressure.idpdx,
                 self.internal_pressure.idpdy,
                 self.vertical_mixing.num,
-                diagnostics=not self._couplers,
-            )
-            if self._couplers:
-                # Couplers (nesting) may replace the 3D transports; the diagnostics
+                # Couplers (nesting) may replace the 3D transports: the diagnostics
                 # (vertical velocity, velocities, shear, bottom friction, advection,
-                # slow terms, Coriolis) are then computed from the replaced
-                # transports, as they are after a restart. Without a change this
-                # is the same as the update at the end of momentum.advance.
-                self._coupling_stage("momentum_3d_transports", macro_active)
-                self.momentum.update_diagnostics(
-                    self.macrotimestep, self.vertical_mixing.num
+                # slow terms, Coriolis) then follow the replaced transports, as they
+                # do after a restart
+                before_diagnostics=(
+                    lambda: self._coupling_stage("momentum_3d_transports", macro_active)
                 )
+                if self._couplers
+                else None,
+            )
 
             # Update turbulent quantities (T grid - interfaces) from time=0 to
             # time=1 (macrotimestep), using surface/buoyancy-related forcing
