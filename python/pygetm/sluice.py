@@ -31,16 +31,12 @@ freshwater update).
 The two cells may lie on different subdomains: their levels, areas and column means
 are combined with one allreduce per step over the simulation's communicator.
 
-In a nested run (``attach(sim, nest=run)``, :class:`pygetm.nesting.runtime.NestingRun`)
-the two ends may lie on different levels, e.g. a fjord behind a dam in a fine level and
-the sea in its parent. Each end is a river and belongs to the level that computes its
-cell (``NestingRun._assign_rivers``). The two levels compute the flow together at
-every time they share (every ``steps_per_root / gcd`` of a level's own steps; the
-parent's step for a parent and its child), from both levels and column means then,
-with one allreduce over the processes of the two levels; each level applies that flow
-to its own end until the next shared time, so both move the same volume. Create the
-sluice on every level (as the rivers) and attach it on all processes of all levels,
-after the nesting couplers.
+The two ends may also be held by two simulations that run together (``attach(sim,
+comm=, every=)``): their levels, column means and the flow then go through ``comm`` (the
+processes of both), and the flow is updated every ``every`` own steps, at the times the
+two share; each applies it to its own end until the next, so both move the same volume.
+In a nested run (e.g. a fjord behind a dam in a fine level and the sea in its parent)
+:meth:`pygetm.nesting.runtime.NestingRun.attach_sluice` works these out.
 
     sluice = pygetm.sluice.Sluice(domain, "hvide_sande", a=(8.13, 56.00), b=(8.10, 56.00),
                                   area=50.0, mu=0.6, gate=1.0)
@@ -123,27 +119,13 @@ class Sluice(Coupler):
         self.content = {}  # per tracer: content moved a -> b so far (concentration x m3)
         self.opening = 0.0
 
-    def attach(self, sim, nest=None):
-        """Add the sluice to ``sim``. ``nest``: the nesting run; then collective over
-        all processes of all levels (call it on every level, after the nesting couplers);
-        a level that has neither end adds nothing."""
-        self._comm = None  # default: the simulation's (on_start)
-        self._every = 1  # own steps between two flow updates
-        if nest is not None:
-            from math import gcd
-
-            owners = [nest.river_owners[n] for n in self._names]
-            part = nest.level.name in owners and getattr(sim, "T", None) is not None
-            comm = nest.world.Split(0 if part else parallel.MPI.UNDEFINED, nest.world.rank)
-            if not part:
-                return self
-            if len(set(owners)) > 1:
-                spr = [l.steps_per_root for l in nest.levels if l.name in owners]
-                self._comm = comm
-                self._every = nest.level.steps_per_root // gcd(*spr)
-                self.levels = tuple(owners)
-            else:
-                comm.Free()
+    def attach(self, sim, comm=None, every: int = 1):
+        """Add the sluice to ``sim``. ``comm``: the communicator over the processes of all
+        simulations that hold an end (default: the simulation's); ``every``: own steps
+        between two flow updates, at times those simulations share (in a nested run
+        :meth:`pygetm.nesting.runtime.NestingRun.attach_sluice` gives both)."""
+        self._comm = comm
+        self._every = int(every)
         self._state_arrays(sim)
         sim.add_coupler(self)
         return self

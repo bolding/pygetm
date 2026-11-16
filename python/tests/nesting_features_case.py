@@ -78,7 +78,7 @@ def main():
     cpl = Nested2D(nest, sim)
     sim.add_coupler(cpl)
     for sl in sluices:
-        sl.attach(sim, nest=nest)
+        nest.attach_sluice(sl, sim)
     if what == "rivers":
         for r in sim.rivers.values():
             r.flow.set(50.0)

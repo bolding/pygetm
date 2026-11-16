@@ -40,7 +40,7 @@ At a sync, in an order without cycles over the hierarchy (as the 2D sync,
 
 * **flux matching (child -> parent):** pyGETM's
   tracer advection adds the amount through every face and layer to arrays
-  of this coupler (:attr:`pygetm.tracer.TracerCollection.face_fluxes`).
+  of this coupler (:attr:`pygetm.tracer.TracerCollection.get_flux`).
   The child sends, with the rim, the profiles through its edge faces (r
   sub-faces per parent interface face) over the parent's 3D step, with its face
   layer thicknesses. The parent remaps every sub-face profile onto the
@@ -263,8 +263,11 @@ class Nested3D(Coupler):
         self.n_clipped = 0
         self.n_seen_reused = 0  # ring slopes: neighbours' round trips not remapped (the same layers)
         self.max_deferred = 0.0
-        self._restart_ring_arrays()  # needs the tracers
-        self._deferred_arrays()
+        #: the tracers exchanged, resolved once here: the restart arrays below (which must exist before a restart
+        #: file is loaded) and everything in :meth:`on_start` use this list, so they agree. The tracers must exist
+        #: when the coupler is created.
+        self.tracers = self._tracers(sim)
+        self._state_arrays()
 
     # --- helpers -----------------------------------------------------------
 
@@ -562,6 +565,13 @@ class Nested3D(Coupler):
         self._rc = (new, prev, lo_, hi_)
         self._prev_to_restart()
 
+    def _state_arrays(self):
+        """The coupler's part of the model state (restart files): the previous 3D ring
+        (:meth:`_restart_ring_arrays`) and the deferred flux corrections
+        (:meth:`_deferred_arrays`)."""
+        self._restart_ring_arrays()
+        self._deferred_arrays()
+
     def _restart_ring_arrays(self):
         """Arrays (part of the model state) with the previous ring, per tracer, at the
         ring cells, and where it is set."""
@@ -570,7 +580,7 @@ class Nested3D(Coupler):
             return
         T = self.sim.T
         attrs = dict(_part_of_state=True, _valid_at=tuple(CellType))  # nothing masked: exact values back
-        n = len(self._tracers(self.sim))
+        n = len(self.tracers)
         self._rs3 = [T.array(name=f"nest_ring3d_old_{k}", z=CENTERS, fill=0.0,
                              long_name=f"nesting: 3D ring of tracer {k} at the previous sync", attrs=dict(attrs))
                      for k in range(n)]
@@ -587,7 +597,7 @@ class Nested3D(Coupler):
             return
         T = self.sim.T
         attrs = dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType))
-        n = len(self._tracers(self.sim))
+        n = len(self.tracers)
         self._deferred = [T.array(name=f"nest_flux_deferred_{k}", z=CENTERS, fill=0.0,
                                   long_name=f"nesting: flux correction of tracer {k} deferred by the limiter (amount)",
                                   attrs=dict(attrs))
@@ -1039,7 +1049,6 @@ class Nested3D(Coupler):
     def on_start(self, sim):
         check_couplers(sim, self, self.nest.world, self.lev.name)
         T = sim.T
-        self.tracers = self._tracers(sim)
         self.wet = T.mask.all_values != 0
         h = T.halox
         self.computed = T.mask.all_values[h:-h, h:-h] == 1
@@ -1075,10 +1084,13 @@ class Nested3D(Coupler):
             self._rin_j, self._rin_i = self.loc(gj, gi)
         self.fluxes = []
         U, V = sim.U, sim.V
+        flux_of = {}
         for f in self.tracers:
             fl = (U.array(z=CENTERS, fill=0.0), V.array(z=CENTERS, fill=0.0))
-            sim.tracers.face_fluxes[f.name] = fl
+            flux_of[f.name] = fl
             self.fluxes.append(fl)
+        if flux_of:  # pyGETM's tracer advection adds the face amounts to these arrays
+            sim.tracers.get_flux = lambda t: flux_of.get(t.name)
         if self.up is not None:
             e = self.lev.edge
             self._own_edge = self.til.owner(*e["inner"]) == self.t

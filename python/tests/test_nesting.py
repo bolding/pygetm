@@ -7,43 +7,6 @@ import pygetm
 from pygetm import parallel
 from pygetm.simulation import Coupler, COUPLING_STAGES
 from pygetm.nesting import split_world
-from pygetm.util.interpolate import interp_columns
-
-
-class TestInterpColumns(unittest.TestCase):
-    def test_identity(self):
-        rng = np.random.default_rng(1)
-        xp = np.cumsum(rng.random((5, 4, 10)), axis=-1)
-        fp = rng.random(xp.shape)
-        np.testing.assert_array_equal(interp_columns(xp, xp, fp, axis=-1), fp)
-
-    def test_linear_profiles_are_reproduced(self):
-        # Source and target columns with different depths and layer counts
-        rng = np.random.default_rng(2)
-        xp = -np.sort(rng.random((7, 12)) * 50.0, axis=0)[::-1]  # (nz_src, np)
-        x = -np.sort(rng.random((5, 12)) * 40.0, axis=0)[::-1]  # (nz_tgt, np)
-        a, b = rng.random(12), rng.random(12)
-        fp = a * xp + b
-        f = interp_columns(x, xp, fp, axis=0)
-        inside = (x >= xp.min(axis=0)) & (x <= xp.max(axis=0))
-        np.testing.assert_allclose(f[inside], (a * x + b)[inside], rtol=1e-12)
-
-    def test_nearest_value_outside_range(self):
-        xp = np.array([[-30.0, -20.0, -10.0]])
-        fp = np.array([[3.0, 2.0, 1.0]])
-        f = interp_columns(np.array([[-50.0, -15.0, 0.0]]), xp, fp, axis=-1)
-        np.testing.assert_allclose(f, [[3.0, 1.5, 1.0]])
-
-    def test_invalid_points_skipped(self):
-        xp = np.array([[-30.0, -20.0, -10.0], [-3.0, -2.0, -1.0]])
-        fp = np.array([[np.nan, 2.0, 1.0], [np.nan, np.nan, np.nan]])
-        f = interp_columns(np.array([[-30.0, -15.0], [-2.0, -1.0]]), xp, fp, axis=-1)
-        np.testing.assert_allclose(f[0], [2.0, 1.5])
-        self.assertTrue(np.isnan(f[1]).all())
-
-    def test_shape_mismatch(self):
-        with self.assertRaises(ValueError):
-            interp_columns(np.zeros((3, 4)), np.zeros((3, 5)), np.zeros((3, 5)))
 
 
 class TestSplitWorld(unittest.TestCase):

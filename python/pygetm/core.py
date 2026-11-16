@@ -517,7 +517,8 @@ class Grid(_pygetm.Grid):
             return horizontal_mask[np.newaxis, ...]
 
         if CellType.ACTIVE in values:
-            # externally set points are valid wherever actively modeled ones are
+            # externally set points are valid wherever actively modeled ones are (EXTERNAL: cells another
+            # model computes, a nesting level's ring or its parent's hole; without nesting there are none)
             values = tuple(values) + (CellType.EXTERNAL,)
         valid_mask_values = frozenset(values)
         key = (valid_mask_values, z)

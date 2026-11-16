@@ -51,33 +51,21 @@ from . import operators as ops
 
 class HaloWaitTimer:
     """Time blocked in MPI_Waitall of pyGETM's halo updates (all of them: the
-    model's own and those the nesting calls), on this process.
+    model's own and those the nesting calls), on this process: pyGETM's
+    :mod:`pygetm.parallel` counts it once :meth:`install` switches it on
+    (:func:`pygetm.parallel.time_halo_waits`). Installed by :class:`Nested2D`."""
 
-    pyGETM's :class:`pygetm.parallel.HaloUpdater` calls the module-level
-    ``Waitall`` of :mod:`pygetm.parallel`; :meth:`install` replaces it by a
-    timed version (two MPI.Wtime calls per halo update). Installed by
-    :class:`Nested2D`, once per process."""
-
-    total = 0.0
-    _installed = False
-
-    @classmethod
-    def install(cls):
-        if cls._installed:
-            return
+    @staticmethod
+    def install():
         from .. import parallel
 
-        waitall = parallel.Waitall
+        parallel.time_halo_waits(True)
 
-        def timed_waitall(reqs, *args, **kwargs):
-            t0 = MPI.Wtime()
-            try:
-                return waitall(reqs, *args, **kwargs)
-            finally:
-                cls.total += MPI.Wtime() - t0
+    @staticmethod
+    def total() -> float:
+        from .. import parallel
 
-        parallel.Waitall = timed_waitall
-        cls._installed = True
+        return parallel.halo_wait_time
 
 
 class ExchangeClock:
@@ -94,20 +82,20 @@ class ExchangeClock:
         self.transfer = 0.0
         self.halo = 0.0
         self.halo_wait = 0.0
-        self.halo_wait0 = HaloWaitTimer.total
+        self.halo_wait0 = HaloWaitTimer.total()
 
     def halos(self, *fields):
         """Halo update of *fields* (pyGETM arrays), timed."""
-        t0, w0 = MPI.Wtime(), HaloWaitTimer.total
+        t0, w0 = MPI.Wtime(), HaloWaitTimer.total()
         for f in fields:
             f.update_halos()
         self.halo += MPI.Wtime() - t0
-        self.halo_wait += HaloWaitTimer.total - w0
+        self.halo_wait += HaloWaitTimer.total() - w0
 
     def model_halo_wait(self) -> float:
         """Time blocked in the model's own halo updates (not the nesting's)
         since the last reset."""
-        return max(HaloWaitTimer.total - self.halo_wait0 - self.halo_wait, 0.0)
+        return max(HaloWaitTimer.total() - self.halo_wait0 - self.halo_wait, 0.0)
 
     def recv(self, comm, buf, source: int, tag: int):
         t0 = MPI.Wtime()
@@ -124,7 +112,7 @@ class ExchangeClock:
 
     def reset(self):
         self.wait = self.transfer = self.halo = self.halo_wait = 0.0
-        self.halo_wait0 = HaloWaitTimer.total
+        self.halo_wait0 = HaloWaitTimer.total()
 
 
 class PointTransfer:

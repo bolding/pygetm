@@ -194,6 +194,29 @@ class NestingRun:
                 domain.rivers.remove(r.name)
         self.river_owners = owner
 
+    def attach_sluice(self, sluice, sim):
+        """Attach a :class:`pygetm.sluice.Sluice` to this level's simulation. Collective
+        over all processes of all levels: create the sluice on every level (as the
+        rivers) and call this on every level, after the nesting couplers. Each end is a
+        river and belongs to the level that computes its cell (:meth:`_assign_rivers`);
+        a level holding neither end adds nothing. With its ends on two levels, the two
+        compute the flow together at every time they share (every ``steps_per_root /
+        gcd`` of a level's own steps; the parent's step for a parent and its child), with
+        one allreduce over the processes of the two levels."""
+        from math import gcd
+
+        owners = [self.river_owners[n] for n in sluice._names]
+        part = self.level.name in owners and getattr(sim, "T", None) is not None
+        comm = self.world.Split(0 if part else MPI.UNDEFINED, self.world.rank)
+        if not part:
+            return sluice
+        if len(set(owners)) == 1:
+            comm.Free()
+            return sluice.attach(sim)
+        spr = [l.steps_per_root for l in self.levels if l.name in owners]
+        sluice.levels = tuple(owners)
+        return sluice.attach(sim, comm=comm, every=self.level.steps_per_root // gcd(*spr))
+
     def _tiling_hint(self):
         """Context: a failing subdomain division names the level and its
         number of processes (then abort_on_error stops all levels)."""
