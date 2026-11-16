@@ -1,6 +1,8 @@
 """pygetm.sluice: two basins joined only by a sluice. Volume and tracer content are
 conserved, water flows from the higher to the lower basin, a flap gate only one way."""
 import datetime
+import os
+import tempfile
 import unittest
 
 import cftime
@@ -14,10 +16,10 @@ TIMESTEP, SPLIT = 30.0, 10
 FEED = 500.0  # m3/s into the west basin
 
 
-def make(direction="both", gate=1.0, nz=10, b_layers=None, b=(21, 10), invert=None):
+def make(direction="both", gate=1.0, nz=10, b_layers=None, b=(21, 10), invert=None, z0=None):
     domain = pygetm.domain.create_cartesian(
         np.linspace(0, 40e3, 41), np.linspace(0, 20e3, 21), H=20.0, interfaces=True, f=0.0,
-        logger=pygetm.parallel.get_logger(level="ERROR"),
+        logger=pygetm.parallel.get_logger(level="ERROR"), **({} if z0 is None else {"z0": z0}),
     )
     domain.logger.parent.setLevel("ERROR")
     domain.mask[:, 40:43] = 0  # supergrid: a wall of T cells 20 between the basins (0-19 west, 21-39 east)
@@ -99,6 +101,59 @@ class TestSluice(unittest.TestCase):
         self.assertGreater(sl.volume, 0.0)
         self.assertAlmostEqual(basin_levels(sim)[1], 0.0, delta=1e-12)  # east untouched
         self.assertAlmostEqual(c1 / (c0 + FEED * dt - sl.content["dye"]), 1.0, delta=1e-12)  # the dye that left is accounted for
+
+    def test_shallow_donor(self):
+        # review F8: a donor holding little water. A basin of one cell (0.5 m deep) drains through a pipe whose
+        # outlet is 3 m lower: the level limit alone would let one step take more than the cell holds; the depth
+        # limit lets it approach Dmin and never go below
+        domain = pygetm.domain.create_cartesian(
+            np.linspace(0, 10e3, 11), np.linspace(0, 5e3, 6), H=0.5, interfaces=True, f=0.0,
+            logger=pygetm.parallel.get_logger(level="ERROR"),
+        )
+        domain.mask[...] = 0
+        domain.mask[5, 3] = 1  # supergrid: T cell (1, 2) alone
+        domain.mask[1:10, 9:20] = 1  # another basin, not connected
+        sl = pygetm.sluice.Sluice(domain, "s", a=(1, 2), b=None, area=1000.0, invert=-3.0,
+                                  coordinate_type=pygetm.rivers.CoordinateType.IJ)
+        sim = pygetm.Simulation(domain, runtype=pygetm.BAROTROPIC_2D, airsea=pygetm.airsea.Fluxes())
+        sl.attach(sim)
+        sim.start(START, TIMESTEP, 1, report=datetime.timedelta(days=1))
+        depths = []
+        for _ in range(60):
+            sim.advance()
+            depths.append(float(sim.T.H.values[2, 1] + sim.T.z.values[2, 1]))
+        sim.finish()
+        self.assertGreaterEqual(min(depths), sim.Dmin - 1e-12)
+        self.assertAlmostEqual(depths[-1], sim.Dmin, delta=1e-6)
+        area = float(sim.T.area.values[2, 1])
+        self.assertAlmostEqual(sl.volume / ((0.5 - sim.Dmin) * area), 1.0, delta=1e-6)  # all above Dmin, no more
+
+    def test_restart(self):
+        # review F9: the volume and content moved so far continue after a restart, and the run continues as the
+        # unbroken one (z0 > 0: a restart with z0 = 0 stops at pyGETM's check of eps)
+        mid = cftime.datetime(2000, 1, 1, 6)
+        with tempfile.TemporaryDirectory() as out:
+            full, sl_full = make(z0=0.01)
+            run(full)
+
+            first, sl_first = make(z0=0.01)
+            first.output_manager.add_restart(os.path.join(out, "first.nc"))
+            first.start(START, TIMESTEP, SPLIT, report=datetime.timedelta(days=1))
+            while first.time < mid:
+                first.advance()
+            first.finish()
+            self.assertGreater(sl_first.volume, 0.0)
+
+            second, sl_second = make(z0=0.01)
+            start = second.load_restart(os.path.join(out, "first.nc"))
+            second.start(start, TIMESTEP, SPLIT, report=datetime.timedelta(days=1))
+            while second.time < STOP:
+                second.advance()
+            second.finish()
+        self.assertGreater(sl_second.volume, sl_first.volume)
+        self.assertAlmostEqual(sl_second.volume / sl_full.volume, 1.0, delta=1e-12)
+        self.assertAlmostEqual(sl_second.content["dye"] / sl_full.content["dye"], 1.0, delta=1e-12)
+        np.testing.assert_array_equal(second.T.z.values, full.T.z.values)
 
 
 if __name__ == "__main__":

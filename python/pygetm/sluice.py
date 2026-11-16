@@ -9,7 +9,8 @@ follows the water levels on both sides through the orifice law
 
 with the gate opening (0..1) a number or a function of time and both levels, and
 optionally only one direction (a flap gate). Q is limited so that one step does not
-reverse the level difference.
+reverse the level difference, and so that one step takes at most ``max_fraction`` of
+the donor cell's water above the minimum depth ``Dmin`` (a shallow or drying donor).
 
 A pipe or outlet through a dam (``invert``: the height of its outlet, m on the
 model's datum): a level below the outlet counts as the outlet itself, so the head is
@@ -50,6 +51,12 @@ after the nesting couplers.
 (``zl``, ``zu``, ``vertical_position``): each end can take or give water below the
 surface, as pyGETM's rivers do for reservoir outlets, e.g. a bottom outlet of a
 reservoir, salt inflow near the bottom of a fjord, or a spillway at the surface.
+
+Restarts: the volume and tracer content moved so far and the phase of the update
+counter are part of the model state (``sluice_<name>_*``, optional when loading). Attach
+the sluice before loading a restart file. Between two levels the flow is updated at the
+times they share; a restart written at another time is refused (the nesting restarts
+only at a root 3D step, which both levels share).
 """
 
 from typing import Callable, Optional, Tuple, Union
@@ -91,7 +98,8 @@ class Sluice(Coupler):
             gate: opening 0..1, or a function ``gate(time, z_a, z_b) -> opening``
             direction: ``"both"``, ``"a_to_b"`` or ``"b_to_a"`` (a flap gate)
             a_layers, b_layers: vertical extent of the rivers (``zl``, ``zu``, ``vertical_position``)
-            max_fraction: the flow of one step changes the level difference by at most this fraction
+            max_fraction: the flow of one step changes the level difference, and takes the donor's water above
+                ``Dmin``, by at most this fraction
             invert: height of the outlet (m, model datum): levels below it count as it (a pipe in a dam)
         """
         if direction not in ("both", "a_to_b", "b_to_a"):
@@ -136,8 +144,34 @@ class Sluice(Coupler):
                 self.levels = tuple(owners)
             else:
                 comm.Free()
+        self._state_arrays(sim)
         sim.add_coupler(self)
         return self
+
+    def _state_arrays(self, sim):
+        """The sluice's state in the restart file: one field per quantity, a constant
+        over the domain (``sluice_<name>_phase``, ``_volume``, ``_content_<tracer>`` for
+        the tracers present now). Optional: a file without them starts from zero."""
+        from .constants import CellType
+
+        def array(what, long_name):
+            return sim.T.array(name=f"sluice_{self.name}_{what}", fill=0.0, long_name=f"sluice {self.name}: {long_name}",
+                               attrs=dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType)))
+
+        self._state = {"phase": array("phase", "own steps since the last flow update"),
+                       "volume": array("volume", "volume moved a -> b so far (m3)")}
+        for t in sim.tracers if sim.runtype > 1 else []:
+            self._state[t.name] = array(f"content_{t.name}", f"{t.name} content moved a -> b so far")
+
+    def _save_state(self):
+        st = getattr(self, "_state", None)
+        if st is None:
+            return
+        st["phase"].all_values.fill(self._k % self._every)
+        st["volume"].all_values.fill(self.volume)
+        for name, c in self.content.items():
+            if name in st:
+                st[name].all_values.fill(c)
 
     # --- helpers --------------------------------------------------------------------
 
@@ -166,6 +200,14 @@ class Sluice(Coupler):
         if not hasattr(self, "_every"):  # added with sim.add_coupler
             self._comm, self._every = None, 1
         self._k = 0
+        st = getattr(self, "_state", None)
+        if st is not None and getattr(sim, "_restarted", False):
+            phase = int(round(float(st["phase"].values[0, 0])))
+            if phase % self._every:
+                raise RuntimeError(f"sluice {self.name}: the restart was written {phase} steps after the last flow "
+                                   f"update of the two levels (every {self._every} steps); restart at a time they share")
+            self.volume = float(st["volume"].values[0, 0])
+            self.content = {n: float(a.values[0, 0]) for n, a in st.items() if n not in ("phase", "volume")}
         self._ends = self._locals(sim)
         v = np.zeros(2)
         for k, e in enumerate(self._ends):
@@ -182,26 +224,25 @@ class Sluice(Coupler):
             all_names = self._comm.allgather(names)
             if any(n != names for n in all_names):
                 raise RuntimeError(f"sluice {self.name}: the two levels have different tracers {all_names[0]} / {names}")
-        for e in self._ends:
-            if e is not None:
-                for t in self._tracers:
-                    e[1][t.name].follow_target_cell = True
         self._update(sim)
+        self._save_state()
 
     def after_state_update(self, sim, macro_active: bool):
         self._k += 1
         if self._k % self._every:
+            self._save_state()
             return  # between two shared times of the two levels: the flow holds
         vol, content = self._pending  # the steps since the last update moved this
         self.volume += vol
         for k, c in content.items():
             self.content[k] = self.content.get(k, 0.0) + c
         self._update(sim)
+        self._save_state()
 
     def _update(self, sim):
         """Flow for the next step from the current levels; tracer values of both rivers."""
         nt = len(self._tracers)
-        v = np.zeros(2 + 2 * nt)
+        v = np.zeros(4 + 2 * nt)  # z_a, z_b, D_a, D_b, then per tracer the column means at a and b
         if nt:
             hall = sim.T.hn.all_values[sim.rivers.slice]
             act = sim.rivers.get_active_part_of_layers(hall)
@@ -210,12 +251,13 @@ class Sluice(Coupler):
                 continue
             idx, r, _ = e
             v[k] = sim.T.z.all_values[r.j, r.i]
+            v[2 + k] = sim.T.H.all_values[r.j, r.i] + v[k]  # water depth now (T.D is updated later in the step)
             if nt:
                 w = act[:, idx]
                 ws = w.sum()
                 for m, t in enumerate(self._tracers):
                     c = t.all_values[:, r.j, r.i]
-                    v[2 + 2 * m + k] = (c * w).sum() / ws if ws > 0 else c[-1]
+                    v[4 + 2 * m + k] = (c * w).sum() / ws if ws > 0 else c[-1]
         v = self._allreduce(sim, v)
         za, zb = v[0], v[1]
         self.z_a, self.z_b = float(za), (float(zb) if len(self._names) > 1 else float("nan"))  # levels at both ends
@@ -234,10 +276,13 @@ class Sluice(Coupler):
         # (to the outlet when the downstream level is below it, or nothing is downstream)
         dt = sim.timestep * self._every  # until the next update
         qmax = self.max_fraction * abs(dz) / (dt * (1.0 / self._cell_area[0] + 1.0 / self._cell_area[1]))
-        self.Q = float(np.clip(Q, -qmax, qmax))
+        # one step takes at most max_fraction of the donor's water above Dmin (a shallow or drying donor)
+        qdry = [self.max_fraction * max(v[2 + k] - sim.Dmin, 0.0) * self._cell_area[k] / dt
+                if np.isfinite(self._cell_area[k]) else np.inf for k in (0, 1)]  # b=None: nothing to take from
+        self.Q = float(np.clip(Q, -min(qmax, qdry[1]), min(qmax, qdry[0])))
         # what this flow moves over the next step; counted once that step is done
         donor = 0 if self.Q > 0 else 1
-        self._pending = (self.Q * dt, {t.name: self.Q * dt * v[2 + 2 * m + donor] for m, t in enumerate(self._tracers)})
+        self._pending = (self.Q * dt, {t.name: self.Q * dt * v[4 + 2 * m + donor] for m, t in enumerate(self._tracers)})
         for k, e in enumerate(self._ends):
             if e is None:
                 continue
@@ -246,4 +291,4 @@ class Sluice(Coupler):
             for m, t in enumerate(self._tracers):
                 rt = r[t.name]
                 rt.follow_target_cell = False
-                rt.values[...] = v[2 + 2 * m + (1 - k)]  # the other end's column mean
+                rt.values[...] = v[4 + 2 * m + (1 - k)]  # the other end's column mean
