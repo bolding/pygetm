@@ -151,3 +151,29 @@ def test_macro_ratios():
                 {"c": (None, 180.0, 10, 1), "t": ("c", 50.0, 10, 3)}):  # time steps that do not fit
         with pytest.raises(ValueError):
             macro_ratios(bad)
+
+
+def test_compiled_helpers_refuse_bad_arguments():
+    """Review F10: the compiled kernels index without bounds checks, so their wrappers refuse cells outside the
+    array (also negative ones, which numpy would wrap) and columns without layers."""
+    _pygetm = pytest.importorskip("pygetm._pygetm")
+    arr = np.zeros((4, 5, 6))
+    out = np.zeros((2, 4))
+    for jj, ii in (([0, 5], [0, 0]), ([0, 0], [0, 6]), ([-1, 0], [0, 0]), ([0, 0], [0, -1])):
+        jj, ii = np.array(jj, dtype=np.intc), np.array(ii, dtype=np.intc)
+        with pytest.raises(ValueError, match="outside the array"):
+            _pygetm.gather_columns(arr, jj, ii, out)
+        with pytest.raises(ValueError, match="outside the array"):
+            _pygetm.scatter_columns(arr, jj, ii, out)
+    _pygetm.gather_columns(arr, np.array([0, 4], dtype=np.intc), np.array([0, 5], dtype=np.intc), out)  # the corners
+    n, nt = 3, 2
+    with pytest.raises(ValueError, match="layers"):  # no source layer: interfaces (n, 1)
+        _pygetm.vertical_remap(np.zeros((n, 1)), np.zeros((n, 3)), np.zeros((n, 0)), np.zeros((nt, n, 0)),
+                               np.zeros((nt, n, 2)))
+    with pytest.raises(ValueError, match="layers"):  # no target layer
+        _pygetm.vertical_remap(np.zeros((n, 3)), np.zeros((n, 1)), np.ones((n, 2)), np.zeros((nt, n, 2)),
+                               np.zeros((nt, n, 0)))
+    with pytest.raises(ValueError, match="layers"):
+        _pygetm.remap_z(np.zeros((n, 0)), np.ones((n, 2)), np.ones(n), np.zeros((nt, n, 0)), np.zeros((nt, n, 2)))
+    with pytest.raises(ValueError, match="layers"):
+        _pygetm.remap_z(np.ones((n, 2)), np.zeros((n, 0)), np.ones(n), np.zeros((nt, n, 2)), np.zeros((nt, n, 0)))

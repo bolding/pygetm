@@ -232,6 +232,8 @@ def vertical_remap(const double[:,::1] zs not None, const double[:,::1] zd not N
         raise ValueError("vertical_remap: out has the wrong shape")
     if n == 0 or nt == 0:
         return
+    if ns < 1 or nd < 1:
+        raise ValueError(f"vertical_remap: {ns} source and {nd} target layers (at least 1 each)")
     with nogil:
         c_vertical_remap(n, ns, nd, nt, scheme, &zs[0,0], &zd[0,0], &h[0,0], &c[0,0,0], &out[0,0,0])
 
@@ -249,8 +251,19 @@ def remap_z(const double[:,::1] hs not None, const double[:,::1] hd not None, co
         raise ValueError("remap_z: out has the wrong shape")
     if n == 0 or nt == 0:
         return
+    if ns < 1 or nd < 1:
+        raise ValueError(f"remap_z: {ns} source and {nd} target layers (at least 1 each)")
     with nogil:
         c_remap_z(n, ns, nd, nt, scheme, &hs[0,0], &hd[0,0], &D[0], &c[0,0,0], &out[0,0,0])
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef _check_cells(str name, const int[::1] jj, const int[::1] ii, int ny, int nx):
+    """The kernels index without bounds checks: every cell must lie in the (ny, nx) array (no negative indices)."""
+    cdef int k
+    for k in range(jj.shape[0]):
+        if jj[k] < 0 or jj[k] >= ny or ii[k] < 0 or ii[k] >= nx:
+            raise ValueError(f"{name}: cell {k} (j={jj[k]}, i={ii[k]}) outside the array ({ny}, {nx})")
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
@@ -261,6 +274,7 @@ def gather_columns(const double[:,:,::1] arr not None, const int[::1] jj not Non
         raise ValueError("gather_columns: inconsistent shapes")
     if n == 0:
         return
+    _check_cells("gather_columns", jj, ii, <int>arr.shape[1], <int>arr.shape[2])
     with nogil:
         c_gather_columns(<int>arr.shape[2], <int>arr.shape[1], <int>arr.shape[0], &arr[0,0,0], n, &jj[0], &ii[0], &out[0,0])
 
@@ -273,6 +287,7 @@ def scatter_columns(double[:,:,::1] arr not None, const int[::1] jj not None, co
         raise ValueError("scatter_columns: inconsistent shapes")
     if n == 0:
         return
+    _check_cells("scatter_columns", jj, ii, <int>arr.shape[1], <int>arr.shape[2])
     with nogil:
         c_scatter_columns(<int>arr.shape[2], <int>arr.shape[1], <int>arr.shape[0], &arr[0,0,0], n, &jj[0], &ii[0], &vals[0,0])
 

@@ -147,7 +147,9 @@ contains
                   Qz(m) = Qbase + f * c(j, i, t) * h(j, i)
                end if
             end do
-            ! the outer interfaces exactly: no content lost to round-off
+            ! the outer interfaces exactly: no content lost to round-off. By design, when the target
+            ! column is shallower than the source, all source content below the last target interface
+            ! goes into the bottom target layer: the column's content is conserved
             Qz(1) = 0.0_c_double
             Qz(nd + 1) = Qtot
             do m = 1, nd
