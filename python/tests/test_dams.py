@@ -4,6 +4,7 @@ each half keeps its volume (the west half gains the river's), and with a gap in 
 dam water does cross."""
 
 import datetime
+import importlib.util
 import unittest
 
 import cftime
@@ -101,6 +102,7 @@ class _Domain:
         self.mask = self._mask
 
 
+@unittest.skipUnless(importlib.util.find_spec("pygetm.nesting"), "needs pygetm.nesting (the nesting fork)")
 class TestDamsInANest(unittest.TestCase):
     """pygetm.nesting.masks.check_dams: a dam on a level's interface is refused; in a
     child's band (cells set from its parent) it is reopened."""
