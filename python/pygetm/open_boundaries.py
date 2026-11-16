@@ -755,8 +755,8 @@ class ArrayOpenBoundaries(Sequence[ArrayOpenBoundary]):
         if not relax:
             return
         deltas = [r.weights * (r.target - r.local) for r in self.relaxation]
-        for relax, delta in zip(self.relaxation, deltas):
-            np.add(relax.local, delta, out=relax.local, where=relax.where)
+        for r, delta in zip(self.relaxation, deltas):
+            np.add(r.local, delta, out=r.local, where=r.where)
 
 
 class GlobalOpenBoundaryCollection(Sequence[GlobalOpenBoundary]):
