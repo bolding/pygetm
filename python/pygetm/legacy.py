@@ -25,6 +25,12 @@ def domain_from_topo(
     argument takes priority.
     """
 
+    def _get_bathymetry(nc: netCDF4.Dataset):
+        H = nc.variables["bathymetry"]
+        if hasattr(H, "missing_value"):
+            return np.ma.masked_equal(H[...], H.missing_value)
+        return H[...]
+
     def _get_metrics(nc: netCDF4.Dataset):
         H = nc.variables["bathymetry"]
         yname, xname = H.dimensions
@@ -54,10 +60,15 @@ def domain_from_topo(
             lon, lat, H = _get_metrics(nc)
             domain = pygetm.domain.create_spherical(lon, lat, H=H, **kwargs)
         elif grid_type == 3:
-            # planar curvilinear
-            raise NotImplementedError(
-                "No support yet for planar curvilinear coordinates"
-            )
+            # planar curvilinear: corner coordinates xx, yx (optional lonx, latx)
+            H = _get_bathymetry(nc)
+            x = supergrid_from_corners(nc["xx"][...])
+            y = supergrid_from_corners(nc["yx"][...])
+            if "lonx" in nc.variables and "latx" in nc.variables:
+                kwargs.setdefault("lon", supergrid_from_corners(nc["lonx"][...]))
+                kwargs.setdefault("lat", supergrid_from_corners(nc["latx"][...]))
+            ny, nx = H.shape
+            domain = pygetm.domain.Domain(nx, ny, x=x, y=y, H=H, **kwargs)
         elif grid_type == 4:
             # spherical curvilinear
             raise NotImplementedError(
@@ -75,6 +86,21 @@ def domain_from_topo(
             domain.z0 = nc["z0"]
 
     return domain
+
+
+def supergrid_from_corners(corners: np.ndarray) -> np.ndarray:
+    """Supergrid (2 ny + 1, 2 nx + 1) from the coordinates of the cell corners
+    (ny + 1, nx + 1), placed as in legacy GETM: the corners (X points) on the even
+    supergrid points, T points at the mean of their four corners, U and V points
+    halfway between the two corners of their face."""
+    c = np.asarray(np.ma.filled(corners, np.nan), dtype=float)
+    nyc, nxc = c.shape
+    out = np.empty((2 * nyc - 1, 2 * nxc - 1))
+    out[::2, ::2] = c
+    out[1::2, ::2] = 0.5 * (c[:-1, :] + c[1:, :])  # U points (faces between corners in y)
+    out[::2, 1::2] = 0.5 * (c[:, :-1] + c[:, 1:])  # V points
+    out[1::2, 1::2] = 0.25 * (c[:-1, :-1] + c[:-1, 1:] + c[1:, :-1] + c[1:, 1:])  # T points
+    return out
 
 
 class DatFile:
