@@ -85,6 +85,8 @@ class Momentum:
         "logger",
         "_U_cum",
         "_V_cum",
+        "U_cum",
+        "V_cum",
         "_ufirst",
         "_u3dfirst",
         "diffuse_momentum",
@@ -493,8 +495,26 @@ class Momentum:
             ),
         )
 
-        self._U_cum = np.zeros_like(self.Ui.all_values)
-        self._V_cum = np.zeros_like(self.Vi.all_values)
+        # Depth-integrated transports summed over the microtimesteps of the current
+        # macrotimestep. Part of the state (optional, for restart files without
+        # them): a coupler (nesting) may add a correction after the macrotimestep's
+        # reset, which then belongs to the next macrotimestep.
+        self.U_cum = ugrid.array(
+            name="U_cum",
+            units="m2 s-1",
+            long_name="depth-integrated velocity in x-direction summed over current macrotimestep",
+            fill=0.0,
+            attrs=dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType)),
+        )
+        self.V_cum = vgrid.array(
+            name="V_cum",
+            units="m2 s-1",
+            long_name="depth-integrated velocity in y-direction summed over current macrotimestep",
+            fill=0.0,
+            attrs=dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType)),
+        )
+        self._U_cum = self.U_cum.all_values
+        self._V_cum = self.V_cum.all_values
 
         self.udev = ugrid.array(
             name="udev",
@@ -705,6 +725,12 @@ class Momentum:
             self.qk.mirror()
             self.Ui.mirror()
             self.Vi.mirror()
+
+            # Sums over the current macrotimestep (zero, or from a restart)
+            for cum in (self.U_cum, self.V_cum):
+                np.nan_to_num(cum.all_values, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            self._U_cum = self.U_cum.all_values
+            self._V_cum = self.V_cum.all_values
 
         # If horizontal diffusivity [damping] is specified, interpolate it to
         # U and V grids

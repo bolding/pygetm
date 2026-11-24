@@ -170,6 +170,9 @@ class BaseSimulation:
         "_profile",
         "_cached_check_finite_info",
         "_couplers",
+        "_split_order",
+        "_restarted",
+        "exact_restart",
     )
 
     def __init__(
@@ -200,6 +203,7 @@ class BaseSimulation:
         self.default_time_reference: Optional[cftime.datetime] = None
         self._cached_check_finite_info = None
         self._couplers: list[Coupler] = []
+        self._restarted = False
 
     def add_coupler(self, coupler: Coupler):
         """Register an object that will be notified at fixed points in the time loop,
@@ -288,7 +292,9 @@ class BaseSimulation:
             for name, field in self.output_manager.fields.items():
                 if field.attrs.get("_part_of_state", False):
                     if name not in ds:
-                        missing.append(name)
+                        # e.g. a restart file written by upstream pyGETM
+                        if not field.attrs.get("_restart_optional", False):
+                            missing.append(name)
                     else:
                         field.set(ds[name], on_grid=pygetm.input.OnGrid.ALL, mask=True)
                         initialized_variables.add(name)
@@ -299,10 +305,14 @@ class BaseSimulation:
                 )
 
         self._after_restart(initialized_variables)
+        self._restarted = True
 
         return time_coord[itime]
 
     def _after_restart(self, initialized_variables: set[str]):
+        pass
+
+    def _store_split_order(self):
         pass
 
     @log_exceptions
@@ -429,6 +439,8 @@ class BaseSimulation:
         # This includes forcing for the future state update (e.g., tracer source terms)
         self.input_manager.update(self.time, macro=macro_active)
         self._update_forcing_and_diagnostics(macro_active)
+
+        self._store_split_order()
 
         # Perform output. This is done before the call to check_finite,
         # so that the user can diagnose non-finite values from the output files.
@@ -619,6 +631,7 @@ class Simulation(BaseSimulation):
         log_level: Optional[int] = None,
         delay_slow_ip: bool = False,
         tiling: Optional[parallel.Tiling] = None,
+        exact_restart: Optional[bool] = None,
     ):
         """Simulation
 
@@ -635,8 +648,16 @@ class Simulation(BaseSimulation):
             tiling: subdomain decomposition. If not provided, an optimal subdomain
                 division is determined automatically based on the land-sea mask and
                 the number of active CPU cores
+            exact_restart: continue from a restart file exactly as the unbroken run
+                would (the elevation at open boundaries from before their update,
+                the transports summed over the current macrotimestep and the order
+                of the split steps from the file, the depths and thicknesses along
+                open boundaries kept instead of mirrored, no sponge relaxation at
+                the start). ``None`` (default): only with couplers (nesting), else
+                as upstream pyGETM; ``True``/``False``: always/never
         """
         super().__init__(domain, log_level=log_level, tiling=tiling)
+        self.exact_restart = exact_restart
 
         if Dmin <= 0.0:
             self.logger.error(f"Dmin ({Dmin} m) must exceed zero")
@@ -767,12 +788,27 @@ class Simulation(BaseSimulation):
             # include hn as part of the model state.
             self.T.hn.attrs["_part_of_state"] = True
             self.T.ho.attrs["_part_of_state"] = True
+            # The old thicknesses on U and V cannot be rebuilt in a restart: they derive
+            # from the elevations of the macro step before the old one
+            self.U.ho.attrs["_part_of_state"] = True
+            self.V.ho.attrs["_part_of_state"] = True
+            self.U.ho.attrs["_restart_optional"] = True
+            self.V.ho.attrs["_restart_optional"] = True
         else:
             # In 2D barotropic runs, bottom roughness is updated iteratively
             # (new value is a function of the previous value), which requires
             # it being included in restarts as part of the model state
             self.U.z0b.attrs["_part_of_state"] = True
             self.V.z0b.attrs["_part_of_state"] = True
+
+        # The direction (U or V) that goes first alternates in the 2D and 3D momentum: without
+        # this a restart after an odd number of steps continues in the other order
+        self._split_order = self.T.array(
+            name="split_order",
+            fill=0.0,
+            long_name="momentum: U first in 2D (bit 0) and 3D (bit 1)",
+            attrs=dict(_part_of_state=True, _restart_optional=True, _valid_at=tuple(CellType)),
+        )
 
         # Enable open boundaries for surface elevation
         self.T.z.open_boundaries = pygetm.open_boundaries.ArrayOpenBoundaries(self.T.z)
@@ -1110,14 +1146,58 @@ class Simulation(BaseSimulation):
         # surface elevation on T grid. This must be done after self.pres.saved is set
         self.initialize_depth()
 
+    def _store_split_order(self):
+        self._split_order.all_values[...] = self.momentum._ufirst + 2 * self.momentum._u3dfirst
+
+    @property
+    def _exact_restart(self) -> bool:
+        """whether a restart continues exactly (see ``exact_restart``)"""
+        return bool(self._couplers) if self.exact_restart is None else bool(self.exact_restart)
+
     def _after_restart(self, initialized_variables: set[str]):
+        if not self._exact_restart:
+            # as upstream pyGETM
+            if self.runtype > RunType.BAROTROPIC_2D:
+                # Restore elevation from before open boundary condition was applied
+                self.T.z.all_values = self.T.zin.all_values
+                self.momentum.U_cum.fill(0.0)
+                self.momentum.V_cum.fill(0.0)
+            keep_ho = "hot" in initialized_variables
+            keep_hn = "hnt" in initialized_variables
+            self.initialize_depth(keep_all_z=True, keep_ho=keep_ho, keep_hn=keep_hn)
+            return
+        if self._split_order.name in initialized_variables:
+            order = int(round(np.nanmax(self._split_order.all_values)))
+            self.momentum._ufirst, self.momentum._u3dfirst = bool(order & 1), bool(order & 2)
         if self.runtype > RunType.BAROTROPIC_2D:
-            # Restore elevation from before open boundary condition was applied
-            self.T.z.all_values = self.T.zin.all_values
+            # Restore elevation from before open boundary condition was applied. Only at
+            # the boundary: elsewhere z is the state, and a coupler may have changed it
+            # after zin was stored (flux matching in nesting).
+            bdy = self.T.mask.all_values == CellType.BOUNDARY
+            self.T.z.all_values[bdy] = self.T.zin.all_values[bdy]
 
         keep_ho = "hot" in initialized_variables
         keep_hn = "hnt" in initialized_variables
+        if self.runtype == RunType.BAROTROPIC_2D:
+            # Restore elevation from before the open boundary condition was applied
+            # (as zin in 3D): the restart holds z after the boundary update at the end
+            # of the last step, but the water depths of the next step's start are
+            # computed (in start, by update_depth) before that update, from the
+            # boundary elevations of the previous one - which are in zo (copied from
+            # z at the start of the step). The update in start then gives the
+            # restarted boundary elevations again: the run continues bit-identically.
+            bdy = self.T.mask.all_values == CellType.BOUNDARY
+            self.T.z.all_values[bdy] = self.T.zo.all_values[bdy]
+        ho_uv = []
+        if self.runtype > RunType.BAROTROPIC_2D:
+            ho_uv = [
+                (grid.ho, grid.ho.all_values.copy())
+                for grid in (self.U, self.V)
+                if grid.ho.name in initialized_variables
+            ]
         self.initialize_depth(keep_all_z=True, keep_ho=keep_ho, keep_hn=keep_hn)
+        for ho, values in ho_uv:
+            ho.all_values[...] = values
 
     def _start(self):
         """Perform final initialization steps before starting the time-stepping loop.
@@ -1137,15 +1217,24 @@ class Simulation(BaseSimulation):
         # mirroring for boundary points, but by convention, `start` assumes all
         # mirroring needs to be redone (some tests intentionally corrupt mirrored
         # values to verify this).
+        # After a restart the depths and thicknesses outside and along open
+        # boundaries are kept: they were set by update_depth (initialize_depth, the
+        # restored old thicknesses), as in a continuous run, whereas mirroring from
+        # the neighbouring U/V points would give other values.
         for grid in (self.U, self.V):
             edges = grid._edge_x | grid._edge_y
+            restarted = self._restarted and self._exact_restart
+            if restarted:
+                edges = edges & (grid.mask.all_values == CellType.UNRESOLVED)
             grid.D.all_values[edges] = FILL_VALUE
-            grid.D.mirror()
+            if not restarted:
+                grid.D.mirror()
             if grid.hn is not None:
                 grid.hn.all_values[..., edges] = FILL_VALUE
                 grid.ho.all_values[..., edges] = FILL_VALUE
-                grid.ho.mirror()
-                grid.hn.mirror()
+                if not restarted:
+                    grid.ho.mirror()
+                    grid.hn.mirror()
 
         self.momentum.start()
         self.tracers.start()
@@ -1409,7 +1498,9 @@ class Simulation(BaseSimulation):
             # from the tracers are calculated.
             if self.open_boundaries.np:
                 for tracer in self.tracers:
-                    tracer.open_boundaries.update()
+                    # After a restart, the sponge relaxation of the last macro step is
+                    # already in the restarted state: set the boundary values only
+                    tracer.open_boundaries.update(relax=not (starting and self._restarted and self._exact_restart))
 
             # Interpolate surface velocities to T grid.
             # These are used by airsea as offset for wind speeds
