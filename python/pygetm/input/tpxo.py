@@ -1,5 +1,5 @@
 import os.path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -21,7 +21,11 @@ def get(
     verbose: bool = False,
     root: str = ROOT,
     scale_factor: float = 1.0,
+    components: Sequence[str] = COMPONENTS,
 ) -> xr.DataArray:
+    """Tidal elevation (h) or transport (u, v) from TPXO at the given
+    positions, as a time-varying array; ``components`` selects the
+    constituents (default: all)."""
     assert variable in ("h", "u", "v", "hz", "hu", "hv")
 
     lon = np.asarray(lon)
@@ -60,8 +64,8 @@ def get(
     scale_factor *= {"h": 1e-3, "u": 1e-4, "v": 1e-4}.get(variable, 1.0)
     axis = {"h": "z"}.get(variable, variable)
     file_prefix = {"v": "u"}.get(variable, variable)
-    components: Mapping[str, tuple[np.ndarray, np.ndarray]] = {}
-    for component in COMPONENTS:
+    values: Mapping[str, tuple[np.ndarray, np.ndarray]] = {}
+    for component in components:
         if verbose:
             print(f"TPXO: reading {component} constituent of {variable}...")
         name = f"{file_prefix}_{component}_tpxo{version}_atlas_30{postfix}.nc"
@@ -70,8 +74,8 @@ def get(
             ds = ds.set_coords((f"lat_{axis}", f"lon_{axis}"))
             re = select(ds[f"{variable}Re"])
             im = select(ds[f"{variable}Im"])
-            components[component] = (scale_factor * re.values, scale_factor * im.values)
-    lazyvar = Data(components, lat, name=f"tpxo({root!r}, {variable!r})")
+            values[component] = (scale_factor * re.values, scale_factor * im.values)
+    lazyvar = Data(values, lat, name=f"tpxo({root!r}, {variable!r})")
     return xr.DataArray(lazyvar, dims=re.dims, coords=re.coords, name=lazyvar.name)
 
 

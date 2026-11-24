@@ -16,7 +16,28 @@ from numpy.typing import ArrayLike, DTypeLike
 
 from . import _pygetm
 
-Waitall = MPI.Request.Waitall
+#: Seconds this process has waited in the halo updates' Waitall, counted while
+#: :func:`time_halo_waits` is on (two MPI.Wtime calls per wait; off by default)
+halo_wait_time = 0.0
+_time_halo_waits = False
+
+
+def time_halo_waits(on: bool = True):
+    """Count the time the halo updates wait in Waitall (:data:`halo_wait_time`)."""
+    global _time_halo_waits
+    _time_halo_waits = bool(on)
+
+
+def Waitall(requests):
+    global halo_wait_time
+    if not _time_halo_waits:
+        return MPI.Request.Waitall(requests)
+    t0 = MPI.Wtime()
+    try:
+        return MPI.Request.Waitall(requests)
+    finally:
+        halo_wait_time += MPI.Wtime() - t0
+
 Startall = MPI.Prequest.Startall
 
 
