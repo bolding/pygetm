@@ -498,6 +498,7 @@ class Domain:
         self.root_logger = logger or parallel.get_logger()
         self.logger = self.root_logger.getChild("domain")
         self._external = None
+        self._tiling_mask = None
 
         if self.comm.rank != 0:
             self._x = self._y = self._lon = self._lat = None
@@ -834,6 +835,27 @@ class Domain:
         self._external = values.copy()
 
     @property
+    def tiling_mask(self) -> Optional[np.ndarray]:
+        """Cell centers (T points, shape ``(ny, nx)``) that need a subdomain, in
+        addition to being water. Subdomains without such cells are removed like
+        all-land subdomains, e.g., where nesting fills a region that nothing
+        reads. None (default): every water point needs one.
+
+        This attribute is None on non-root MPI nodes.
+        """
+        return self._tiling_mask
+
+    @tiling_mask.setter
+    def tiling_mask(self, values: Optional[npt.ArrayLike]):
+        if self.comm.rank != 0 or values is None:
+            self._tiling_mask = None
+            return
+        values = np.asarray(values, dtype=bool)
+        if values.shape != (self.ny, self.nx):
+            raise ValueError(f"tiling_mask has shape {values.shape}, expected {(self.ny, self.nx)}")
+        self._tiling_mask = values.copy()
+
+    @property
     def H(self) -> Optional[np.ndarray]:
         """bathymetric depth (m)
 
@@ -899,7 +921,11 @@ class Domain:
         Returns:
             tiling
         """
-        mask = None if self.comm.rank != 0 else self._mask[1::2, 1::2]
+        mask = None
+        if self.comm.rank == 0:
+            mask = self._mask[1::2, 1::2]
+            if self._tiling_mask is not None:
+                mask = np.where(self._tiling_mask, mask, 0)
         mask = self.comm.bcast(mask)
         return parallel.Tiling.autodetect(
             mask,
