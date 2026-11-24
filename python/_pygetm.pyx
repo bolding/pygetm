@@ -31,6 +31,10 @@ cdef extern void grid_interp_z(int nx, int ny, int nz1, int nz2, const double* s
 cdef extern void grid_interp_xy(int nx1, int ny1, int nx2, int ny2, int nz, const double* source, double* target, int ioffset, int joffset) nogil
 cdef extern void c_horizontal_filter(int nx, int ny, int nz, int halox, int haloy, int* mask, double w, const double* var) nogil
 cdef extern void c_vertical_filter(int nx, int ny, int nz, int halox, int haloy, int n, int* mask, double w, const double* var) nogil
+cdef extern void c_vertical_remap(int n, int ns, int nd, int nt, int scheme, const double* zs, const double* zd, const double* h, const double* c, double* out) nogil
+cdef extern void c_remap_z(int n, int ns, int nd, int nt, int scheme, const double* hs, const double* hd, const double* D, const double* c, double* out) nogil
+cdef extern void c_gather_columns(int nx, int ny, int nz, const double* arr, int n, const int* jj, const int* ii, double* out) nogil
+cdef extern void c_scatter_columns(int nx, int ny, int nz, double* arr, int n, const int* jj, const int* ii, const double* vals) nogil
 cdef extern void c_gradient_x(int nx1, int ny1, int nx2, int ny2, int nz, const double* source, const double* idx, double* target, int ioffset, int joffset) nogil
 cdef extern void c_gradient_y(int nx1, int ny1, int nx2, int ny2, int nz, const double* source, const double* idy, double* target, int ioffset, int joffset) nogil
 cdef extern void get_array(int source_type, void* grid, const char* name, int* grid_type, int* sub_type, int* data_type, void** p) nogil
@@ -214,6 +218,78 @@ def vertical_filter(int n, Array f not None, double w):
     cdef Array mask = f.grid.mask
 
     c_vertical_filter(nx, ny, nz, halox, haloy, n, <int*>mask.p, w, <double*>f.p)
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def vertical_remap(const double[:,::1] zs not None, const double[:,::1] zd not None, const double[:,::1] h not None, const double[:,:,::1] c not None, double[:,:,::1] out not None, int scheme=0):
+    """Contents of the target layers of n columns (pygetm.nesting.vremap.contents): zs (n, ns + 1) and
+    zd (n, nd + 1) the source and target interfaces (depths below the surface), h (n, ns) the source
+    thicknesses, c (nt, n, ns) the concentrations, out (nt, n, nd); scheme 0: PCM, 1: PPM."""
+    cdef int n = <int>zs.shape[0], ns = <int>zs.shape[1] - 1, nd = <int>zd.shape[1] - 1, nt = <int>c.shape[0]
+    if zd.shape[0] != n or h.shape[0] != n or h.shape[1] != ns or c.shape[1] != n or c.shape[2] != ns:
+        raise ValueError("vertical_remap: inconsistent shapes")
+    if out.shape[0] != nt or out.shape[1] != n or out.shape[2] != nd:
+        raise ValueError("vertical_remap: out has the wrong shape")
+    if n == 0 or nt == 0:
+        return
+    if ns < 1 or nd < 1:
+        raise ValueError(f"vertical_remap: {ns} source and {nd} target layers (at least 1 each)")
+    with nogil:
+        c_vertical_remap(n, ns, nd, nt, scheme, &zs[0,0], &zd[0,0], &h[0,0], &c[0,0,0], &out[0,0,0])
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def remap_z(const double[:,::1] hs not None, const double[:,::1] hd not None, const double[::1] D not None, const double[:,:,::1] c not None, double[:,:,::1] out not None, int scheme=0):
+    """Concentrations on the target layers of n single columns, interfaces kept at their depths
+    (pygetm.nesting.nested3d.remap_conc_z with one source column each): hs (n, ns) and hd (n, nd)
+    the source and target thicknesses (surface first), D (n) the target depths, c (nt, n, ns), out
+    (nt, n, nd); scheme 0: PCM, 1: PPM."""
+    cdef int n = <int>hs.shape[0], ns = <int>hs.shape[1], nd = <int>hd.shape[1], nt = <int>c.shape[0]
+    if hd.shape[0] != n or D.shape[0] != n or c.shape[1] != n or c.shape[2] != ns:
+        raise ValueError("remap_z: inconsistent shapes")
+    if out.shape[0] != nt or out.shape[1] != n or out.shape[2] != nd:
+        raise ValueError("remap_z: out has the wrong shape")
+    if n == 0 or nt == 0:
+        return
+    if ns < 1 or nd < 1:
+        raise ValueError(f"remap_z: {ns} source and {nd} target layers (at least 1 each)")
+    with nogil:
+        c_remap_z(n, ns, nd, nt, scheme, &hs[0,0], &hd[0,0], &D[0], &c[0,0,0], &out[0,0,0])
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef _check_cells(str name, const int[::1] jj, const int[::1] ii, int ny, int nx):
+    """The kernels index without bounds checks: every cell must lie in the (ny, nx) array (no negative indices)."""
+    cdef int k
+    for k in range(jj.shape[0]):
+        if jj[k] < 0 or jj[k] >= ny or ii[k] < 0 or ii[k] >= nx:
+            raise ValueError(f"{name}: cell {k} (j={jj[k]}, i={ii[k]}) outside the array ({ny}, {nx})")
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def gather_columns(const double[:,:,::1] arr not None, const int[::1] jj not None, const int[::1] ii not None, double[:,::1] out not None):
+    """out (n, nz) = arr[::-1, jj, ii].T: the columns of a (nz, ny, nx) array at n cells, surface first."""
+    cdef int n = <int>jj.shape[0]
+    if ii.shape[0] != n or out.shape[0] != n or out.shape[1] != arr.shape[0]:
+        raise ValueError("gather_columns: inconsistent shapes")
+    if n == 0:
+        return
+    _check_cells("gather_columns", jj, ii, <int>arr.shape[1], <int>arr.shape[2])
+    with nogil:
+        c_gather_columns(<int>arr.shape[2], <int>arr.shape[1], <int>arr.shape[0], &arr[0,0,0], n, &jj[0], &ii[0], &out[0,0])
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def scatter_columns(double[:,:,::1] arr not None, const int[::1] jj not None, const int[::1] ii not None, const double[:,::1] vals not None):
+    """arr[::-1, jj, ii] = vals.T: write n columns (n, nz), surface first, into a (nz, ny, nx) array."""
+    cdef int n = <int>jj.shape[0]
+    if ii.shape[0] != n or vals.shape[0] != n or vals.shape[1] != arr.shape[0]:
+        raise ValueError("scatter_columns: inconsistent shapes")
+    if n == 0:
+        return
+    _check_cells("scatter_columns", jj, ii, <int>arr.shape[1], <int>arr.shape[2])
+    with nogil:
+        c_scatter_columns(<int>arr.shape[2], <int>arr.shape[1], <int>arr.shape[0], &arr[0,0,0], n, &jj[0], &ii[0], &vals[0,0])
 
 def gradient_x(const double[:,::1] idx not None, const double[:,:,::1] source not None, double[:,:,::1] target not None, int ioffset=0, int joffset=0):
     c_gradient_x(<int>source.shape[2], <int>source.shape[1], <int>target.shape[2], <int>target.shape[1], <int>source.shape[0], &source[0,0,0], &idx[0,0], &target[0,0,0], ioffset, joffset)
