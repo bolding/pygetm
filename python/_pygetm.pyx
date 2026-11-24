@@ -36,7 +36,7 @@ cdef extern void c_gradient_y(int nx1, int ny1, int nx2, int ny2, int nz, const 
 cdef extern void get_array(int source_type, void* grid, const char* name, int* grid_type, int* sub_type, int* data_type, void** p) nogil
 cdef extern void* advection_create(int scheme, void* tgrid) nogil
 cdef extern void advection_finalize(void* advection) nogil
-cdef extern void advection_uv_calculate(int direction, int nk, void* advection, void* tgrid, void* ugrid, double* pu, double* Ah, double timestep, double* pD, double* pDU, double* pvar) nogil
+cdef extern void advection_uv_calculate(int direction, int nk, void* advection, void* tgrid, void* ugrid, double* pu, double* Ah, double timestep, double* pD, double* pDU, double* pvar, double* pflux) nogil
 cdef extern void advection_w_calculate(void* padvection, void* tgrid, double* pw, double* pw_var, double timestep, double* ph, double* pvar) nogil
 cdef extern void* vertical_diffusion_create(void* tgrid) nogil
 cdef extern void vertical_diffusion_finalize(void* diffusion) nogil
@@ -259,27 +259,31 @@ cdef class Advection:
 
     @cython.initializedcheck(False)
     @cython.boundscheck(False) # turn off bounds-checking for entire function
-    def u_2d(self, Array u not None, double timestep, Array var not None, Array Ah=None):
+    def u_2d(self, Array u not None, double timestep, Array var not None, Array Ah=None, Array flux=None):
         cdef double * pAh = <double *>Ah.p if Ah is not None else NULL
-        advection_uv_calculate(1, 1, self.p, self.grid.p, self.ugrid.p, <double *>u.p, pAh, timestep, self.ph, self.pDU, <double *>var.p)
+        cdef double * pflux = <double *>flux.p if flux is not None else NULL
+        advection_uv_calculate(1, 1, self.p, self.grid.p, self.ugrid.p, <double *>u.p, pAh, timestep, self.ph, self.pDU, <double *>var.p, pflux)
 
     @cython.initializedcheck(False)
     @cython.boundscheck(False) # turn off bounds-checking for entire function
-    def v_2d(self, Array v not None, double timestep, Array var not None, Array Ah=None):
+    def v_2d(self, Array v not None, double timestep, Array var not None, Array Ah=None, Array flux=None):
         cdef double * pAh = <double *>Ah.p if Ah is not None else NULL
-        advection_uv_calculate(2, 1, self.p, self.grid.p, self.vgrid.p, <double *>v.p, pAh, timestep, self.ph, self.pDV, <double *>var.p)
+        cdef double * pflux = <double *>flux.p if flux is not None else NULL
+        advection_uv_calculate(2, 1, self.p, self.grid.p, self.vgrid.p, <double *>v.p, pAh, timestep, self.ph, self.pDV, <double *>var.p, pflux)
 
     @cython.initializedcheck(False)
     @cython.boundscheck(False) # turn off bounds-checking for entire function
-    def u_3d(self, Array u not None, double timestep, Array var not None, Array Ah=None):
+    def u_3d(self, Array u not None, double timestep, Array var not None, Array Ah=None, Array flux=None):
         cdef double * pAh = <double *>Ah.p if Ah is not None else NULL
-        advection_uv_calculate(1, <int>var._array.shape[0], self.p, self.grid.p, self.ugrid.p, <double *>u.p, pAh, timestep, self.ph, self.phu, <double *>var.p)
+        cdef double * pflux = <double *>flux.p if flux is not None else NULL
+        advection_uv_calculate(1, <int>var._array.shape[0], self.p, self.grid.p, self.ugrid.p, <double *>u.p, pAh, timestep, self.ph, self.phu, <double *>var.p, pflux)
 
     @cython.initializedcheck(False)
     @cython.boundscheck(False) # turn off bounds-checking for entire function
-    def v_3d(self, Array v not None, double timestep, Array var not None, Array Ah=None):
+    def v_3d(self, Array v not None, double timestep, Array var not None, Array Ah=None, Array flux=None):
         cdef double * pAh = <double *>Ah.p if Ah is not None else NULL
-        advection_uv_calculate(2, <int>var._array.shape[0], self.p, self.grid.p, self.vgrid.p, <double *>v.p, pAh, timestep, self.ph, self.phv, <double *>var.p)
+        cdef double * pflux = <double *>flux.p if flux is not None else NULL
+        advection_uv_calculate(2, <int>var._array.shape[0], self.p, self.grid.p, self.vgrid.p, <double *>v.p, pAh, timestep, self.ph, self.phv, <double *>var.p, pflux)
 
     @cython.initializedcheck(False)
     @cython.boundscheck(False) # turn off bounds-checking for entire function

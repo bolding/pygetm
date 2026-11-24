@@ -1,6 +1,6 @@
 import enum
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -669,7 +669,9 @@ class Momentum:
             attrs=dict(
                 _require_halos=True,
                 _time_varying=False,
-                _valid_at=(CellType.BOUNDARY,),
+                # EXTERNAL: valid in cells set from outside (nesting), so the
+                # damping at faces next to them (a child's interface) is defined
+                _valid_at=(CellType.BOUNDARY, CellType.EXTERNAL),
             ),
         )
         self.An.fill(self._An_const)
@@ -848,6 +850,7 @@ class Momentum:
         idpdx: core.Array,
         idpdy: core.Array,
         viscosity: core.Array,
+        before_diagnostics: Optional[Callable[[], None]] = None,
     ):
         """Update depth-explicit transports (:attr:`pk`, :attr:`qk`) and velocities
         (:attr:`uk`, :attr:`vk`). This will also update their halos.
@@ -862,6 +865,10 @@ class Momentum:
             idpdx: internal pressure gradient (m2 s-2) in x-direction
             idpdy: internal pressure gradient (m2 s-2) in y-direction
             viscosity: turbulent viscosity (m2 s-1)
+            before_diagnostics: optional; called after the transports are updated and
+                before the diagnostics (:meth:`update_diagnostics`), which then follow
+                whatever it changed, the Coriolis term included (couplers, e.g. nesting,
+                may replace transports there)
         """
         # Start the halo exchange for viscosity, as this needs to be interpolated
         # to the U and V grids. For that, information from the halos is used.
@@ -938,7 +945,11 @@ class Momentum:
             u()
         self._u3dfirst = not self._u3dfirst
 
-        self.update_diagnostics(timestep, viscosity, skip_coriolis=True)
+        if before_diagnostics is None:
+            self.update_diagnostics(timestep, viscosity, skip_coriolis=True)
+        else:
+            before_diagnostics()
+            self.update_diagnostics(timestep, viscosity)
 
     def update_diagnostics(
         self, timestep: float, viscosity: core.Array, skip_coriolis: bool = False

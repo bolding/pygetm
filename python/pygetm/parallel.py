@@ -27,14 +27,40 @@ def _iterate_rankmap(rankmap):
 
 
 LOGFILE_PREFIX = "getm-"
+_file_prefix = LOGFILE_PREFIX
 
 
-def get_logger(level=logging.INFO, comm=MPI.COMM_WORLD) -> logging.Logger:
+def file_prefix() -> str:
+    """Prefix for files written by individual processes (logs, dumps). This
+    includes the name passed to :func:`get_logger`, if any."""
+    return _file_prefix
+
+
+def get_logger(
+    level=logging.INFO, comm=MPI.COMM_WORLD, name: Optional[str] = None
+) -> logging.Logger:
+    """Configure logging for the current process.
+
+    Args:
+        level: log level
+        comm: communicator of the processes that run the same simulation. Its
+            rank 0 logs to the console; with more than one process, each
+            process additionally logs to its own file.
+        name: name of the simulation (e.g., a domain in a nested setup).
+            If provided, it is included in the names of log and dump files and
+            in console messages, so that multiple simulations can run side by
+            side within one MPI job.
+    """
+    global _file_prefix
+    _file_prefix = LOGFILE_PREFIX if name is None else f"{LOGFILE_PREFIX}{name}-"
     handlers: list[logging.Handler] = []
     if comm.rank == 0:
-        handlers.append(logging.StreamHandler())
+        stream_handler = logging.StreamHandler()
+        if name is not None:
+            stream_handler.setFormatter(logging.Formatter(f"[{name}] %(message)s"))
+        handlers.append(stream_handler)
     if comm.size > 1:
-        logfile = f"{LOGFILE_PREFIX}{comm.rank:04}.log"
+        logfile = f"{_file_prefix}{comm.rank:04}.log"
         file_handler = logging.FileHandler(logfile, mode="w")
         file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
         handlers.append(file_handler)

@@ -72,6 +72,84 @@ def log_exceptions(method):
     return wrapper
 
 
+#: Points within the state update of :class:`Simulation` at which
+#: :meth:`Coupler.on_stage` is called, in order of occurrence. ``transports_2d``
+#: and ``elevation`` occur every microtimestep; ``momentum_3d_transports``,
+#: ``momentum_3d`` and ``tracers`` only when the microtimestep completes a
+#: macrotimestep (3D runs only). ``momentum_3d_transports`` comes after the 3D
+#: transports are updated, before the momentum diagnostics are computed from them
+#: (a coupler may replace transports there); ``momentum_3d`` after the
+#: diagnostics and the turbulence update.
+COUPLING_STAGES = (
+    "transports_2d",
+    "elevation",
+    "momentum_3d_transports",
+    "momentum_3d",
+    "tracers",
+)
+
+
+class Coupler:
+    """Base class for objects that exchange information between a simulation and
+    other simulations (e.g., nested domains) at fixed points in the time loop.
+
+    Register couplers with :meth:`BaseSimulation.add_coupler`. All methods are
+    no-ops by default; subclasses override the ones they need.
+    """
+
+    def on_start(self, sim: "BaseSimulation"):
+        """Called from :meth:`BaseSimulation.start`, after the simulation has been
+        initialized but before inputs are updated for the first time."""
+        pass
+
+    def before_state_update(self, sim: "BaseSimulation", macro_active: bool):
+        """Called from :meth:`BaseSimulation.advance` after the time has been
+        incremented to the end of the current microtimestep, but before the model
+        state is updated.
+
+        Args:
+            sim: simulation that is being advanced
+            macro_active: whether the current microtimestep completes a
+                macrotimestep
+        """
+        pass
+
+    def after_state_update(self, sim: "BaseSimulation", macro_active: bool):
+        """Called from :meth:`BaseSimulation.advance` after the model state has been
+        updated, but before inputs and diagnostics are updated.
+
+        Args:
+            sim: simulation that is being advanced
+            macro_active: whether the current microtimestep completes a
+                macrotimestep
+        """
+        pass
+
+    def on_stage(self, sim: "BaseSimulation", stage: str, macro_active: bool):
+        """Called from within the state update, just after a group of prognostic
+        variables has been updated (and halo-exchanged within the domain).
+
+        Args:
+            sim: simulation that is being advanced
+            stage: one of :data:`COUPLING_STAGES`:
+
+                * ``transports_2d``: depth-integrated transports ``U``, ``V``
+                * ``elevation``: surface elevation ``T.z``
+                * ``momentum_3d``: layer transports and velocities ``pk``,
+                  ``qk``, ``uk``, ``vk``; turbulent viscosity ``num``
+                * ``tracers``: all tracers (temperature, salinity, FABM),
+                  layer thicknesses ``hn``
+
+            macro_active: whether the current microtimestep completes a
+                macrotimestep
+        """
+        pass
+
+    def on_finish(self, sim: "BaseSimulation"):
+        """Called from :meth:`BaseSimulation.finish`, before output is closed."""
+        pass
+
+
 class BaseSimulation:
     __slots__ = (
         "logger",
@@ -91,6 +169,7 @@ class BaseSimulation:
         "_start_time",
         "_profile",
         "_cached_check_finite_info",
+        "_couplers",
     )
 
     def __init__(
@@ -120,6 +199,18 @@ class BaseSimulation:
 
         self.default_time_reference: Optional[cftime.datetime] = None
         self._cached_check_finite_info = None
+        self._couplers: list[Coupler] = []
+
+    def add_coupler(self, coupler: Coupler):
+        """Register an object that will be notified at fixed points in the time loop,
+        for instance, to exchange information with nested domains.
+        This must be called before :meth:`start`.
+        """
+        self._couplers.append(coupler)
+
+    def _coupling_stage(self, stage: str, macro_active: bool):
+        for coupler in self._couplers:
+            coupler.on_stage(self, stage, macro_active)
 
     def __getitem__(self, key: str) -> core.Array:
         return self.output_manager.fields[key]
@@ -269,6 +360,9 @@ class BaseSimulation:
 
         self._start()
 
+        for coupler in self._couplers:
+            coupler.on_start(self)
+
         # Update all inputs and diagnostics.
         # This includes forcing for the future state update (e.g., tracer source terms)
         self.input_manager.update(self.time, macro=True)
@@ -323,7 +417,13 @@ class BaseSimulation:
         if self.report != 0 and self.istep % self.report == 0:
             self.logger.info(self.time)
 
+        for coupler in self._couplers:
+            coupler.before_state_update(self, macro_active)
+
         self._advance_state(macro_active)
+
+        for coupler in self._couplers:
+            coupler.after_state_update(self, macro_active)
 
         # Update all inputs and (state-dependent) diagnostics.
         # This includes forcing for the future state update (e.g., tracer source terms)
@@ -363,6 +463,8 @@ class BaseSimulation:
                 self._summarize_profiling_result(ps)
         nsecs = timeit.default_timer() - self._start_time
         self.logger.info(f"Time spent in main loop: {nsecs:.3f} s")
+        for coupler in self._couplers:
+            coupler.on_finish(self)
         self.output_manager.close(self.timestep * self.istep, self.time)
 
     def check_finite(self, macro_active: bool = True, dump: bool = True) -> bool:
@@ -422,7 +524,7 @@ class BaseSimulation:
                 assert all_bad_fields
                 dump_fields = set(all_bad_fields)
                 dump_fields = [f for f in self._fields.values() if f.ndim]
-                dump_file = f"{parallel.LOGFILE_PREFIX}dump.nc"
+                dump_file = f"{parallel.file_prefix()}dump.nc"
                 self.logger.info(f"Dumping {len(dump_fields)} fields to {dump_file}")
                 self.output_manager.dump(dump_file, *dump_fields)
             self.tiling.comm.Barrier()
@@ -1168,6 +1270,7 @@ class Simulation(BaseSimulation):
         self.momentum.advance_depth_integrated(
             self.timestep, self.tausx, self.tausy, self.dpdx, self.dpdy
         )
+        self._coupling_stage("transports_2d", macro_active)
 
         # Update surface elevation on T grid from time=0 to time=1 using transports
         # U and V at time=1/2 and freshwater fluxes at time=0. This also updates halos
@@ -1182,6 +1285,7 @@ class Simulation(BaseSimulation):
         self._int_river_flow += self.rivers.flow * self.timestep
 
         self.T.z.halo_updaters[parallel.Neighbor.ALL].finish()
+        self._coupling_stage("elevation", macro_active)
 
         if self.runtype > RunType.BAROTROPIC_2D and macro_active:
             # Use previous source terms for biogeochemistry (valid for the start of the
@@ -1226,6 +1330,15 @@ class Simulation(BaseSimulation):
                 self.internal_pressure.idpdx,
                 self.internal_pressure.idpdy,
                 self.vertical_mixing.num,
+                # Couplers (nesting) may replace the 3D transports: the diagnostics
+                # (vertical velocity, velocities, shear, bottom friction, advection,
+                # slow terms, Coriolis) then follow the replaced transports, as they
+                # do after a restart
+                before_diagnostics=(
+                    lambda: self._coupling_stage("momentum_3d_transports", macro_active)
+                )
+                if self._couplers
+                else None,
             )
 
             # Update turbulent quantities (T grid - interfaces) from time=0 to
@@ -1242,6 +1355,7 @@ class Simulation(BaseSimulation):
                 self.NN,
                 self.momentum.SS,
             )
+            self._coupling_stage("momentum_3d", macro_active)
 
             # Advect and diffuse tracers. Source terms are optionally handled too,
             # as part of the diffusion update.
@@ -1252,6 +1366,7 @@ class Simulation(BaseSimulation):
                 self.momentum.ww,
                 self.vertical_mixing.nuh,
             )
+            self._coupling_stage("tracers", macro_active)
 
             # If we have to delay slow (2D depth-integrated) terms for internal pressure
             # by one macrotimestep, calculate them now, at the end of state update of the
@@ -1360,9 +1475,13 @@ class Simulation(BaseSimulation):
         # to advection and diffusion, bottom friction and Coriolis terms.
         # Only do 2D Coriolis update at the start of the simulation.
         # At subsequent times, this term will already have been updated
-        # as part of the momentum update in _advance_state
+        # as part of the momentum update in _advance_state - unless couplers
+        # (nesting) may have replaced transports after that update: then it is
+        # computed from the replaced transports, as after a restart.
         self.momentum.update_depth_integrated_diagnostics(
-            self.timestep, skip_coriolis=not starting, update_z0b=update_z0b
+            self.timestep,
+            skip_coriolis=not (starting or self._couplers),
+            update_z0b=update_z0b,
         )
 
         # Update air-sea fluxes of heat and momentum (all on T grid)
