@@ -6,9 +6,9 @@ module advection_base
 
    private
 
-   !> mask value of a cell computed by another model (pygetm.constants.CellType.EXTERNAL: a nesting level's ring,
+   !> mask value of a cell computed by another model (pygetm.constants.CellType.COUPLED: a nesting level's ring,
    !> its parent's hole): wet, its faces open, so it takes part in advection as water
-   integer, parameter, public :: MASK_EXTERNAL = 5
+   integer, parameter, public :: MASK_COUPLED = 5
 
    type, abstract, public :: type_advection_base
    contains
