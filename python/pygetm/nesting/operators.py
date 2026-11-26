@@ -20,6 +20,8 @@ Flux matching
 """
 
 import numpy as np
+import numpy.typing as npt
+from typing import Optional, Tuple
 
 
 def minmod(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -56,8 +58,8 @@ def limited_slopes(
 
 
 def limited_slopes_at(
-    c: np.ndarray, wet: "np.ndarray | None", j, i
-) -> "tuple[np.ndarray, np.ndarray]":
+    c: np.ndarray, wet: Optional[np.ndarray], j: npt.ArrayLike, i: npt.ArrayLike
+) -> Tuple[np.ndarray, np.ndarray]:
     """:func:`limited_slopes` at the cells (j, i) only, with the same
     arithmetic (identical values), for the few cells a parent sends."""
     j, i = np.asarray(j), np.asarray(i)
@@ -84,13 +86,20 @@ def limited_slopes_at(
     return sx, sy
 
 
-def subcell_offset(k, r: int):
+def subcell_offset(k: npt.ArrayLike, r: int) -> np.ndarray:
     """Centre of sub-cell k (0..r-1) relative to the parent cell centre, in
     parent-cell units."""
     return (np.asarray(k) + 0.5) / r - 0.5
 
 
-def prolong(c, sx, sy, a, b, r: int) -> np.ndarray:
+def prolong(
+    c: np.ndarray,
+    sx: np.ndarray,
+    sy: np.ndarray,
+    a: npt.ArrayLike,
+    b: npt.ArrayLike,
+    r: int,
+) -> np.ndarray:
     """Value in child sub-cell (row a, column b) of parent cells (c, sx, sy)."""
     return c + sx * subcell_offset(b, r) + sy * subcell_offset(a, r)
 
@@ -132,7 +141,7 @@ __all__ = [
 ]
 
 
-def interp_time(s0, s1, a):
+def interp_time(s0: np.ndarray, s1: np.ndarray, a: float) -> np.ndarray:
     """Linear in time between two snapshots: s0 at a = 0, s1 at a = 1 (a > 1
     extrapolates)."""
     return (1.0 - a) * s0 + a * s1

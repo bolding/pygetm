@@ -36,9 +36,13 @@ Face convention: the U face with index (j, i) is the east face of T cell
 arrays (see :func:`boundary_faces`): x faces first, then y faces, row-major.
 """
 
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
+import numpy.typing as npt
+import os
+
+Window = Tuple[int, int, int, int]
 
 SIDES = ("W", "E", "S", "N")
 
@@ -217,7 +221,7 @@ class Level:
         outer edge: every side of the root, the outer sides of a child."""
         return self.parent is None or side in self.outer_sides
 
-    def set_active(self, mask: Optional[np.ndarray]):
+    def set_active(self, mask: Optional[np.ndarray]) -> None:
         """Set the active region: a boolean mask of the window's parent cells
         (shape (jstop - jstart, istop - istart)); None for the whole window.
         Must be called before :meth:`finish`."""
@@ -243,7 +247,7 @@ class Level:
         self.cactive = np.repeat(np.repeat(mask, r, axis=0), r, axis=1)
 
     @property
-    def extended_shape(self):
+    def extended_shape(self) -> Tuple[int, int]:
         """Shape of the level including its band (for a level with an overhang: the
         view the nesting works on, the window part and its band)."""
         return (self.ny + 2 * self.band, self.nx + 2 * self.band)
@@ -253,7 +257,7 @@ class Level:
         return any(self.overhang.values())
 
     @property
-    def domain_shape(self):
+    def domain_shape(self) -> Tuple[int, int]:
         """Shape of the level's pyGETM domain: the view plus the overhang."""
         o = self.overhang
         return (
@@ -262,11 +266,11 @@ class Level:
         )
 
     @property
-    def view_offset(self):
+    def view_offset(self) -> Tuple[int, int]:
         """(j, i) of the view's first cell in the domain's arrays."""
         return self.overhang["S"], self.overhang["W"]
 
-    def to_domain(self, a: np.ndarray, fill) -> np.ndarray:
+    def to_domain(self, a: np.ndarray, fill: Any) -> np.ndarray:
         """A view-shaped array (extended shape) placed into the domain's shape."""
         if not self.has_overhang:
             return a
@@ -299,7 +303,7 @@ class Level:
             out[h + self.ny :, :] = True
         return out
 
-    def regular_supergrid(self):
+    def regular_supergrid(self) -> Tuple[np.ndarray, np.ndarray]:
         """The regular grid of the level (from lon0/dlon: for a child the parent's
         grid refined by the ratio) on the supergrid, including the band:
         (x, y) of shape (2 (ny + 2 band) + 1, 2 (nx + 2 band) + 1)."""
@@ -308,7 +312,7 @@ class Level:
         y = self.lat0 + (np.arange(2 * (self.ny + 2 * h) + 1) / 2.0 - h) * self.dlat
         return np.meshgrid(x, y)
 
-    def domain_supergrid(self):
+    def domain_supergrid(self) -> Tuple[np.ndarray, np.ndarray]:
         """The coordinates of the level's whole pyGETM domain on the supergrid (with an
         overhang: larger than :meth:`supergrid`)."""
         if self.grid is None:
@@ -328,7 +332,7 @@ class Level:
             self._supergrid = x, y
         return self._supergrid
 
-    def supergrid(self):
+    def supergrid(self) -> Tuple[np.ndarray, np.ndarray]:
         """The level's coordinates on the supergrid including the band, (x, y): the
         curvilinear grid if the level has one (``grid``; with an overhang its view),
         else the regular grid."""
@@ -340,7 +344,7 @@ class Level:
         sl = (slice(2 * oj, 2 * (oj + ny) + 1), slice(2 * oi, 2 * (oi + nx) + 1))
         return x[sl], y[sl]
 
-    def centres(self):
+    def centres(self) -> Tuple[np.ndarray, np.ndarray]:
         """Coordinates (x, y) of the level's cell centres (ny, nx), without the band."""
         x, y = self.supergrid()
         h = self.band
@@ -350,7 +354,7 @@ class Level:
         )
         return x[sl], y[sl]
 
-    def edges(self):
+    def edges(self) -> Tuple[np.ndarray, np.ndarray]:
         """Cell edges (degrees) in x and y, including the band (regular levels only;
         see :meth:`supergrid`)."""
         if self.grid is not None:
@@ -381,7 +385,7 @@ class Level:
         hole[j0:j1, i0:i1] = child.active
         return hole
 
-    def finish(self):
+    def finish(self) -> None:
         """Hole, rims, interface faces (parents must be finished first).
 
         The rim is every hole cell that something reads, so the child must
@@ -561,7 +565,7 @@ class Level:
         act[h : h + self.ny, h : h + self.nx] = self.cactive
         return dilate(act, h) & ~act & ~self.outer_mask() & ~self._overhang_band()
 
-    def ring_cells(self):
+    def ring_cells(self) -> Tuple[np.ndarray, np.ndarray]:
         """Global (j, i) of all ring cells, row-major (for a full window: the
         whole band)."""
         h = self.band
@@ -576,7 +580,9 @@ class Level:
         act[h : h + self.ny, h : h + self.nx] = self.cactive
         return ~act & ~self._ring_mask() & ~self._overhang_band()
 
-    def ring_source(self, j, i):
+    def ring_source(
+        self, j: npt.ArrayLike, i: npt.ArrayLike
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Parent cell (global) covering child cells (j, i) (also in the band),
         and the position (a, b) of the child cell within it."""
         i0, _, j0, _ = self.window
@@ -589,7 +595,7 @@ class Level:
         )
 
 
-def _overlap(w1, w2) -> bool:
+def _overlap(w1: Window, w2: Window) -> bool:
     return w1[0] < w2[1] and w2[0] < w1[1] and w1[2] < w2[3] and w2[2] < w1[3]
 
 
@@ -717,7 +723,7 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
     return blocks(connected) | land
 
 
-def read_layout(path) -> Dict[str, Any]:
+def read_layout(path: Union[str, os.PathLike]) -> Dict[str, Any]:
     """A nesting layout from a YAML file; a level's ``grid`` file is taken
     relative to the layout's directory."""
     import os
@@ -733,7 +739,7 @@ def read_layout(path) -> Dict[str, Any]:
 
 
 def load_levels(
-    config,
+    config: Union[str, os.PathLike, Mapping[str, Any]],
     halo: int = 2,
     root_band: Optional[int] = None,
     wet: Optional[Mapping[str, np.ndarray]] = None,

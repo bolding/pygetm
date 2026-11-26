@@ -26,17 +26,42 @@ This is the nesting exchange; it shares no code with pyGETM's halo exchange.
 """
 
 import enum
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
+import numpy.typing as npt
 
 from .geometry import Level
+from mpi4py import MPI
+
+if TYPE_CHECKING:
+    from ..core import Grid
 
 
 class LevelTiling:
     """A level's pyGETM tiling in the level's global cell indices."""
 
-    def __init__(self, info: dict, band: int, world_offset: int, view_offset=(0, 0)):
+    __slots__ = (
+        "band",
+        "halo",
+        "map",
+        "ntiles",
+        "nx_sub",
+        "ny_sub",
+        "offi",
+        "offj",
+        "offset",
+        "xoff",
+        "yoff",
+    )
+
+    def __init__(
+        self,
+        info: dict,
+        band: int,
+        world_offset: int,
+        view_offset: Tuple[int, int] = (0, 0),
+    ):
         self.map = np.asarray(info["map"])
         self.nx_sub, self.ny_sub = info["nx_sub"], info["ny_sub"]
         self.xoff, self.yoff = info["xoffset_global"], info["yoffset_global"]
@@ -49,7 +74,7 @@ class LevelTiling:
         self.ntiles = int((self.map >= 0).sum())
 
     @staticmethod
-    def info(grid) -> dict:
+    def info(grid: "Grid") -> dict:
         """Description of the tiling of a pyGETM grid (to be shared)."""
         tl = grid.tiling
         return dict(
@@ -66,7 +91,7 @@ class LevelTiling:
         """Number of tiles pyGETM removed (all land)."""
         return int((self.map < 0).sum())
 
-    def owner(self, j, i) -> np.ndarray:
+    def owner(self, j: npt.ArrayLike, i: npt.ArrayLike) -> np.ndarray:
         """Rank (within the level) owning global cells (j, i); -1 if none."""
         row = np.floor_divide(np.asarray(j) + self.offj - self.yoff, self.ny_sub)
         col = np.floor_divide(np.asarray(i) + self.offi - self.xoff, self.nx_sub)
@@ -88,15 +113,21 @@ class LevelTiling:
             col * self.nx_sub + self.xoff - self.offi,
         )
 
-    def local(self, t: int, j, i):
+    def local(
+        self, t: int, j: npt.ArrayLike, i: npt.ArrayLike
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Index into ``Array.all_values`` of tile t for global cells (j, i)."""
         y0, x0 = self.origin(t)
         return np.asarray(j) - y0 + self.halo, np.asarray(i) - x0 + self.halo
 
 
 def gather_tilings(
-    levels: List[Level], world, level: Level, grid, offsets: Dict[str, int]
-) -> Dict[str, LevelTiling]:
+    levels: List[Level],
+    world: MPI.Comm,
+    level: Level,
+    grid: "Grid",
+    offsets: Dict[str, int],
+) -> Dict[str, "LevelTiling"]:
     """Share the tilings of all levels with every rank (one allgather)."""
     info = LevelTiling.info(grid) if grid.tiling.rank == 0 else None
     tilings = {}
@@ -131,6 +162,28 @@ class Tag(enum.IntEnum):
 
 class Plan:
     """Exchange lists for one parent/child link."""
+
+    __slots__ = (
+        "child",
+        "coff",
+        "comm",
+        "corr_of",
+        "ctil",
+        "faces_of",
+        "flx",
+        "poff",
+        "pro",
+        "ptil",
+        "res",
+        "rim_of",
+        "uv_of",
+    )
+
+    #: set by :meth:`NestingRun._interface_comms`: the interface's communicator and
+    #: the ranks of the parent's and the child's tile 0 on it
+    comm: MPI.Comm
+    poff: int
+    coff: int
 
     def __init__(self, child: Level, ptil: LevelTiling, ctil: LevelTiling):
         self.child, self.ptil, self.ctil = child, ptil, ctil

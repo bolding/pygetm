@@ -1,4 +1,4 @@
-from typing import Mapping, NamedTuple, Optional
+from typing import Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from mpi4py import MPI
 
@@ -68,7 +68,7 @@ def split_world(
     return NestingContext(names[color], domain_comm, nesting_comm, offsets, dict(ranks))
 
 
-def mpmd_blocks(entries) -> dict:
+def mpmd_blocks(entries: Sequence[Tuple[str, int]]) -> Dict[str, Tuple[int, int]]:
     """Domains of an MPMD launch from ``(name, appnum)`` of every rank, in
     rank order: ``{name: (offset, size)}`` in launch order. Each component
     (``appnum``) must hold one domain, each domain one component, and the

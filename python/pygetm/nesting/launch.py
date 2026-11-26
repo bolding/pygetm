@@ -40,7 +40,7 @@ SRUN_BIND = {
 BIND_CHOICES = ("none", "core", "hwthread")
 
 
-def _check(models: Sequence[Tuple[str, int]]):
+def _check(models: Sequence[Tuple[str, int]]) -> None:
     if not models:
         raise ValueError("no models")
     names = [n for n, _ in models]

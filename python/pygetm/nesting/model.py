@@ -24,7 +24,7 @@ nesting through :class:`NestedModel`:
 Steps 2 and 3 are collective over all processes of all components.
 """
 
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional, Union
 
 import warnings
 
@@ -35,9 +35,12 @@ from .geometry import Level, load_levels, read_layout
 from .hierarchy import split_mpmd
 from .runtime import NestingRun, install_abort_hook
 from . import masks
+import os
+
+Layout = Union[str, os.PathLike, Mapping[str, Any]]
 
 
-def _load_config(layout) -> Dict[str, Any]:
+def _load_config(layout: Layout) -> Dict[str, Any]:
     if isinstance(layout, Mapping):
         return dict(layout)
     return read_layout(layout)
@@ -48,7 +51,7 @@ class NestedModel:
 
     def __init__(
         self,
-        layout,
+        layout: Layout,
         name: str,
         comm: Optional[MPI.Comm] = None,
         halo: int = 2,
@@ -198,7 +201,7 @@ class NestedModel:
         return self._run
 
 
-def _lcm(values) -> int:
+def _lcm(values: Iterable[int]) -> int:
     import math
 
     out = 1
@@ -208,7 +211,7 @@ def _lcm(values) -> int:
 
 
 def simple_root_step(
-    dt_max: float, steps_per_root, period: Optional[float] = 3600.0
+    dt_max: float, steps_per_root: int, period: Optional[float] = 3600.0
 ) -> float:
     """The root step for :meth:`NestedModel.timestep`: the largest ``period / n``
     (n whole) not above ``dt_max`` for which every level's step (root step / its

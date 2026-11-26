@@ -36,17 +36,26 @@ set there; faces between ring and computed cells are computed by the level
 itself and are the interface faces matched by the flux registers.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+import numpy.typing as npt
 from mpi4py import MPI
 
 from ..simulation import Coupler
 from .geometry import Level
-from .plan import LevelTiling, Tag
+from .plan import LevelTiling, Plan, Tag
 from .runtime import NestingRun, check_couplers, sync_order
 from . import operators as ops
 from .endpoint import Endpoint
+
+if TYPE_CHECKING:
+    from ..core import Array, Grid
+    from ..simulation import BaseSimulation, Simulation
+
+Index = Tuple[np.ndarray, np.ndarray]
+Locate = Callable[[npt.ArrayLike, npt.ArrayLike], Index]
+Snapshot = Tuple[np.ndarray, np.ndarray, np.ndarray]
 
 
 class HaloWaitTimer:
@@ -56,7 +65,7 @@ class HaloWaitTimer:
     (:func:`pygetm.parallel.time_halo_waits`). Installed by :class:`Nested2D`."""
 
     @staticmethod
-    def install():
+    def install() -> None:
         from .. import parallel
 
         parallel.time_halo_waits(True)
@@ -76,6 +85,14 @@ class ExchangeClock:
     ``halo_wait``: the part blocked in MPI_Waitall, i.e. waiting for the
     neighbouring tiles of the same level)."""
 
+    __slots__ = (
+        "halo",
+        "halo_wait",
+        "halo_wait0",
+        "transfer",
+        "wait",
+    )
+
     def __init__(self):
         HaloWaitTimer.install()
         self.wait = 0.0
@@ -84,7 +101,7 @@ class ExchangeClock:
         self.halo_wait = 0.0
         self.halo_wait0 = HaloWaitTimer.total()
 
-    def halos(self, *fields):
+    def halos(self, *fields: "Array") -> None:
         """Halo update of *fields* (pyGETM arrays), timed."""
         t0, w0 = MPI.Wtime(), HaloWaitTimer.total()
         for f in fields:
@@ -97,7 +114,7 @@ class ExchangeClock:
         since the last reset."""
         return max(HaloWaitTimer.total() - self.halo_wait0 - self.halo_wait, 0.0)
 
-    def recv(self, comm, buf, source: int, tag: int):
+    def recv(self, comm: MPI.Comm, buf: np.ndarray, source: int, tag: int) -> None:
         t0 = MPI.Wtime()
         comm.Probe(source=source, tag=tag)
         t1 = MPI.Wtime()
@@ -105,12 +122,12 @@ class ExchangeClock:
         self.wait += t1 - t0
         self.transfer += MPI.Wtime() - t1
 
-    def waitall(self, reqs):
+    def waitall(self, reqs: List[MPI.Request]) -> None:
         t0 = MPI.Wtime()
         MPI.Request.Waitall(reqs)
         self.wait += MPI.Wtime() - t0
 
-    def reset(self):
+    def reset(self) -> None:
         self.wait = self.transfer = self.halo = self.halo_wait = 0.0
         self.halo_wait0 = HaloWaitTimer.total()
 
@@ -122,13 +139,25 @@ class PointTransfer:
     the owner of a point is the owner of its T cell. Sums are formed in a
     fixed order (k), so results do not depend on the decomposition."""
 
+    __slots__ = (
+        "K",
+        "dst_of",
+        "dst_off",
+        "dst_til",
+        "label",
+        "pairs",
+        "src_off",
+        "src_til",
+        "tag",
+    )
+
     def __init__(
         self,
         src_til: LevelTiling,
         dst_til: LevelTiling,
-        dst,
-        src,
-        weights,
+        dst: Index,
+        src: Index,
+        weights: npt.ArrayLike,
         tag: int,
         label: str,
         src_off: Optional[int] = None,
@@ -165,7 +194,9 @@ class PointTransfer:
                     si[idx][pos[sel], k[sel]],
                 )
 
-    def send(self, world, me: int, values: np.ndarray, loc):
+    def send(
+        self, world: MPI.Comm, me: int, values: np.ndarray, loc: Locate
+    ) -> List[MPI.Request]:
         """Source side: send this tile's values (an ``all_values`` array)."""
         reqs = []
         for (p, t), (_, _, sj, si) in self.pairs.items():
@@ -174,7 +205,9 @@ class PointTransfer:
                 reqs.append(world.Isend(buf, dest=self.dst_off + t, tag=self.tag))
         return reqs
 
-    def recv(self, world, me: int, clock: Optional[ExchangeClock] = None) -> np.ndarray:
+    def recv(
+        self, world: MPI.Comm, me: int, clock: Optional[ExchangeClock] = None
+    ) -> np.ndarray:
         """Destination side: weighted values at this tile's points."""
         dj, di, w = self.dst_of.get(
             me, (np.zeros(0, int),) * 2 + (np.zeros((0, self.K)),)
@@ -193,7 +226,7 @@ class PointTransfer:
             out = out + w[:, kk] * vals[:, kk]
         return out
 
-    def points(self, me: int):
+    def points(self, me: int) -> Index:
         dj, di, _ = self.dst_of.get(me, (np.zeros(0, int), np.zeros(0, int), None))
         return dj, di
 
@@ -213,7 +246,12 @@ class PointTransfer:
         return out
 
 
-def _outside_masks(lev: Level):
+def _outside_masks(
+    lev: Level,
+) -> Tuple[
+    Callable[[np.ndarray, np.ndarray], np.ndarray],
+    Callable[[np.ndarray, np.ndarray], np.ndarray],
+]:
     """Lookups (global j, i; band included) of the non-active cells and of
     the ring cells of a child."""
     b = lev.band
@@ -223,7 +261,7 @@ def _outside_masks(lev: Level):
     return (lambda j, i: ~act[j + b, i + b]), (lambda j, i: ring[j + b, i + b])
 
 
-def ring_faces(child: Level, axis: str):
+def ring_faces(child: Level, axis: str) -> Tuple[Index, Index, np.ndarray]:
     """Child U (axis x) or V (axis y) points with non-active cells on both
     sides, at least one of them a ring cell, their parent source faces (2 per
     point) and weights: linear across, constant along the parent faces."""
@@ -257,7 +295,7 @@ def ring_faces(child: Level, axis: str):
     return (j, i), (src_j, src_i), weights
 
 
-def rim_faces(child: Level, axis: str):
+def rim_faces(child: Level, axis: str) -> Tuple[Index, Index, np.ndarray]:
     """Parent U/V points with hole cells on both sides and at least one rim
     cell, their child source faces (r per point, mean)."""
     par, r = child.parent, child.ratio
@@ -283,7 +321,7 @@ def rim_faces(child: Level, axis: str):
     return (pj, pf), (src_j, src_i), weights
 
 
-def face_transfers(child: Level, plan):
+def face_transfers(child: Level, plan: Plan) -> Dict[str, "PointTransfer"]:
     """U/V ring (parent -> child) and rim (child -> parent) transfers of the
     interface of *plan* (on ``plan.comm``)."""
     ptil, ctil, po, co = plan.ptil, plan.ctil, plan.poff, plan.coff
@@ -304,8 +342,15 @@ class Nested2D(Coupler):
     """Coupler exchanging z, U, V of a 2D barotropic simulation with its
     parent and children (see module documentation)."""
 
-    def __init__(self, nest: NestingRun, sim, sponge_width=0.0, sponge_alpha=0.1):
+    def __init__(
+        self,
+        nest: NestingRun,
+        sim: "Simulation",
+        sponge_width: float = 0.0,
+        sponge_alpha: float = 0.1,
+    ):
         self.nest, self.sim = nest, sim
+        self.logger = sim.logger.getChild("nesting")
         #: this process's end of the level's interfaces (shared with Nested3D)
         self.ep = ep = Endpoint(nest)
         self.lev = lev = ep.lev
@@ -381,7 +426,7 @@ class Nested2D(Coupler):
     #: the restarted model state (restart files are written after the sync).
     _RESTART = (("T", "z"), ("T", "zsx"), ("T", "zsy"), ("U", "u"), ("V", "v"))
 
-    def _restart_arrays(self):
+    def _restart_arrays(self) -> None:
         """Arrays (part of the model state, so in pyGETM's restart files) with
         the previous ring snapshot, and ``nest_ring_old_set`` (1 where it is
         stored, 0 before the first sync with fluxes: a cold start)."""
@@ -411,7 +456,7 @@ class Nested2D(Coupler):
             attrs=dict(attrs),
         )
 
-    def _phase_array(self):
+    def _phase_array(self) -> None:
         """``nest_root_phase``: this level's steps since the last root 3D step
         (in a 2D run: the last root step), part of the model state. The nesting
         restarts its sub-step counters, sums and registers at a root 3D step, so
@@ -455,7 +500,7 @@ class Nested2D(Coupler):
         import os
         import zlib
 
-        def one(lev, with_active):
+        def one(lev: Level, with_active: bool) -> bytes:
             geo = (
                 lev.name,
                 lev.parent.name if lev.parent is not None else "",
@@ -486,7 +531,7 @@ class Nested2D(Coupler):
         data += b"".join(one(c, True) for c in lev.children)
         return float(zlib.crc32(data))
 
-    def _clean_coupled_after_restart(self, sim):
+    def _clean_coupled_after_restart(self, sim: "Simulation") -> None:
         """After a restart: the restart file holds NaN where the writer masks the
         field, which includes this level's COUPLED cells inside the domain (a
         parent's hole, a child's band); a continuous run has finite values there.
@@ -513,7 +558,7 @@ class Nested2D(Coupler):
             bad = ~np.isfinite(v) & np.broadcast_to(ext, v.shape)
             v[bad] = 0.0
 
-    def _check_restart_phase(self, sim):
+    def _check_restart_phase(self, sim: "Simulation") -> None:
         """Steps of this level per root 3D step (the longest 3D step of all
         levels: the root's); after a restart, all levels stop if any file was
         written in the middle of a root 3D step."""
@@ -569,7 +614,7 @@ class Nested2D(Coupler):
                 "written with"
             )
 
-    def _restart_points(self):
+    def _restart_points(self) -> Tuple[Index, ...]:
         return (
             (self._rj, self._ri),
             (self._rj, self._ri),
@@ -578,7 +623,7 @@ class Nested2D(Coupler):
             self._rv,
         )
 
-    def _snap_to_restart(self):
+    def _snap_to_restart(self) -> None:
         """Keep the restart arrays equal to ``_snap_old``."""
         if self._rs is None:
             return
@@ -592,7 +637,7 @@ class Nested2D(Coupler):
             a.all_values[pts] = vals
         self._rs_set.all_values[...] = 1.0
 
-    def _snap_from_restart(self):
+    def _snap_from_restart(self) -> None:
         """``_snap_old`` from the restart arrays if a restart stored one (else
         None, as at a cold start)."""
         if self._rs is None or not (self._rs_set.all_values > 0.5).any():
@@ -604,13 +649,15 @@ class Nested2D(Coupler):
 
     # --- helpers --------------------------------------------------------------
 
-    def loc(self, j, i):
+    def loc(self, j: npt.ArrayLike, i: npt.ArrayLike) -> Index:
         return self.ep.loc(j, i)
 
-    def _dt(self):
+    def _dt(self) -> float:
         return self.sim.timestep
 
-    def _face_volume(self, is_x, j, i):
+    def _face_volume(
+        self, is_x: np.ndarray, j: np.ndarray, i: np.ndarray
+    ) -> np.ndarray:
         jj, ii = self.loc(j, i)
         out = np.empty(np.shape(is_x))
         x, y = is_x, ~is_x
@@ -620,7 +667,7 @@ class Nested2D(Coupler):
 
     # --- child side -------------------------------------------------------------
 
-    def _recv_snapshot(self):
+    def _recv_snapshot(self) -> Snapshot:
         parts = []
         for p, v in self._ring:
             buf = np.empty((3, v[2].size))
@@ -631,7 +678,7 @@ class Nested2D(Coupler):
         v = self.up_faces["ring_y"].recv(self.up.comm, self.t, self.clock)
         return z, u, v
 
-    def _set_ring_z(self, snap, halos=True):
+    def _set_ring_z(self, snap: np.ndarray, halos: bool = True) -> None:
         if self._rj.size:
             vals = ops.prolong(
                 snap[0], snap[1], snap[2], self._ring_a, self._ring_b, self.lev.ratio
@@ -653,7 +700,7 @@ class Nested2D(Coupler):
         if halos:
             self.clock.halos(self.z)
 
-    def _alpha(self, grid, pts):
+    def _alpha(self, grid: "Grid", pts: Index) -> np.ndarray:
         """pyGETM's drying factor at faces ``pts`` of ``grid`` (U or V) from the
         child's own water depth there: 0 at D <= 2 Dmin, 1 at D >= Dcrit
         (as pygetm.Simulation.update_depth, _pygetm.alpha). pyGETM computes it
@@ -663,7 +710,7 @@ class Nested2D(Coupler):
         dmin2 = 2.0 * sim.Dmin
         return np.clip((D - dmin2) / (sim.Dcrit - dmin2), 0.0, 1.0)
 
-    def _set_ring_uv(self, u, v, halos=True):
+    def _set_ring_uv(self, u: np.ndarray, v: np.ndarray, halos: bool = True) -> None:
         # drying: the parent's transport through a (coarser) face that is wet in
         # the parent, scaled by the child's own drying factor at its ring face, so
         # no water moves over the child's dry ground (alpha = 1 in deep water)
@@ -673,7 +720,9 @@ class Nested2D(Coupler):
         if halos:
             self.clock.halos(self.U, self.V)
 
-    def _send_up(self, fluxes=True, wait=True):
+    def _send_up(
+        self, fluxes: bool = True, wait: bool = True
+    ) -> Optional[List[MPI.Request]]:
         reqs = []
         z = self.z.all_values
         for (tt, p), (_, _, _, cj, ci) in self.up.res.items():
@@ -701,7 +750,7 @@ class Nested2D(Coupler):
             return reqs
         self.clock.waitall(reqs)
 
-    def _own_edge_fluxes(self):
+    def _own_edge_fluxes(self) -> None:
         e = self.lev.edge
         keep = self.own_edge & self.lev.computed[e["inner"]]
         if keep.any():
@@ -711,7 +760,9 @@ class Nested2D(Coupler):
 
     # --- parent side ------------------------------------------------------------
 
-    def _send_snapshot(self, plan, faces):
+    def _send_snapshot(
+        self, plan: Plan, faces: Dict[str, "PointTransfer"]
+    ) -> List[MPI.Request]:
         z = self.z.all_values
         reqs = []
         for (p, tt), (pj, pi, *_rest) in plan.pro.items():
@@ -724,12 +775,14 @@ class Nested2D(Coupler):
         reqs += faces["ring_y"].send(plan.comm, self.t, self.V.all_values, self.loc)
         return reqs
 
-    def _window_volumes(self, plan):
+    def _window_volumes(self, plan: Plan) -> np.ndarray:
         wf = self.lev.wfaces[plan.child.name]
         m = plan.faces_of[self.t]
         return self._face_volume(wf["is_x"][m], wf["face"][0][m], wf["face"][1][m])
 
-    def _recv_child(self, plan, faces, fp):
+    def _recv_child(
+        self, plan: Plan, faces: Dict[str, "PointTransfer"], fp: Optional[np.ndarray]
+    ) -> None:
         """From one child at a sync: its rim (elevation and transports) in this level's
         hole and, with flux matching (``fp``: this level's own volumes through the
         interface faces), its flux registers.
@@ -745,7 +798,7 @@ class Nested2D(Coupler):
         self._continue_transports(plan, fc)
         self._pass_up(plan, fc)
 
-    def _recv_rim_z(self, plan):
+    def _recv_rim_z(self, plan: Plan) -> None:
         """The rim's elevation: the area-weighted mean over the wet child cells of each
         rim cell."""
         mine = plan.rim_of[self.t]
@@ -770,7 +823,7 @@ class Nested2D(Coupler):
             d = self.H[jj[ok], ii[ok]] + vals[ok]
             self.min_depth_rim = min(self.min_depth_rim, float(d.min()))
 
-    def _recv_rim_uv(self, plan, faces):
+    def _recv_rim_uv(self, plan: Plan, faces: Dict[str, "PointTransfer"]) -> None:
         """The rim's U, V: the mean over the child faces, only at faces open in this
         level (a land face keeps no transport; beyond a curvilinear child's conforming
         band the child's faces lie elsewhere).
@@ -782,7 +835,7 @@ class Nested2D(Coupler):
             op = arr.grid.mask.all_values[fj, fi] != 0
             arr.all_values[fj[op], fi[op]] = val[op]
 
-    def _recv_face_sums(self, plan) -> Optional[np.ndarray]:
+    def _recv_face_sums(self, plan: Plan) -> Optional[np.ndarray]:
         """The child's volumes through this tile's interface faces
         (:attr:`Plan.faces_of`), its r sub-faces added; None if the tile has no
         interface faces."""
@@ -792,7 +845,7 @@ class Nested2D(Coupler):
         sub = self.ep.recv_subfaces(plan, 1, Tag.FLUX, self.clock.recv)[0]
         return ops.face_sum(sub)
 
-    def _correct_elevation(self, plan, fp, fc):
+    def _correct_elevation(self, plan: Plan, fp: np.ndarray, fc: np.ndarray) -> None:
         """Flux matching: the cells outside the hole that this tile owns
         (:attr:`Plan.corr_of`) get the difference of this level's and the child's volume
         through their interface faces (all faces at once; np.add.at adds in face order,
@@ -834,7 +887,7 @@ class Nested2D(Coupler):
                 float(dz[k]),
             )
 
-    def _continue_transports(self, plan, fc):
+    def _continue_transports(self, plan: Plan, fc: np.ndarray) -> None:
         """The parent continues from the child's mean transport, at the interface faces
         whose U/V point this tile owns (:attr:`Plan.uv_of`). In 3D runs the transports
         summed over the macro step for the 3D momentum (Ui, Vi) hold this step's own U,
@@ -858,7 +911,7 @@ class Nested2D(Coupler):
         self.U.all_values[fj[x], fi[x]] = newU
         self.V.all_values[fj[~x], fi[~x]] = newV
 
-    def _pass_up(self, plan, fc):
+    def _pass_up(self, plan: Plan, fc: np.ndarray) -> None:
         """The child's volumes through faces on this level's own interface (a child
         touching it): into this level's register, for its parent."""
         wf = self.lev.wfaces[plan.child.name]
@@ -867,18 +920,20 @@ class Nested2D(Coupler):
         if up.any():
             np.add.at(self.reg, wf["up"][flist][up], fc[up])
 
-    def _sync(self, fps, with_parent: bool, fluxes: bool):
+    def _sync(
+        self, fps: List[Optional[np.ndarray]], with_parent: bool, fluxes: bool
+    ) -> None:
         """One sync point (:func:`~pygetm.nesting.runtime.sync_order`): up, restriction
         and flux registers; from the children, the hole's rim and their registers, then
         flux matching; down, this level's corrected state for the children's rings; from
         the parent, its state for this level's ring."""
         t0 = MPI.Wtime()
 
-        def recv_children():
+        def recv_children() -> None:
             for plan, faces, fp in zip(self.down, self.down_faces, fps):
                 self._recv_child(plan, faces, fp)
 
-        def send_down():
+        def send_down() -> List[MPI.Request]:
             reqs = []
             if self.down:
                 self.clock.halos(self.z, self.U, self.V)
@@ -886,7 +941,7 @@ class Nested2D(Coupler):
                     reqs += self._send_snapshot(plan, faces)
             return reqs
 
-        def recv_parent():
+        def recv_parent() -> None:
             self._snap_old = getattr(self, "_snap", None) if fluxes else None
             self._snap = self._recv_snapshot()
             self._set_ring_z(self._snap[0])
@@ -908,7 +963,7 @@ class Nested2D(Coupler):
 
     # --- Coupler hooks -------------------------------------------------------------
 
-    def _set_sponge(self, sim):
+    def _set_sponge(self, sim: "Simulation") -> None:
         """Add the sponge to An and redo pyGETM's interpolation of An to the
         U and V grids (momentum.start has done it before the couplers start;
         the time step is known only now)."""
@@ -948,7 +1003,7 @@ class Nested2D(Coupler):
         #: largest sponge An (m2 s-1) of this process (diagnostic)
         self.sponge_max = float(mom.An.all_values[w > 0].max(initial=0.0))
 
-    def on_start(self, sim):
+    def on_start(self, sim: "Simulation") -> None:
         check_couplers(sim, self, self.world, self.lev.name)
         # the sponge is a transport damping (An): a nested run applies it with the time
         # step once (Momentum(An_timestep_once=True); upstream pyGETM's default would
@@ -965,13 +1020,13 @@ class Nested2D(Coupler):
         self.clock.reset()
         self._t_start = MPI.Wtime()
 
-    def on_stage(self, sim, stage, macro_active):
+    def on_stage(self, sim: "Simulation", stage: str, macro_active: bool) -> None:
         t0 = MPI.Wtime()
         self._on_stage(sim, stage, macro_active)
         if self._t_start is not None:
             self.t_stage += MPI.Wtime() - t0
 
-    def _on_stage(self, sim, stage, macro_active):
+    def _on_stage(self, sim: "Simulation", stage: str, macro_active: bool) -> None:
         r = self.lev.time_ratio  # sub-steps per parent step
         k = self._k % r
         # the ring continued linearly in time from the parent's last two syncs
@@ -1008,7 +1063,7 @@ class Nested2D(Coupler):
                 sim.momentum.U_cum.update_halos()
                 sim.momentum.V_cum.update_halos()
 
-    def after_state_update(self, sim, macro_active):
+    def after_state_update(self, sim: "Simulation", macro_active: bool) -> None:
         self._phase.all_values[...] = (
             sim.istep % self._period
         )  # restart state (see _phase_array)
@@ -1016,6 +1071,27 @@ class Nested2D(Coupler):
         k = self._k % r
         self._sync(self._fps, self.up is not None and k == r - 1, fluxes=True)
         self._k += 1
+
+    def on_finish(self, sim: "Simulation") -> None:
+        """Log this process's time in the syncs and the drying and flux-matching
+        diagnostics (:meth:`timing` has the full breakdown)."""
+        t = self.timing()
+        self.logger.info(
+            f"{self.lev.name} tile {self.t}: {t['sync']:.1f} s of {t['elapsed']:.1f} s"
+            f" in the 2D syncs ({t['wait']:.1f} s waiting for partners)"
+        )
+        if self.max_correction > 0.0:
+            self.logger.info(
+                f"largest elevation correction by flux matching:"
+                f" {self.max_correction:.3g} m"
+            )
+        for what, value in (
+            ("ring", self.min_depth_ring),
+            ("rim", self.min_depth_rim),
+            ("corrected parent cells", self.min_depth_corrected),
+        ):
+            if np.isfinite(value):
+                self.logger.info(f"least water depth, {what}: {value:.3g} m")
 
     def timing(self) -> dict:
         """Wall-clock monitoring of this process since the start (seconds):

@@ -4,17 +4,25 @@ the level computes. One rule for every way a nested model is set up (pygetm-conf
 generated scripts, pygetm-nesting's tools), computed from the depths the run uses (after
 the nesting's consistency, :meth:`pygetm.nesting.NestedModel.share_depth`)."""
 
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 
 from .geometry import Level
 
+if TYPE_CHECKING:
+    from ..domain import Domain
+
 #: side letter -> pygetm.open_boundaries.Side name
 SIDES = {"W": "LEFT", "E": "RIGHT", "S": "BOTTOM", "N": "TOP"}
 
 
-def edge_segments(wet, band=0, sides="WESN", exclude=None):
+def edge_segments(
+    wet: np.ndarray,
+    band: int = 0,
+    sides: str = "WESN",
+    exclude: Optional[np.ndarray] = None,
+) -> List[Tuple[str, int, int, int]]:
     """Open boundaries along every wet stretch of a level's outer edges.
 
     ``wet`` (ny, nx): T cells of the level's pyGETM domain (band included).
@@ -36,7 +44,7 @@ def edge_segments(wet, band=0, sides="WESN", exclude=None):
     h = band
     own = wet if exclude is None else wet & ~np.asarray(exclude, dtype=bool)
 
-    def runs(cells):
+    def runs(cells: np.ndarray) -> List[Tuple[int, int]]:
         idx = np.nonzero(cells)[0]
         if not idx.size:
             return []
@@ -45,7 +53,7 @@ def edge_segments(wet, band=0, sides="WESN", exclude=None):
         stops = np.concatenate([idx[breaks] + 1, [idx[-1] + 1]])
         return list(zip(starts.tolist(), stops.tolist()))
 
-    def along(n, low, high):
+    def along(n: int, low: str, high: str) -> np.ndarray:
         """the window's cells along an edge, without the corners of open perpendicular
         sides"""
         m = np.zeros(n, bool)
@@ -95,13 +103,13 @@ def level_edge_segments(
 
 
 def add_edge_boundaries(
-    domain,
+    domain: "Domain",
     lev: Level,
     wet: np.ndarray,
     type_2d: int,
     type_3d: int,
     prefix: str = "",
-    sides: str = None,
+    sides: Optional[str] = None,
 ) -> List[Tuple[str, int, int, int]]:
     """Add the open boundaries of :func:`level_edge_segments` to ``domain`` (before its
     grids are created), named ``<prefix><side letter><k>`` (k counting all of them, in

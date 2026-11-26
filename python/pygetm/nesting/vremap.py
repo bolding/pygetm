@@ -26,9 +26,12 @@ reference (tests).
 """
 
 import numpy as np
+from typing import Callable, Optional, Tuple
+
+Prepared = Tuple[np.ndarray, np.ndarray]
 
 
-def interfaces(h):
+def interfaces(h: np.ndarray) -> np.ndarray:
     """Depths of the layer interfaces (0 at the surface), shape [..., nz + 1]."""
     h = np.asarray(h, dtype=float)
     z = np.zeros(h.shape[:-1] + (h.shape[-1] + 1,))
@@ -36,7 +39,9 @@ def interfaces(h):
     return z
 
 
-def stretch(z, D_from, D_to, keep=0.0):
+def stretch(
+    z: np.ndarray, D_from: np.ndarray, D_to: np.ndarray, keep: float = 0.0
+) -> np.ndarray:
     """Map interface depths of a column of depth ``D_from`` onto one of depth
     ``D_to``: linear (keep 0), or identity down to ``keep`` x min(D_from, D_to)
     and linear below (B')."""
@@ -50,7 +55,7 @@ def stretch(z, D_from, D_to, keep=0.0):
     return np.where(z <= z0, z, below)
 
 
-def prepare(z_src, z_dst):
+def prepare(z_src: np.ndarray, z_dst: np.ndarray) -> Prepared:
     """Positions of the target interfaces in the source column:
     (layer index j, fraction f) with z_dst = z_src[j] + f h_src[j].
 
@@ -78,7 +83,7 @@ def prepare(z_src, z_dst):
     return j, np.clip(f, 0.0, 1.0)
 
 
-def ppm_edges(c, h):
+def ppm_edges(c: np.ndarray, h: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Left (upper) and right (lower) edge values of the limited piecewise-parabolic
     reconstruction (Colella and Woodward 1984, eqs. 1.6-1.10, for layers of unequal
     thickness) of layer means ``c [..., n]`` with thicknesses ``h [..., n]``. The
@@ -138,7 +143,9 @@ def ppm_edges(c, h):
         e = np.where(good, e, 0.5 * (cj + cj1))
 
         # the edges next to the outermost layers: linear between the two layer means
-        def lin(ca, cb, ha, hb):
+        def lin(
+            ca: np.ndarray, cb: np.ndarray, ha: np.ndarray, hb: np.ndarray
+        ) -> np.ndarray:
             v = ca + ha / (ha + hb) * (cb - ca)
             return np.where((ha > 0) & (hb > 0) & np.isfinite(v), v, 0.5 * (ca + cb))
 
@@ -166,7 +173,9 @@ def ppm_edges(c, h):
     return np.where(empty, a, aL), np.where(empty, a, aR)
 
 
-def apply(prep, c_src, h_src, scheme="pcm"):
+def apply(
+    prep: Prepared, c_src: np.ndarray, h_src: np.ndarray, scheme: str = "pcm"
+) -> np.ndarray:
     """Contents of the target layers (per unit area) from source concentrations
     ``c_src [..., ns]`` with thicknesses ``h_src``; ``c_src`` may carry extra
     leading tracer axes (broadcast against the prepared positions).
@@ -200,7 +209,9 @@ def apply(prep, c_src, h_src, scheme="pcm"):
     return np.diff(Qz, axis=-1)
 
 
-def remap(h_src, c_src, h_dst, scheme="pcm"):
+def remap(
+    h_src: np.ndarray, c_src: np.ndarray, h_dst: np.ndarray, scheme: str = "pcm"
+) -> np.ndarray:
     """Concentrations on the target layers (one call, no sharing)."""
     prep = prepare(interfaces(h_src), interfaces(h_dst))
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -215,7 +226,9 @@ def remap(h_src, c_src, h_dst, scheme="pcm"):
 # nzp].
 
 
-def contents(zs, zd, c, h, scheme="pcm"):
+def contents(
+    zs: np.ndarray, zd: np.ndarray, c: np.ndarray, h: np.ndarray, scheme: str = "pcm"
+) -> np.ndarray:
     """Contents of the target layers (per unit area) for source interfaces ``zs [...,
     ns+1]`` and target interfaces ``zd [..., nd+1]`` (depths below the surface),
     concentrations ``c [(tracers,) ..., ns]`` and source thicknesses ``h [..., ns]``:
@@ -245,7 +258,7 @@ def contents(zs, zd, c, h, scheme="pcm"):
     return out.reshape(extra + lead + (nd,))
 
 
-def _kernel(name):
+def _kernel(name: str) -> Optional[Callable]:
     """A compiled routine of pyGETM, or None: then the numpy versions are used. Set the
     environment variable PYGETM_NESTING_REMAP=numpy to use numpy anyway (a simpler,
     pure-Python path, e.g. for debugging or for changes to the remap that are easier to
@@ -262,7 +275,9 @@ def _kernel(name):
         return None
 
 
-def gather_columns(arr, jj, ii, out=None):
+def gather_columns(
+    arr: np.ndarray, jj: np.ndarray, ii: np.ndarray, out: Optional[np.ndarray] = None
+) -> np.ndarray:
     """The columns of a pyGETM 3D array ``arr (nz, ny, nx)`` (layer 0 at the bottom) at
     the cells (jj, ii), surface first, as one C-contiguous ``(n, nz)`` block:
     ``arr[::-1, jj, ii].T``, compiled when available (no temporaries)."""
@@ -278,7 +293,9 @@ def gather_columns(arr, jj, ii, out=None):
     return out
 
 
-def scatter_columns(arr, jj, ii, vals):
+def scatter_columns(
+    arr: np.ndarray, jj: np.ndarray, ii: np.ndarray, vals: np.ndarray
+) -> None:
     """``arr[::-1, jj, ii] = vals.T`` for columns ``vals (n, nz)``, surface first,
     compiled when available."""
     jj = np.ascontiguousarray(jj, dtype=np.intc)

@@ -81,18 +81,36 @@ The ring is linear within each parent cell, with limited slopes (``ring_slopes``
 default; off: constant per parent cell).
 """
 
-from typing import List, Optional, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
+import numpy.typing as npt
 from mpi4py import MPI
 
 from ..constants import CENTERS, CellType
 from ..simulation import Coupler
 from .endpoint import Endpoint
-from .plan import Tag
+from .plan import Plan, Tag
 from .runtime import NestingRun, check_couplers, sync_order
 from . import vremap
 from .operators import minmod, subcell_offset
+
+if TYPE_CHECKING:
+    from ..core import Array
+    from ..simulation import BaseSimulation, Simulation
+    from .nested2d import PointTransfer
+
+Index = Tuple[np.ndarray, np.ndarray]
 
 # pyGETM's layers run from the bottom (0) to the surface (nz - 1); vremap's
 # columns from the surface down: the messages hold columns surface first.
@@ -104,7 +122,9 @@ from .operators import minmod, subcell_offset
 KEEP = 0.8
 
 
-def remap_amounts(F, h_src, h_dst, keep=0.0):
+def remap_amounts(
+    F: np.ndarray, h_src: np.ndarray, h_dst: np.ndarray, keep: float = 0.0
+) -> np.ndarray:
     """Amounts per layer (``F [..., ns]``, e.g. the tracer amount through a
     face) of a column with thicknesses ``h_src`` onto the layers ``h_dst``
     (surface first), the source column stretched to the target's depth below
@@ -127,7 +147,13 @@ def remap_amounts(F, h_src, h_dst, keep=0.0):
     return vremap.contents(zs, zd, c, h_src)
 
 
-def remap_conc_z(c, h_src, h_dst, w=None, scheme="ppm"):
+def remap_conc_z(
+    c: np.ndarray,
+    h_src: np.ndarray,
+    h_dst: np.ndarray,
+    w: Optional[np.ndarray] = None,
+    scheme: str = "ppm",
+) -> np.ndarray:
     """Concentrations ``c [nt, ..., m, ns]`` of source columns (thicknesses ``h_src
     [..., m, ns]``, surface first) onto target layers ``h_dst [..., nd]``, with every
     source interface kept at its depth below the surface: only the bottom source
@@ -152,7 +178,9 @@ def remap_conc_z(c, h_src, h_dst, w=None, scheme="ppm"):
         return np.where(V > 0.0, C / V, 0.0)
 
 
-def remap_column(c, h_src, h_dst, scheme="ppm"):
+def remap_column(
+    c: np.ndarray, h_src: np.ndarray, h_dst: np.ndarray, scheme: str = "ppm"
+) -> np.ndarray:
     """Concentrations ``c [nt, n, ns]`` of columns with thicknesses ``h_src`` onto
     the layers ``h_dst [n, nd]`` (surface first), every source interface kept at
     its depth below the surface (:func:`remap_conc_z`), compiled when available."""
@@ -174,7 +202,9 @@ def remap_column(c, h_src, h_dst, scheme="ppm"):
     return out
 
 
-def macro_ratios(levels) -> dict:
+def macro_ratios(
+    levels: Mapping[str, Tuple[Optional[str], float, int, int]],
+) -> Dict[str, int]:
     """Macro steps of every child per macro step of its parent. ``levels``: name ->
     (parent name or None, macro time step, split factor, time ratio). A child's macro
     step must be its parent's divided by a whole number."""
@@ -215,13 +245,14 @@ class Nested3D(Coupler):
     def __init__(
         self,
         nest: NestingRun,
-        sim,
+        sim: "Simulation",
         tracers: Optional[Sequence] = None,
         remap_scheme: str = "ppm",
         ring_slopes: bool = True,
         ring_time: str = "hold",
     ):
         self.nest, self.sim = nest, sim
+        self.logger = sim.logger.getChild("nesting")
         #: this process's end of the level's interfaces (shared with Nested2D)
         self.ep = ep = Endpoint(nest)
         self.lev, self.t, self.til = ep.lev, ep.t, ep.til
@@ -317,26 +348,25 @@ class Nested3D(Coupler):
 
     # --- helpers -----------------------------------------------------------
 
-    def _timed(self, name):
+    def _timed(self, name: str) -> None:
         f = getattr(self, name)
 
-        def wrapper(*a, **kw):
+        def wrapper(*a: Any, **kw: Any) -> Any:
             t0, w0 = MPI.Wtime(), self.t_wait
             try:
                 return f(*a, **kw)
             finally:
                 p = self.parts.setdefault(name, [0.0, 0.0])
                 p[0] += MPI.Wtime() - t0
-                p[1] += (
-                    self.t_wait - w0
-                )  # of which waiting for the partner (MPI receives)
+                # of which waiting for the partner (MPI receives)
+                p[1] += self.t_wait - w0
 
         setattr(self, name, wrapper)
 
-    def loc(self, j, i):
+    def loc(self, j: npt.ArrayLike, i: npt.ArrayLike) -> Index:
         return self.ep.loc(j, i)
 
-    def _tracers(self, sim):
+    def _tracers(self, sim: "Simulation") -> List["Array"]:
         if self._tracer_spec is None:
             names = [n for n in ("temp", "salt") if getattr(sim, n, None) is not None]
             fabm = getattr(sim, "fabm", None)
@@ -355,14 +385,20 @@ class Nested3D(Coupler):
             and self.sim.istep % (self.sim.split_factor * self.ratio_3d) == 0
         )
 
-    def _recv(self, comm, buf, source, tag):
+    def _recv(self, comm: MPI.Comm, buf: np.ndarray, source: int, tag: int) -> None:
         t0 = MPI.Wtime()
         comm.Recv(buf, source=source, tag=tag)
         self.t_wait += MPI.Wtime() - t0
 
     # --- child side ------------------------------------------------------------
 
-    def _face_profiles(self, arrays, is_x, j, i):
+    def _face_profiles(
+        self,
+        arrays: Tuple["Array", "Array"],
+        is_x: np.ndarray,
+        j: np.ndarray,
+        i: np.ndarray,
+    ) -> np.ndarray:
         """(n, nz) profiles, surface first, of a U array and a V array at faces
         (j, i)."""
         jj, ii = self.loc(j, i)
@@ -371,7 +407,7 @@ class Nested3D(Coupler):
         out[~is_x] = arrays[1].all_values[::-1, jj[~is_x], ii[~is_x]].T
         return out
 
-    def _own_edge_fluxes(self):
+    def _own_edge_fluxes(self) -> None:
         e = self.lev.edge
         keep = self._own_edge & self.lev.computed[e["inner"]]
         if keep.any():
@@ -380,7 +416,9 @@ class Nested3D(Coupler):
                 self.reg[n, keep] += self._face_profiles(fl, *args)
             self.reg[-1, keep] += self._volume_profiles(*args)
 
-    def _volume_profiles(self, is_x, j, i):
+    def _volume_profiles(
+        self, is_x: np.ndarray, j: np.ndarray, i: np.ndarray
+    ) -> np.ndarray:
         """Water through faces (j, i) over the 3D step per layer, surface first
         (layer transports pk, qk at the half step, as the tracer advection)."""
         m = self.sim.momentum
@@ -435,7 +473,7 @@ class Nested3D(Coupler):
             reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=Tag.RIM_3D))
         return reqs
 
-    def _recv_ring(self):
+    def _recv_ring(self) -> None:
         """Ring: the parent columns for this tile's ring cells, remapped onto the
         child's layers there; with ``ring_slopes`` limited linear in each parent cell,
         with ``ring_time="extrapolate"`` its range kept for the steps until the next
@@ -487,7 +525,9 @@ class Nested3D(Coupler):
             parts.append(buf)
         return np.concatenate(parts, axis=2)
 
-    def _adjacent_child_columns(self, ok):
+    def _adjacent_child_columns(
+        self, ok: np.ndarray
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """The child's own column next to each ring cell (one cell inwards): its
         vertical detail for the ring and the reference for the slopes. Returns (where
         there is one, its layer thicknesses, its tracers).
@@ -503,7 +543,18 @@ class Nested3D(Coupler):
             m &= np.isfinite(hin).all(axis=1) & (hin.sum(axis=1) > 0.0)
         return m, hin, cin
 
-    def _ring_anomaly_slopes(self, buf, ok, c, hs, cs, hd, m, hin, cin):
+    def _ring_anomaly_slopes(
+        self,
+        buf: np.ndarray,
+        ok: np.ndarray,
+        c: np.ndarray,
+        hs: np.ndarray,
+        cs: np.ndarray,
+        hd: np.ndarray,
+        m: np.ndarray,
+        hin: Optional[np.ndarray],
+        cin: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """``ring_slopes`` (held ring): minmod slopes per layer of the anomalies, taken
         on each parent column's own layers: the parent column (the ring cell's and its
         W, E, S, N neighbours) minus the child's adjacent column remapped onto those
@@ -569,7 +620,20 @@ class Nested3D(Coupler):
             )
         return c, back
 
-    def _ring_range(self, buf, ok, c, hs, cs, hd, m, hin, cin):
+    def _ring_range(
+        self,
+        buf: np.ndarray,
+        ok: np.ndarray,
+        c: np.ndarray,
+        hs: np.ndarray,
+        cs: np.ndarray,
+        hd: np.ndarray,
+        m: np.ndarray,
+        hin: Optional[np.ndarray],
+        cin: Optional[np.ndarray],
+    ) -> Tuple[
+        np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]
+    ]:
         """With extrapolation (and slopes): the neighbours on the ring cell's layers
         (land: the cell itself), all four in one remap, and the range of the five
         columns; with ``ring_slopes`` minmod slopes of the anomalies within that range.
@@ -666,7 +730,16 @@ class Nested3D(Coupler):
             )
         return c, lo, hi, back
 
-    def _child_detail(self, c, hs, hd, m, hin, cin, back):
+    def _child_detail(
+        self,
+        c: np.ndarray,
+        hs: np.ndarray,
+        hd: np.ndarray,
+        m: np.ndarray,
+        hin: Optional[np.ndarray],
+        cin: Optional[np.ndarray],
+        back: Optional[np.ndarray],
+    ) -> np.ndarray:
         """The child's vertical detail: the ring plus the child's adjacent column minus
         that column as the ring sees it (through the parent's layers), limited layer by
         layer to the range of the parent's value and the child's adjacent one, so that
@@ -687,7 +760,9 @@ class Nested3D(Coupler):
 
     # --- the ring in time (ring_time "extrapolate") ---------------------------------
 
-    def _store_ring(self, ok, c, lo, hi):
+    def _store_ring(
+        self, ok: np.ndarray, c: np.ndarray, lo: np.ndarray, hi: np.ndarray
+    ) -> None:
         """Keep the ring of this sync (all ring cells, NaN where not set) and move
         the previous one back; the previous one is also written to the restart arrays.
         """
@@ -700,14 +775,14 @@ class Nested3D(Coupler):
         self._rc = (new, prev, lo_, hi_)
         self._prev_to_restart()
 
-    def _state_arrays(self):
+    def _state_arrays(self) -> None:
         """The coupler's part of the model state (restart files): the previous 3D ring
         (:meth:`_restart_ring_arrays`) and the deferred flux corrections
         (:meth:`_deferred_arrays`)."""
         self._restart_ring_arrays()
         self._deferred_arrays()
 
-    def _restart_ring_arrays(self):
+    def _restart_ring_arrays(self) -> None:
         """Arrays (part of the model state) with the previous ring, per tracer, at the
         ring cells, and where it is set."""
         self._rs3 = None
@@ -735,7 +810,7 @@ class Nested3D(Coupler):
             attrs=dict(attrs),
         )
 
-    def _deferred_arrays(self):
+    def _deferred_arrays(self) -> None:
         """Arrays (part of the model state) with the amounts of the flux correction
         deferred by the limiter, per tracer (levels with children)."""
         self._deferred = None
@@ -776,7 +851,7 @@ class Nested3D(Coupler):
             ]
         )
 
-    def _apply_corrections(self):
+    def _apply_corrections(self) -> None:
         """The limited flux correction of this sync (see the constructor)."""
         if self._deferred is None:
             return
@@ -856,7 +931,7 @@ class Nested3D(Coupler):
                     self.max_deferred, float(np.abs(rest[d] / vol[d]).max())
                 )
 
-    def _prev_to_restart(self):
+    def _prev_to_restart(self) -> None:
         if self._rs3 is None or not self._rj.size:
             return
         prev = self._rc[1]
@@ -867,7 +942,7 @@ class Nested3D(Coupler):
             )
         self._rs3_set.all_values[self._rj, self._ri] = set_.astype(float)
 
-    def _prev_from_restart(self):
+    def _prev_from_restart(self) -> Optional[np.ndarray]:
         """The previous ring from the restart arrays (as they were before the initial
         sync)."""
         if self._rs3 is None or not self._rj.size:
@@ -881,7 +956,7 @@ class Nested3D(Coupler):
         prev[:, ~set_] = np.nan
         return prev
 
-    def _extrapolate_ring(self, sim):
+    def _extrapolate_ring(self, sim: "Simulation") -> None:
         """At the child's m-th macro step after a sync: the ring continued in time."""
         R = self.ratio_3d
         m = (
@@ -920,7 +995,7 @@ class Nested3D(Coupler):
 
     # --- parent side -------------------------------------------------------------
 
-    def _send_down(self, plan) -> List[MPI.Request]:
+    def _send_down(self, plan: Plan) -> List[MPI.Request]:
         reqs = []
         h = self.sim.T.hn.all_values
         for (p, tt), (pj, pi, *_rest) in plan.pro.items():
@@ -949,7 +1024,7 @@ class Nested3D(Coupler):
             reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=Tag.RING_3D))
         return reqs
 
-    def _recv_rim(self, plan, nzc: int):
+    def _recv_rim(self, plan: Plan, nzc: int) -> None:
         mine = plan.rim_of[self.t]
         if not len(mine):
             return
@@ -987,7 +1062,7 @@ class Nested3D(Coupler):
         for f, cf in zip(self.tracers, c):
             vremap.scatter_columns(f.all_values, jo, io, cf)
 
-    def _match_fluxes(self, plan, nzc: int):
+    def _match_fluxes(self, plan: Plan, nzc: int) -> None:
         flist = plan.faces_of[self.t]
         if not flist.size:
             return
@@ -1054,7 +1129,7 @@ class Nested3D(Coupler):
 
     # --- 3D transports at the interface (momentum_3d stage) ------------------------
 
-    def _add_water_up(self):
+    def _add_water_up(self) -> None:
         """Add this macro step's water through the edge faces (every macro step)."""
         e = self.lev.edge
         for key, fk in self.up.faces_from(self.t):
@@ -1082,7 +1157,7 @@ class Nested3D(Coupler):
             )
         return reqs
 
-    def _recv_transports(self, plan, nzc: int) -> bool:
+    def _recv_transports(self, plan: Plan, nzc: int) -> bool:
         flist = plan.faces_of[self.t]
         if not flist.size:
             return False
@@ -1135,7 +1210,7 @@ class Nested3D(Coupler):
 
     # --- 3D transports in the child's ring (parent -> child) ------------------------
 
-    def _ring_transfers(self, plan):
+    def _ring_transfers(self, plan: Plan) -> Dict[str, "PointTransfer"]:
         from .nested2d import PointTransfer, ring_faces
 
         out = {}
@@ -1154,7 +1229,9 @@ class Nested3D(Coupler):
             )
         return out
 
-    def _send_ring_uv(self, plan, tx) -> List[MPI.Request]:
+    def _send_ring_uv(
+        self, plan: Plan, tx: Dict[str, "PointTransfer"]
+    ) -> List[MPI.Request]:
         reqs = []
         mom = self.sim.momentum
         for axis, grid, tp in (("x", self.sim.U, mom.pk), ("y", self.sim.V, mom.qk)):
@@ -1170,7 +1247,7 @@ class Nested3D(Coupler):
                 reqs.append(plan.comm.Isend(buf, dest=plan.coff + t, tag=tx[axis].tag))
         return reqs
 
-    def _recv_ring_uv(self):
+    def _recv_ring_uv(self) -> None:
         nzp = self.parent_nz
         out = {}
         for axis in "xy":
@@ -1195,7 +1272,7 @@ class Nested3D(Coupler):
             out[axis] = (dj, di, hs, qs)
         self._ring_uv = out
 
-    def _set_ring_uv(self, sim):
+    def _set_ring_uv(self, sim: "Simulation") -> None:
         mom = sim.momentum
         kk = np.arange(self.nz)[::-1]
         for axis, grid, tp in (("x", sim.U, mom.pk), ("y", sim.V, mom.qk)):
@@ -1221,7 +1298,7 @@ class Nested3D(Coupler):
             )
             tp.all_values[kk[None, :], jj[ok][:, None], ii[ok][:, None]] = new
 
-    def _sync_transports(self, sim):
+    def _sync_transports(self, sim: "Simulation") -> None:
         t0 = MPI.Wtime()
         reqs = []
         if self.up is not None:
@@ -1245,7 +1322,7 @@ class Nested3D(Coupler):
 
     # --- sync --------------------------------------------------------------------
 
-    def _sync(self):
+    def _sync(self) -> None:
         """One sync point (:func:`~pygetm.nesting.runtime.sync_order`): up, the rim and
         the flux registers; from the children, their rims, flux matching and the limited
         corrections; down, the rings' tracers and 3D transports; from the parent, this
@@ -1255,7 +1332,7 @@ class Nested3D(Coupler):
         if self._fluxes_ready and self.up is not None:
             self._own_edge_fluxes()
 
-        def recv_children():
+        def recv_children() -> None:
             for plan, nzc in zip(self.down, self.child_nz):
                 self._recv_rim(plan, nzc)
                 if self._fluxes_ready:
@@ -1263,7 +1340,7 @@ class Nested3D(Coupler):
             if self.down and self._fluxes_ready:
                 self._apply_corrections()
 
-        def send_down():
+        def send_down() -> List[MPI.Request]:
             reqs = []
             if self.down:
                 for f in self.tracers:
@@ -1273,7 +1350,7 @@ class Nested3D(Coupler):
                     reqs += self._send_ring_uv(plan, tx)
             return reqs
 
-        def recv_parent():
+        def recv_parent() -> None:
             for (
                 f
             ) in (
@@ -1302,7 +1379,7 @@ class Nested3D(Coupler):
 
     # --- Coupler hooks -------------------------------------------------------------
 
-    def on_start(self, sim):
+    def on_start(self, sim: "Simulation") -> None:
         check_couplers(sim, self, self.nest.world, self.lev.name)
         T = sim.T
         self.wet = T.mask.all_values != 0
@@ -1397,7 +1474,7 @@ class Nested3D(Coupler):
         self.parts = {}  # the start-up sync does not count
         self.n_sync = 0
 
-    def on_stage(self, sim, stage, macro_active):
+    def on_stage(self, sim: "Simulation", stage: str, macro_active: bool) -> None:
         if stage == "momentum_3d_transports" and macro_active:
             self._sync_transports(sim)
         elif (
@@ -1423,6 +1500,16 @@ class Nested3D(Coupler):
                 float((f.all_values[:, h:-h, h:-h] * vol)[:, self.computed].sum())
                 for f in self.tracers
             ]
+        )
+
+    def on_finish(self, sim: "Simulation") -> None:
+        """Log this process's time in the 3D syncs and the flux-correction
+        diagnostics (:meth:`timing` has the full breakdown)."""
+        self.logger.info(
+            f"{self.lev.name}: {self.t_sync:.1f} s in {self.n_sync} 3D syncs"
+            f" ({self.t_wait:.1f} s waiting for partners); largest tracer correction"
+            f" {self.max_correction:.3g}, largest deferred {self.max_deferred:.3g},"
+            f" {self.n_clipped} clipped"
         )
 
     def timing(self) -> dict:

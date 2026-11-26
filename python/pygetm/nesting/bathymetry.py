@@ -1,15 +1,16 @@
 """A level's depth from a bathymetry file on the layout's grid (one reader for every way
 a nested model is set up: pygetm-config's generated scripts, pygetm-nesting's tools)."""
 
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 
 from .geometry import Level
+import os
 
 
 def read_level_depth(
-    path,
+    path: Union[str, os.PathLike],
     lev: Level,
     depth_variable: str,
     lon_variable: str,

@@ -7,7 +7,18 @@ shares the tilings of all levels and builds the exchange plans
 (:class:`pygetm.nesting.plan.Plan`).
 """
 
-from typing import Callable, Dict, List, Mapping, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 
 import numpy as np
 from mpi4py import MPI
@@ -17,8 +28,14 @@ from .hierarchy import NestingContext, split_world
 from .plan import LevelTiling, Plan, gather_tilings
 from . import masks
 
+if TYPE_CHECKING:
+    from ..core import Grid
+    from ..domain import Domain
+    from ..rivers import GlobalRiver
+    from ..simulation import BaseSimulation, Coupler
 
-def install_abort_hook(comm: MPI.Comm, label: str):
+
+def install_abort_hook(comm: MPI.Comm, label: str) -> None:
     """Make an unhandled exception on any process abort the whole run.
 
     The levels of a nesting run wait for each other in MPI: if one level
@@ -40,7 +57,7 @@ def install_abort_hook(comm: MPI.Comm, label: str):
     previous = sys.excepthook
     previous_exit = sys.exit
 
-    def exit_(status=None):
+    def exit_(status: Any = None) -> None:
         if status not in (None, 0):
             if not isinstance(status, int):
                 sys.stderr.write(f"{status}\n")
@@ -53,7 +70,7 @@ def install_abort_hook(comm: MPI.Comm, label: str):
             comm.Abort(status if isinstance(status, int) else 1)
         previous_exit(status)
 
-    def hook(etype, value, tb):
+    def hook(etype: type, value: BaseException, tb: Any) -> None:
         traceback.print_exception(etype, value, tb)
         sys.stderr.write(
             f"[nesting: {label}, rank {comm.rank}] unhandled exception - aborting all "
@@ -71,7 +88,9 @@ def install_abort_hook(comm: MPI.Comm, label: str):
     sys.exit = exit_
 
 
-def check_couplers(sim, coupler, world: MPI.Comm, level: str) -> None:
+def check_couplers(
+    sim: "BaseSimulation", coupler: "Coupler", world: MPI.Comm, level: str
+) -> None:
     """Collective, from the ``on_start`` of every nesting coupler, done by the first one
     of the simulation: every level must run the same nesting couplers in the same order
     and the same run type, else their start-up collectives would not match (a hang).
@@ -161,7 +180,7 @@ class NestingRun:
         self.up: Optional[Plan] = None
         self.down: List[Plan] = []
 
-    def build(self, make_domain: Callable, nz: int = 1, **grid_kwargs):
+    def build(self, make_domain: Callable, nz: int = 1, **grid_kwargs) -> "Grid":
         """Build this level's grids. ``make_domain(level, comm)`` returns the
         pyGETM domain of the level including its band (window extended by
         ``level.band`` cells on every side). Returns the T grid (pyGETM's tiling
@@ -182,7 +201,9 @@ class NestingRun:
             )
         return self._setup(grid)
 
-    def build_simulation(self, make_domain: Callable, make_simulation: Callable):
+    def build_simulation(
+        self, make_domain: Callable, make_simulation: Callable
+    ) -> "BaseSimulation":
         """Build this level's :class:`pygetm.Simulation`. ``make_domain(level,
         comm)`` returns the level's domain including its band;
         ``make_simulation(level, domain)`` the simulation (its halo must equal
@@ -207,7 +228,7 @@ class NestingRun:
         self._setup(sim.T)
         return sim
 
-    def _assign_rivers(self, domain):
+    def _assign_rivers(self, domain: "Domain") -> None:
         """Collective. A river belongs to the finest level whose computed region holds
         it (land in a level's active region is that level's; a curvilinear child beyond
         its conforming band lies over its parent's land: the child wins); every level
@@ -246,7 +267,7 @@ class NestingRun:
                 domain.rivers.remove(r.name)
         self.river_owners = owner
 
-    def attach_sluice(self, sluice, sim):
+    def attach_sluice(self, sluice: Any, sim: "BaseSimulation") -> Any:
         """Attach a :class:`pygetm.sluice.Sluice` to this level's simulation. Collective
         over all processes of all levels: create the sluice on every level (as the
         rivers) and call this on every level, after the nesting couplers. Each end is a
@@ -271,7 +292,7 @@ class NestingRun:
             sim, comm=comm, every=self.level.steps_per_root // gcd(*spr)
         )
 
-    def _tiling_hint(self):
+    def _tiling_hint(self) -> ContextManager[None]:
         """Context: a failing subdomain division names the level and its
         number of processes (then abort_on_error stops all levels)."""
         import contextlib
@@ -279,7 +300,7 @@ class NestingRun:
         run = self
 
         @contextlib.contextmanager
-        def ctx():
+        def ctx() -> Iterator[None]:
             try:
                 yield
             except Exception as e:
@@ -295,7 +316,7 @@ class NestingRun:
 
         return ctx()
 
-    def _setup(self, grid):
+    def _setup(self, grid: "Grid") -> "Grid":
         lev = self.level
         self.grid = grid
         self.tilings = gather_tilings(
@@ -308,7 +329,7 @@ class NestingRun:
         self._interface_comms()
         return self.grid
 
-    def _interface_comms(self):
+    def _interface_comms(self) -> None:
         """Give every plan of this process the communicator of its interface
         (``plan.comm``) and the ranks of the parent's and the child's tile 0
         in it (``plan.poff``, ``plan.coff``). Interfaces are created in the
@@ -351,7 +372,7 @@ class NestingRun:
             lines += p.describe(me, "parent", t)
         return lines
 
-    def print_plan(self):
+    def print_plan(self) -> None:
         """Print the messages of all processes in rank order (collective)."""
         lines = self.describe()
         for rank in range(self.world.size):
@@ -359,7 +380,7 @@ class NestingRun:
                 print("\n".join(lines), flush=True)
             self.world.Barrier()
 
-    def global_indices(self):
+    def global_indices(self) -> Tuple[np.ndarray, np.ndarray]:
         """Global (j, i) of every row/column of this process's local arrays."""
         T, lev = self.grid, self.level
         y0, x0 = self.tilings[lev.name].origin(self.tile)
@@ -367,7 +388,7 @@ class NestingRun:
         return np.arange(T.ny_) - h + y0, np.arange(T.nx_) - h + x0
 
 
-def _river_in(domain, river, computed: np.ndarray) -> bool:
+def _river_in(domain: "Domain", river: "GlobalRiver", computed: np.ndarray) -> bool:
     """Whether a river lies in a computed cell of this level's domain (root process).
     By index: that cell; by location: the cell whose centre is nearest, if the point
     lies within it (half a cell, with a margin)."""

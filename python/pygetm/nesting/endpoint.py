@@ -4,15 +4,35 @@ the tile, its tiling, the plans with the parent and the children, local indices,
 the ring this tile receives, its edge faces, and the receive of the children's
 sub-face messages."""
 
-from typing import Callable, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import numpy as np
+import numpy.typing as npt
 
 from .plan import Plan, Tag
 
+if TYPE_CHECKING:
+    from .runtime import NestingRun
+
 
 class Endpoint:
-    def __init__(self, nest):
+
+    __slots__ = (
+        "down",
+        "lev",
+        "nest",
+        "own_edge",
+        "ri",
+        "ring",
+        "ring_cells",
+        "rj",
+        "t",
+        "til",
+        "up",
+        "world",
+    )
+
+    def __init__(self, nest: "NestingRun"):
         self.nest = nest
         self.lev = nest.level
         self.t = nest.tile
@@ -33,7 +53,7 @@ class Endpoint:
             self.ring_cells = self.up.ring_cells(self.t)
             self.rj, self.ri = self.loc(self.ring_cells["bj"], self.ring_cells["bi"])
 
-    def loc(self, j, i):
+    def loc(self, j: npt.ArrayLike, i: npt.ArrayLike) -> Tuple[np.ndarray, np.ndarray]:
         """Local (with halos) indices of global cells of this level on this tile."""
         return self.til.local(self.t, j, i)
 

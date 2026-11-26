@@ -33,16 +33,19 @@ largest fall of the water level below the datum (tidal amplitude plus
 set-down by wind) plus a margin above pyGETM's Dcrit.
 """
 
-from typing import Dict, Iterable
+from typing import TYPE_CHECKING, Dict, Iterable, Tuple
 
 import numpy as np
 
 from .geometry import Level
 
+if TYPE_CHECKING:
+    from ..domain import Domain
+
 
 def make_consistent(
     levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict[str, np.ndarray]
-):
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Dict[str, int]]]:
     """Child-led consistency of wet masks and depths (levels parents first).
     Returns new (wet, H) and, per level, the number of cells changed."""
     levels = list(levels)
@@ -143,7 +146,7 @@ def closed_faces(lev: Level, wet: Dict[str, np.ndarray]) -> Dict[str, np.ndarray
     )
 
 
-def close_faces(lev: Level, domain) -> None:
+def close_faces(lev: Level, domain: "Domain") -> None:
     """Close :attr:`Level.closed_faces` in ``domain`` (the level's domain
     including its band; its supergrid mask, before the grids are built)."""
     cf = getattr(lev, "closed_faces", None)
@@ -160,7 +163,7 @@ def close_faces(lev: Level, domain) -> None:
     domain.mask[2 * fj[~x] + 2, 2 * fi[~x] + 1] = 0
 
 
-def check_dams(lev: Level, domain) -> None:
+def check_dams(lev: Level, domain: "Domain") -> None:
     """Dams (:mod:`pygetm.dams`: faces closed between two wet cells) must stay off the
     level's interface: a closed face between a computed and a coupled cell raises (the
     parent's and the child's fluxes there would differ). Faces between two coupled cells
@@ -195,7 +198,9 @@ def check_dams(lev: Level, domain) -> None:
     xm[(xm == 0) & t4 & e4] = 1
 
 
-def check_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray]):
+def check_consistent(
+    levels: Iterable[Level], wet: Dict[str, np.ndarray]
+) -> Dict[str, Dict[str, int]]:
     """Violations of the two rules per child level (all zero if consistent)."""
     out = {}
     for lev in levels:
