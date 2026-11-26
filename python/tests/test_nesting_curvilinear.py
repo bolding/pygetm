@@ -12,7 +12,9 @@ from pygetm.nesting.geometry import load_levels
 from pygetm.nesting import masks
 
 R, BAND = 2, 2
-WINDOW = dict(istart=8, istop=10, jstart=5, jstop=15)  # 2 x 10 parent cells: a strait north from j = 5
+WINDOW = dict(
+    istart=8, istop=10, jstart=5, jstop=15
+)  # 2 x 10 parent cells: a strait north from j = 5
 
 
 def layout(grid):
@@ -24,18 +26,23 @@ def layout(grid):
 
 def child_grid(path, bend_from):
     """The refined parent grid, bent sideways from child row ``bend_from`` on."""
-    nx, ny = (WINDOW["istop"] - WINDOW["istart"]) * R, (WINDOW["jstop"] - WINDOW["jstart"]) * R
+    nx, ny = (WINDOW["istop"] - WINDOW["istart"]) * R, (
+        WINDOW["jstop"] - WINDOW["jstart"]
+    ) * R
     ii = np.arange(2 * (nx + 2 * BAND) + 1) / 2.0 - BAND
     jj = np.arange(2 * (ny + 2 * BAND) + 1) / 2.0 - BAND
     I, J = np.meshgrid(ii, jj)
     x = WINDOW["istart"] + I / R
     y = WINDOW["jstart"] + J / R
-    x = x + 0.02 * np.clip(J - bend_from, 0.0, None) ** 2 / R  # a bend (staying over the root's land)
+    x = (
+        x + 0.02 * np.clip(J - bend_from, 0.0, None) ** 2 / R
+    )  # a bend (staying over the root's land)
     np.savez(path, x=x, y=y)
 
 
 def wet_masks(levels):
-    """The root is land around the child's window except south of it; the child is water."""
+    """The root is land around the child's window except south of it; the child is
+    water."""
     wets = {}
     for lev in levels:
         w = np.ones(lev.extended_shape, dtype=bool)
@@ -98,11 +105,15 @@ class TestOverhang(unittest.TestCase):
     """A child larger than its window (overhang): the window holds the mouth at the
     root's north edge, the rest of the child runs out of the root."""
 
-    WIN = dict(istart=8, istop=10, jstart=17, jstop=20)  # 3 rows up to the root's edge (ny = 20)
+    WIN = dict(
+        istart=8, istop=10, jstart=17, jstop=20
+    )  # 3 rows up to the root's edge (ny = 20)
     OVER = 10  # child rows beyond the window, to the north
 
     def build(self):
-        nx, nyw = (self.WIN["istop"] - self.WIN["istart"]) * R, (self.WIN["jstop"] - self.WIN["jstart"]) * R
+        nx, nyw = (self.WIN["istop"] - self.WIN["istart"]) * R, (
+            self.WIN["jstop"] - self.WIN["jstart"]
+        ) * R
         ny_dom, nx_dom = nyw + self.OVER + 2 * BAND, nx + 2 * BAND
         ii = np.arange(2 * nx_dom + 1) / 2.0 - BAND
         jj = np.arange(2 * ny_dom + 1) / 2.0 - BAND
@@ -112,13 +123,24 @@ class TestOverhang(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         path = os.path.join(tmp, "child.npz")
         np.savez(path, x=x, y=y)
-        cfg = {"root": dict(nx=20, ny=20, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
-               "child": dict(parent="root", ratio=R, time_ratio=R, grid=path, overhang=[0, 0, 0, self.OVER], **self.WIN)}
+        cfg = {
+            "root": dict(nx=20, ny=20, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
+            "child": dict(
+                parent="root",
+                ratio=R,
+                time_ratio=R,
+                grid=path,
+                overhang=[0, 0, 0, self.OVER],
+                **self.WIN
+            ),
+        }
         levels = load_levels(cfg, halo=BAND, root_band=0, active=False)
         child = next(l for l in levels if l.name == "child")
         root = next(l for l in levels if l.name == "root")
         wr = np.ones(root.extended_shape, bool)
-        wr[17:, :] = False  # a coast along the root's north edge (the window cuts through it)
+        wr[17:, :] = (
+            False  # a coast along the root's north edge (the window cuts through it)
+        )
         wc_dom = np.zeros(child.domain_shape, bool)
         wc_dom[BAND:-BAND, BAND:-BAND] = True  # the child's own cells
         wc_dom[:BAND, :] = True  # its ring at the mouth
@@ -126,14 +148,18 @@ class TestOverhang(unittest.TestCase):
 
     def test_overhang_geometry(self):
         cfg, child, w, wc_dom = self.build()
-        self.assertEqual(child.domain_shape, (child.ny + 2 * BAND + self.OVER, child.nx + 2 * BAND))
+        self.assertEqual(
+            child.domain_shape, (child.ny + 2 * BAND + self.OVER, child.nx + 2 * BAND)
+        )
         self.assertNotIn("N", child.outer_sides)  # the side continues as overhang
         ext = child.coupled()
         self.assertEqual(ext.shape, child.domain_shape)
-        self.assertFalse(ext[BAND + child.ny:].any())  # overhang (and the view's band there) computed
+        self.assertFalse(
+            ext[BAND + child.ny :].any()
+        )  # overhang (and the view's band there) computed
         self.assertTrue(ext[:BAND].all())  # the ring at the mouth
         ring = child._ring_mask()
-        self.assertFalse(ring[BAND + child.ny:].any())
+        self.assertFalse(ring[BAND + child.ny :].any())
         # no water counted twice: the overhang lies outside the root, allowed
         wets = dict(w, child=child.to_view(wc_dom))
         masks.check_overhang(child, wc_dom, wets)
@@ -148,4 +174,6 @@ class TestOverhang(unittest.TestCase):
         wr2 = np.ones(next(l for l in levels if l.name == "root").extended_shape, bool)
         wr2[17:20, :] = False
         with self.assertRaisesRegex(ValueError, "overhang"):
-            masks.check_overhang(child2, wc_dom, {"root": wr2, "child": child2.to_view(wc_dom)})
+            masks.check_overhang(
+                child2, wc_dom, {"root": wr2, "child": child2.to_view(wc_dom)}
+            )

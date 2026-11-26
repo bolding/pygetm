@@ -19,9 +19,10 @@ The work is split so that it can be shared between scalars:
 - :func:`apply` (per scalar): cumulative content at the source interfaces,
   gathered and interpolated at the prepared positions, differenced.
 
-:func:`stretch` maps a column's interfaces onto another depth (Nested3D's remaps of amounts),
-:func:`contents` and :func:`gather_columns` / :func:`scatter_columns` are the compiled kernels Nested3D
-uses; :func:`remap` (``prepare`` + ``apply``) is their numpy reference (tests).
+:func:`stretch` maps a column's interfaces onto another depth (Nested3D's remaps of
+amounts), :func:`contents` and :func:`gather_columns` / :func:`scatter_columns` are the
+compiled kernels Nested3D uses; :func:`remap` (``prepare`` + ``apply``) is their numpy
+reference (tests).
 """
 
 import numpy as np
@@ -98,9 +99,21 @@ def ppm_edges(c, h):
         hm, h0, hp = h[..., :-2], h[..., 1:-1], h[..., 2:]
         cm, c0, cp = c[..., :-2], c[..., 1:-1], c[..., 2:]
         # slopes of the inner layers (1.7), monotonised (1.8)
-        da = h0 / (hm + h0 + hp) * ((2 * hm + h0) / (hp + h0) * (cp - c0) + (h0 + 2 * hp) / (hm + h0) * (c0 - cm))
+        da = (
+            h0
+            / (hm + h0 + hp)
+            * (
+                (2 * hm + h0) / (hp + h0) * (cp - c0)
+                + (h0 + 2 * hp) / (hm + h0) * (c0 - cm)
+            )
+        )
         ok = (cp - c0) * (c0 - cm) > 0.0
-        dm = np.where(ok, np.sign(da) * np.minimum(np.abs(da), 2 * np.minimum(np.abs(c0 - cm), np.abs(cp - c0))), 0.0)
+        dm = np.where(
+            ok,
+            np.sign(da)
+            * np.minimum(np.abs(da), 2 * np.minimum(np.abs(c0 - cm), np.abs(cp - c0))),
+            0.0,
+        )
         dm = np.where(np.isfinite(dm), dm, 0.0)
         d = np.zeros_like(c)
         d[..., 1:-1] = dm
@@ -110,20 +123,30 @@ def ppm_edges(c, h):
         dj, dj1 = d[..., 1:-2], d[..., 2:-1]
         z1 = (hj_1 + hj) / (2 * hj + hj1)
         z2 = (hj2 + hj1) / (2 * hj1 + hj)
-        e = (cj + hj / (hj + hj1) * (cj1 - cj)
-             + 1.0 / (hj_1 + hj + hj1 + hj2) * (2 * hj1 * hj / (hj + hj1) * (z1 - z2) * (cj1 - cj)
-                                                 - hj * z1 * dj1 + hj1 * z2 * dj))
+        e = (
+            cj
+            + hj / (hj + hj1) * (cj1 - cj)
+            + 1.0
+            / (hj_1 + hj + hj1 + hj2)
+            * (
+                2 * hj1 * hj / (hj + hj1) * (z1 - z2) * (cj1 - cj)
+                - hj * z1 * dj1
+                + hj1 * z2 * dj
+            )
+        )
         good = np.isfinite(e) & (hj_1 > 0) & (hj > 0) & (hj1 > 0) & (hj2 > 0)
         e = np.where(good, e, 0.5 * (cj + cj1))
+
         # the edges next to the outermost layers: linear between the two layer means
         def lin(ca, cb, ha, hb):
             v = ca + ha / (ha + hb) * (cb - ca)
             return np.where((ha > 0) & (hb > 0) & np.isfinite(v), v, 0.5 * (ca + cb))
+
         e0 = lin(c[..., 0], c[..., 1], h[..., 0], h[..., 1])
         en = lin(c[..., -2], c[..., -1], h[..., -2], h[..., -1])
     # layers 1 .. n-2 get both edges; the outermost two stay constant
-    aR[..., 2:-2] = e[..., 1:]       # lower edge of layer j = edge j+1/2
-    aL[..., 2:-2] = e[..., :-1]      # upper edge of layer j = edge j-1/2
+    aR[..., 2:-2] = e[..., 1:]  # lower edge of layer j = edge j+1/2
+    aL[..., 2:-2] = e[..., :-1]  # upper edge of layer j = edge j-1/2
     aL[..., 1] = e0
     aR[..., 1] = e[..., 0]
     aL[..., -2] = e[..., -1]
@@ -163,10 +186,12 @@ def apply(prep, c_src, h_src, scheme="pcm"):
         a6 = 6.0 * (c_src - 0.5 * (aL + aR))
         hh = np.broadcast_to(h_src, q.shape)
         g = lambda x: np.take_along_axis(x, jj, axis=-1)
-        part = g(aL) * ff + g(dA) * ff ** 2 / 2 + g(a6) * (ff ** 2 / 2 - ff ** 3 / 3)
+        part = g(aL) * ff + g(dA) * ff**2 / 2 + g(a6) * (ff**2 / 2 - ff**3 / 3)
         Qz = np.take_along_axis(Q, jj, axis=-1) + g(hh) * part
     elif scheme == "pcm":
-        Qz = np.take_along_axis(Q, jj, axis=-1) + ff * np.take_along_axis(q, jj, axis=-1)
+        Qz = np.take_along_axis(Q, jj, axis=-1) + ff * np.take_along_axis(
+            q, jj, axis=-1
+        )
     else:
         raise ValueError(f"unknown remap scheme {scheme!r}")
     # the outer interfaces exactly: no content lost to round-off at the bottom
@@ -182,17 +207,21 @@ def remap(h_src, c_src, h_dst, scheme="pcm"):
         return apply(prep, c_src, h_src, scheme) / h_dst
 
 
-# --- the rim (child -> parent) --------------------------------------------------------------
+# --- the rim (child -> parent)
+# --------------------------------------------------------------
 #
-# Child columns of one parent cell are along axis -2 (r*r, land columns weight 0):
-#   h_c [..., m, nzc], c_c [(tracers,) ..., m, nzc], a_c [..., m]; parent layers h_p [..., nzp].
+# Child columns of one parent cell are along axis -2 (r*r, land columns weight 0): h_c
+# [..., m, nzc], c_c [(tracers,) ..., m, nzc], a_c [..., m]; parent layers h_p [...,
+# nzp].
 
 
 def contents(zs, zd, c, h, scheme="pcm"):
-    """Contents of the target layers (per unit area) for source interfaces ``zs [..., ns+1]`` and
-    target interfaces ``zd [..., nd+1]`` (depths below the surface), concentrations ``c [(tracers,)
-    ..., ns]`` and source thicknesses ``h [..., ns]``: the same as ``apply(prepare(zs, zd), c, h,
-    scheme)``, with the compiled kernel (``_pygetm.vertical_remap``) when it is available."""
+    """Contents of the target layers (per unit area) for source interfaces ``zs [...,
+    ns+1]`` and target interfaces ``zd [..., nd+1]`` (depths below the surface),
+    concentrations ``c [(tracers,) ..., ns]`` and source thicknesses ``h [..., ns]``:
+    the same as ``apply(prepare(zs, zd), c, h, scheme)``, with the compiled kernel
+    (``_pygetm.vertical_remap``) when it is available.
+    """
     kernel = _kernel("vertical_remap")
     zs = np.asarray(zs, dtype=float)
     zd = np.asarray(zd, dtype=float)
@@ -208,16 +237,19 @@ def contents(zs, zd, c, h, scheme="pcm"):
     zs2 = np.ascontiguousarray(np.broadcast_to(zs, lead + (ns + 1,)).reshape(n, ns + 1))
     zd2 = np.ascontiguousarray(np.broadcast_to(zd, lead + (nd + 1,)).reshape(n, nd + 1))
     h2 = np.ascontiguousarray(np.broadcast_to(h, lead + (ns,)).reshape(n, ns))
-    c2 = np.ascontiguousarray(np.broadcast_to(c, extra + lead + (ns,)).reshape(nt, n, ns))
+    c2 = np.ascontiguousarray(
+        np.broadcast_to(c, extra + lead + (ns,)).reshape(nt, n, ns)
+    )
     out = np.empty((nt, n, nd))
     kernel(zs2, zd2, h2, c2, out, 1 if scheme == "ppm" else 0)
     return out.reshape(extra + lead + (nd,))
 
 
 def _kernel(name):
-    """A compiled routine of pyGETM, or None: then the numpy versions are used. Set the environment variable
-    PYGETM_NESTING_REMAP=numpy to use numpy anyway (a simpler, pure-Python path, e.g. for debugging or
-    for changes to the remap that are easier to try in numpy first)."""
+    """A compiled routine of pyGETM, or None: then the numpy versions are used. Set the
+    environment variable PYGETM_NESTING_REMAP=numpy to use numpy anyway (a simpler,
+    pure-Python path, e.g. for debugging or for changes to the remap that are easier to
+    try in numpy first)."""
     import os
 
     if os.environ.get("PYGETM_NESTING_REMAP", "").lower() == "numpy":
@@ -231,9 +263,9 @@ def _kernel(name):
 
 
 def gather_columns(arr, jj, ii, out=None):
-    """The columns of a pyGETM 3D array ``arr (nz, ny, nx)`` (layer 0 at the bottom) at the cells
-    (jj, ii), surface first, as one C-contiguous ``(n, nz)`` block: ``arr[::-1, jj, ii].T``, compiled
-    when available (no temporaries)."""
+    """The columns of a pyGETM 3D array ``arr (nz, ny, nx)`` (layer 0 at the bottom) at
+    the cells (jj, ii), surface first, as one C-contiguous ``(n, nz)`` block:
+    ``arr[::-1, jj, ii].T``, compiled when available (no temporaries)."""
     jj = np.ascontiguousarray(jj, dtype=np.intc)
     ii = np.ascontiguousarray(ii, dtype=np.intc)
     if out is None:
@@ -247,7 +279,8 @@ def gather_columns(arr, jj, ii, out=None):
 
 
 def scatter_columns(arr, jj, ii, vals):
-    """``arr[::-1, jj, ii] = vals.T`` for columns ``vals (n, nz)``, surface first, compiled when available."""
+    """``arr[::-1, jj, ii] = vals.T`` for columns ``vals (n, nz)``, surface first,
+    compiled when available."""
     jj = np.ascontiguousarray(jj, dtype=np.intc)
     ii = np.ascontiguousarray(ii, dtype=np.intc)
     vals = np.ascontiguousarray(vals, dtype=float)

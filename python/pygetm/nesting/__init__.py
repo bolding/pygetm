@@ -1,4 +1,5 @@
-"""Two-way, multi-level nesting of pyGETM domains (branch ``nesting-mpmd`` of the fork bolding/pygetm).
+"""Two-way, multi-level nesting of pyGETM domains (branch ``nesting-mpmd`` of the fork
+bolding/pygetm).
 
 Each domain of a nested setup runs as its own :class:`pygetm.Simulation` on its own
 group of MPI processes. Domains exchange information through

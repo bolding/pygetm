@@ -20,7 +20,9 @@ import numpy as np
 from .geometry import dilate
 
 
-def water_distance(source: np.ndarray, wet: np.ndarray, max_steps: int = 10_000) -> np.ndarray:
+def water_distance(
+    source: np.ndarray, wet: np.ndarray, max_steps: int = 10_000
+) -> np.ndarray:
     """Distance (in cells, 8-connected steps) from the ``source`` cells to
     every cell of ``wet``, moving through wet cells only. Unreachable cells
     get ``inf``; source cells 0."""
@@ -42,5 +44,7 @@ def sponge_weight(distance: np.ndarray, width: float) -> np.ndarray:
     """1 at distance 1 (the first computed cell next to the interface),
     decreasing linearly by 1/``width`` per cell (1/``width`` at ``width``);
     0 beyond and at the source."""
-    w = np.where((distance >= 1) & (distance <= width), 1.0 - (distance - 1.0) / width, 0.0)
+    w = np.where(
+        (distance >= 1) & (distance <= width), 1.0 - (distance - 1.0) / width, 0.0
+    )
     return np.where(np.isfinite(distance), w, 0.0)

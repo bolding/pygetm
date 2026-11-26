@@ -35,14 +35,21 @@ class TestSplitWorld(unittest.TestCase):
         from pygetm.nesting import mpmd_blocks
 
         e = [("root", 0), ("root", 0), ("child", 1), ("gc", 2), ("gc", 2)]
-        self.assertEqual(mpmd_blocks(e), {"root": (0, 2), "child": (2, 1), "gc": (3, 2)})
+        self.assertEqual(
+            mpmd_blocks(e), {"root": (0, 2), "child": (2, 1), "gc": (3, 2)}
+        )
         self.assertEqual(mpmd_blocks([("root", -1)] * 3), {"root": (0, 3)})
         with self.assertRaises(ValueError):  # two domains in one component
             mpmd_blocks([("root", 0), ("child", 0), ("gc", 1)])
         # one application (srun --multi-prog): the names define the components
         e = [("root", 0), ("root", 0), ("child", 0), ("gc", 0)]
-        self.assertEqual(mpmd_blocks(e), {"root": (0, 2), "child": (2, 1), "gc": (3, 1)})
-        self.assertEqual(mpmd_blocks([("root", -1), ("child", -1)]), {"root": (0, 1), "child": (1, 1)})
+        self.assertEqual(
+            mpmd_blocks(e), {"root": (0, 2), "child": (2, 1), "gc": (3, 1)}
+        )
+        self.assertEqual(
+            mpmd_blocks([("root", -1), ("child", -1)]),
+            {"root": (0, 1), "child": (1, 1)},
+        )
         with self.assertRaises(ValueError):  # not contiguous
             mpmd_blocks([("root", 0), ("child", 0), ("root", 0)])
         with self.assertRaises(ValueError):  # one domain in two components
@@ -54,7 +61,10 @@ class TestSplitWorld(unittest.TestCase):
 
         world = parallel.MPI.COMM_WORLD
         ctx = split_mpmd("root")
-        self.assertEqual((ctx.name, ctx.comm.size, ctx.sizes), ("root", world.size, {"root": world.size}))
+        self.assertEqual(
+            (ctx.name, ctx.comm.size, ctx.sizes),
+            ("root", world.size, {"root": world.size}),
+        )
 
 
 class RecordingCoupler(Coupler):
@@ -197,7 +207,9 @@ class TestExternalCells(unittest.TestCase):
         u.all_values[T.ugrid.mask.all_values != 0] = 300.0
         v = T.vgrid.array(fill=0.0)
         before = f.all_values.copy()
-        pygetm.operators.Advection(T, scheme=pygetm.AdvectionScheme.UPSTREAM)(u, v, 1.0, f)
+        pygetm.operators.Advection(T, scheme=pygetm.AdvectionScheme.UPSTREAM)(
+            u, v, 1.0, f
+        )
         np.testing.assert_array_equal(f.all_values[ext], before[ext])
         first_active = inside & (ig == 2)
         if first_active.any():
@@ -210,9 +222,13 @@ def small_hierarchy(halo=2):
     return load_levels(
         {
             "root": dict(nx=40, ny=30, lon0=0.0, lat0=50.0, dlon=0.5, dlat=0.5),
-            "child": dict(parent="root", istart=10, istop=26, jstart=8, jstop=20, ratio=3),
+            "child": dict(
+                parent="root", istart=10, istop=26, jstart=8, jstop=20, ratio=3
+            ),
             # touches the child's south edge, as belt_sea in skagerrak
-            "gc": dict(parent="child", istart=20, istop=40, jstart=0, jstop=15, ratio=3),
+            "gc": dict(
+                parent="child", istart=20, istop=40, jstart=0, jstop=15, ratio=3
+            ),
         },
         halo=halo,
     )
@@ -229,7 +245,15 @@ def active_hierarchy(halo=2):
     return load_levels(
         {
             "root": dict(nx=40, ny=30, lon0=0.0, lat0=50.0, dlon=0.5, dlat=0.5),
-            "child": dict(parent="root", istart=10, istop=26, jstart=8, jstop=20, ratio=3, active=act.tolist()),
+            "child": dict(
+                parent="root",
+                istart=10,
+                istop=26,
+                jstart=8,
+                jstop=20,
+                ratio=3,
+                active=act.tolist(),
+            ),
             "gc": dict(parent="child", istart=3, istop=15, jstart=0, jstop=9, ratio=3),
         },
         halo=halo,
@@ -248,8 +272,14 @@ def tiling_info(nrow, ncol, ny_ext, nx_ext, xoff=0, yoff=0, removed=(), halo=2):
             if (r, c) not in removed:
                 rank_map[r, c] = rank
                 rank += 1
-    return dict(map=rank_map.tolist(), nx_sub=nx_sub, ny_sub=ny_sub,
-                xoffset_global=xoff, yoffset_global=yoff, halo=halo)
+    return dict(
+        map=rank_map.tolist(),
+        nx_sub=nx_sub,
+        ny_sub=ny_sub,
+        xoffset_global=xoff,
+        yoffset_global=yoff,
+        halo=halo,
+    )
 
 
 class TestNestingGeometry(unittest.TestCase):
@@ -270,7 +300,10 @@ class TestNestingGeometry(unittest.TestCase):
         self.assertEqual(child.rims["gc"][:, 0].min(), 0)
         self.assertGreaterEqual(child.rims["gc"][:, 0].max(), 2 * 3 - 1)
         bj, bi = child.ring_cells()
-        self.assertEqual(bj.size, child.extended_shape[0] * child.extended_shape[1] - child.nx * child.ny)
+        self.assertEqual(
+            bj.size,
+            child.extended_shape[0] * child.extended_shape[1] - child.nx * child.ny,
+        )
 
     def test_tiling_mask(self):
         # only hole cells nothing reads (the hole minus the rim) need no subdomain
@@ -283,7 +316,8 @@ class TestNestingGeometry(unittest.TestCase):
         self.assertEqual(int(free.sum()), (12 - 2 * 2) * (16 - 2 * 2))
         rim = root.rims["child"]
         self.assertTrue(tm[2 + rim[:, 0], 2 + rim[:, 1]].all())
-        # a grandchild on the child's edge: the faces passed upwards keep their hole cells
+        # a grandchild on the child's edge: the faces passed upwards keep their hole
+        # cells
         tm = child.tiling_mask()
         wf = child.wfaces["gc"]
         hj, hi = wf["hole"]
@@ -298,7 +332,9 @@ class TestNestingGeometry(unittest.TestCase):
         levels = load_levels(
             {
                 "root": dict(nx=40, ny=30, lon0=0.0, lat0=50.0, dlon=0.5, dlat=0.5),
-                "child": dict(parent="root", istart=10, istop=26, jstart=8, jstop=20, ratio=3),
+                "child": dict(
+                    parent="root", istart=10, istop=26, jstart=8, jstop=20, ratio=3
+                ),
             },
             root_band=0,
         )
@@ -315,13 +351,21 @@ class TestNestingGeometry(unittest.TestCase):
         self.assertTrue(root.hole[8:14, 10:26].all())
         self.assertFalse(root.hole[14:20, 18:26].any())
         self.assertTrue(root.computed[14:20, 18:26].all())
-        np.testing.assert_array_equal(root.coupled(), ~np.pad(root.computed, 2, constant_values=False))
-        # ring: non-active cells within the band of the active region, also inside the window
+        np.testing.assert_array_equal(
+            root.coupled(), ~np.pad(root.computed, 2, constant_values=False)
+        )
+        # ring: non-active cells within the band of the active region, also inside the
+        # window
         b = child.band
         bj, bi = child.ring_cells()
-        self.assertTrue(((bj >= 0) & (bj < child.ny) & (bi >= 0) & (bi < child.nx)).any())
-        self.assertFalse(child.cactive[np.clip(bj, 0, child.ny - 1), np.clip(bi, 0, child.nx - 1)][
-            (bj >= 0) & (bj < child.ny) & (bi >= 0) & (bi < child.nx)].any())
+        self.assertTrue(
+            ((bj >= 0) & (bj < child.ny) & (bi >= 0) & (bi < child.nx)).any()
+        )
+        self.assertFalse(
+            child.cactive[np.clip(bj, 0, child.ny - 1), np.clip(bi, 0, child.nx - 1)][
+                (bj >= 0) & (bj < child.ny) & (bi >= 0) & (bi < child.nx)
+            ].any()
+        )
         self.assertTrue(child.unused()[b + child.ny - 1, b + child.nx - 1])
         # interface faces of the child in the root: the perimeter of the L
         wf = root.wfaces["child"]
@@ -338,21 +382,33 @@ class TestNestingGeometry(unittest.TestCase):
         e = child.edge
         for m in np.nonzero(~g["inside"])[0]:
             k = g["up"][m]
-            self.assertEqual((e["face"][0][k], e["face"][1][k]), (g["face"][0][m], g["face"][1][m]))
-            self.assertEqual((e["inner"][0][k], e["inner"][1][k]), (g["hole"][0][m], g["hole"][1][m]))
+            self.assertEqual(
+                (e["face"][0][k], e["face"][1][k]), (g["face"][0][m], g["face"][1][m])
+            )
+            self.assertEqual(
+                (e["inner"][0][k], e["inner"][1][k]), (g["hole"][0][m], g["hole"][1][m])
+            )
         # full window: unchanged behaviour
         levels = small_hierarchy()
         bj, bi = levels[1].ring_cells()
-        self.assertEqual(bj.size, levels[1].extended_shape[0] * levels[1].extended_shape[1] - levels[1].nx * levels[1].ny)
+        self.assertEqual(
+            bj.size,
+            levels[1].extended_shape[0] * levels[1].extended_shape[1]
+            - levels[1].nx * levels[1].ny,
+        )
 
     def test_active_region_from_seed(self):
         from pygetm.nesting.geometry import Level, active_region
 
         root = Level("root", dict(nx=20, ny=10, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0))
-        child = Level("child", dict(istart=2, istop=18, jstart=1, jstop=9, ratio=2), root)
+        child = Level(
+            "child", dict(istart=2, istop=18, jstart=1, jstop=9, ratio=2), root
+        )
         wet = np.ones((child.ny, child.nx), dtype=bool)
         wet[:, 15] = False  # land wall at lon 9.5..10 (child column 15)
-        act = active_region(child, dict(seed=[3.0, 4.0], barriers=[{"lat_gt": 7.0, "lon_lt": 6.0}]), wet)
+        act = active_region(
+            child, dict(seed=[3.0, 4.0], barriers=[{"lat_gt": 7.0, "lon_lt": 6.0}]), wet
+        )
         self.assertEqual(act.shape, (8, 16))
         self.assertFalse(act[:, 8:].any())  # behind the land wall
         self.assertFalse(act[6:, :4].any())  # behind the barrier
@@ -360,10 +416,16 @@ class TestNestingGeometry(unittest.TestCase):
         with self.assertRaises(ValueError):
             active_region(child, dict(seed=[15.0, 4.0], barriers=[]), wet & False)
         # a list of seeds: the water behind the wall becomes active too
-        act2 = active_region(child, dict(seed=[[3.0, 4.0], [15.0, 4.0]], barriers=[{"lat_gt": 7.0, "lon_lt": 6.0}]), wet)
+        act2 = active_region(
+            child,
+            dict(
+                seed=[[3.0, 4.0], [15.0, 4.0]],
+                barriers=[{"lat_gt": 7.0, "lon_lt": 6.0}],
+            ),
+            wet,
+        )
         self.assertTrue(act2[:, 8:].all())
         self.assertTrue((act2[:, :8] == act[:, :8]).all())
-
 
     def test_outer_sides(self):
         """A child whose window reaches the root's edge owns that part of the
@@ -375,7 +437,9 @@ class TestNestingGeometry(unittest.TestCase):
         cfg = dict(
             root=dict(nx=10, ny=8, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
             east=dict(parent="root", istart=6, istop=10, jstart=0, jstop=5, ratio=2),
-            inner=dict(parent="root", istart=2, istop=5, jstart=2, jstop=6, ratio=2),  # 2 cells from the edges
+            inner=dict(
+                parent="root", istart=2, istop=5, jstart=2, jstop=6, ratio=2
+            ),  # 2 cells from the edges
         )
         levels = {l.name: l for l in load_levels(cfg, halo=2, root_band=0)}
         east, inner = levels["east"], levels["inner"]
@@ -403,7 +467,9 @@ class TestNestingGeometry(unittest.TestCase):
         wet2, _, changes = masks.make_consistent(levels.values(), wet, H)
         self.assertFalse(wet2["east"][east.outer_mask()].any())
         self.assertTrue(wet2["east"][h : h + east.ny, h : h + east.nx].all())
-        self.assertFalse(any(masks.check_consistent(levels.values(), wet2)["east"].values()))
+        self.assertFalse(
+            any(masks.check_consistent(levels.values(), wet2)["east"].values())
+        )
 
     def test_outer_sides_grandchild(self):
         """A grandchild at an outer side of its parent owns that part of the
@@ -425,53 +491,89 @@ class TestNestingGeometry(unittest.TestCase):
         h = gc.band
         ring = gc._ring_mask()
         self.assertFalse(ring[:, h + gc.nx :].any())
-        self.assertTrue(ring[:h, h:].any())  # south: ring from east's band (over the root)
+        self.assertTrue(
+            ring[:h, h:].any()
+        )  # south: ring from east's band (over the root)
         wf = east.wfaces["gc"]
         oj, oi = wf["out"]
-        self.assertTrue((oi < east.nx).all())  # no interface faces beyond the outer side
+        self.assertTrue(
+            (oi < east.nx).all()
+        )  # no interface faces beyond the outer side
         self.assertEqual(wf["is_x"].size, 6 + 6 + 6)  # west, south, north
         south = oj < 0
         self.assertEqual(int(south.sum()), 6)
-        self.assertTrue((wf["up"][south] >= 0).all())  # on east's interface with the root
+        self.assertTrue(
+            (wf["up"][south] >= 0).all()
+        )  # on east's interface with the root
         self.assertTrue((wf["up"][~south] < 0).all())
         wet = {n: np.ones(l.extended_shape, dtype=bool) for n, l in levels.items()}
         H = {n: np.full(l.extended_shape, 10.0) for n, l in levels.items()}
         wet2, _, _ = masks.make_consistent(levels.values(), wet, H)
         self.assertFalse(wet2["gc"][gc.outer_mask()].any())
-        self.assertFalse(any(masks.check_consistent(levels.values(), wet2)["gc"].values()))
-
+        self.assertFalse(
+            any(masks.check_consistent(levels.values(), wet2)["gc"].values())
+        )
 
     def test_parent_rim_in_hole(self):
-        """A grandchild within halo parent cells of its parent's interface (not touching it): the root's rim
-        blocks lie partly in the child's hole, so the child must send up after its own children."""
+        """A grandchild within halo parent cells of its parent's interface (not touching
+        it): the root's rim blocks lie partly in the child's hole, so the child must
+        send up after its own children.
+        """
         from pygetm.nesting.geometry import load_levels
 
         def child_flag(gi0):
-            spec = {"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
-                    "child": dict(parent="root", istart=10, istop=30, jstart=5, jstop=25, ratio=3),
-                    "grand": dict(parent="child", istart=gi0, istop=gi0 + 20, jstart=15, jstop=40, ratio=2)}
-            return {lev.name: lev.parent_rim_in_hole for lev in load_levels(spec, root_band=0)}
+            spec = {
+                "root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
+                "child": dict(
+                    parent="root", istart=10, istop=30, jstart=5, jstop=25, ratio=3
+                ),
+                "grand": dict(
+                    parent="child",
+                    istart=gi0,
+                    istop=gi0 + 20,
+                    jstart=15,
+                    jstop=40,
+                    ratio=2,
+                ),
+            }
+            return {
+                lev.name: lev.parent_rim_in_hole
+                for lev in load_levels(spec, root_band=0)
+            }
 
         near = child_flag(3)  # one root cell inside the child's west edge
         self.assertTrue(near["child"])
         self.assertFalse(near["root"])
         self.assertFalse(near["grand"])
-        self.assertFalse(child_flag(12)["child"])  # four root cells inside: clear of the root's rim
+        self.assertFalse(
+            child_flag(12)["child"]
+        )  # four root cells inside: clear of the root's rim
 
     def test_layout_refusals(self):
-        """A window 1 cell from the root's outer edge, and a layout with two roots, are refused."""
+        """A window 1 cell from the root's outer edge, and a layout with two roots, are
+        refused."""
         from pygetm.nesting.geometry import load_levels
 
         root = dict(nx=10, ny=8, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0)
         with self.assertRaisesRegex(ValueError, "from the root's outer edge"):
-            load_levels(dict(root=root, c=dict(parent="root", istart=1, istop=4, jstart=2, jstop=6, ratio=2)), root_band=0)
+            load_levels(
+                dict(
+                    root=root,
+                    c=dict(
+                        parent="root", istart=1, istop=4, jstart=2, jstop=6, ratio=2
+                    ),
+                ),
+                root_band=0,
+            )
         with self.assertRaisesRegex(ValueError, "exactly one root"):
             load_levels(dict(a=root, b=dict(root)), root_band=0)
 
+
 class TestLevelDepthAndEdges(unittest.TestCase):
-    """pygetm.nesting.bathymetry.read_level_depth (a file with a band of 2 cut to the level's grid, a wrong grid
-    refused, min_depth) and pygetm.nesting.boundaries (the root's and a child's edge stretches; added to a domain
-    in the order W, E, S, N with their names)."""
+    """pygetm.nesting.bathymetry.read_level_depth (a file with a band of 2 cut to the
+    level's grid, a wrong grid refused, min_depth) and pygetm.nesting.boundaries (the
+    root's and a child's edge stretches; added to a domain in the order W, E, S, N with
+    their names)."""
 
     def setUp(self):
         import tempfile
@@ -479,8 +581,10 @@ class TestLevelDepthAndEdges(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory()
         from pygetm.nesting.geometry import load_levels
 
-        spec = {"root": dict(nx=10, ny=8, lon0=0.0, lat0=50.0, dlon=0.1, dlat=0.1),
-                "east": dict(parent="root", istart=6, istop=10, jstart=2, jstop=6, ratio=2)}
+        spec = {
+            "root": dict(nx=10, ny=8, lon0=0.0, lat0=50.0, dlon=0.1, dlat=0.1),
+            "east": dict(parent="root", istart=6, istop=10, jstart=2, jstop=6, ratio=2),
+        }
         self.levels = {l.name: l for l in load_levels(spec, root_band=0, active=False)}
 
     def tearDown(self):
@@ -493,12 +597,25 @@ class TestLevelDepthAndEdges(unittest.TestCase):
         ny, nx = lev.domain_shape
         lon_e, lat_e = lev.edges()
         d = lev.dlon
-        lon = np.concatenate([lon_e[0] - d * (np.arange(extra, 0, -1) - 0.5), 0.5 * (lon_e[1:] + lon_e[:-1]),
-                              lon_e[-1] + d * (np.arange(extra) + 0.5)]) + shift
-        lat = np.concatenate([lat_e[0] - lev.dlat * (np.arange(extra, 0, -1) - 0.5), 0.5 * (lat_e[1:] + lat_e[:-1]),
-                              lat_e[-1] + lev.dlat * (np.arange(extra) + 0.5)])
+        lon = (
+            np.concatenate(
+                [
+                    lon_e[0] - d * (np.arange(extra, 0, -1) - 0.5),
+                    0.5 * (lon_e[1:] + lon_e[:-1]),
+                    lon_e[-1] + d * (np.arange(extra) + 0.5),
+                ]
+            )
+            + shift
+        )
+        lat = np.concatenate(
+            [
+                lat_e[0] - lev.dlat * (np.arange(extra, 0, -1) - 0.5),
+                0.5 * (lat_e[1:] + lat_e[:-1]),
+                lat_e[-1] + lev.dlat * (np.arange(extra) + 0.5),
+            ]
+        )
         H = np.full((lat.size, lon.size), 10.0)
-        H[:, :extra + 1] = 1.0  # shallow first columns
+        H[:, : extra + 1] = 1.0  # shallow first columns
         path = os.path.join(self.dir.name, f"{lev.name}.nc")
         with netCDF4.Dataset(path, "w") as nc:
             nc.createDimension("lon", lon.size)
@@ -517,13 +634,21 @@ class TestLevelDepthAndEdges(unittest.TestCase):
         H = read_level_depth(path, root, "depth", "lon", "lat", mask_variable="mask")
         self.assertEqual(H.shape, root.domain_shape)
         self.assertTrue(np.isfinite(H).all())
-        H = read_level_depth(path, root, "depth", "lon", "lat", mask_variable="mask", min_depth=2.0)
-        self.assertTrue(np.isnan(H[:, 0]).all() and np.isfinite(H[:, 1:]).all())  # the shallow first column: land
+        H = read_level_depth(
+            path, root, "depth", "lon", "lat", mask_variable="mask", min_depth=2.0
+        )
+        self.assertTrue(
+            np.isnan(H[:, 0]).all() and np.isfinite(H[:, 1:]).all()
+        )  # the shallow first column: land
         with self.assertRaisesRegex(ValueError, "cell centres"):
             read_level_depth(self.write(root, shift=0.05), root, "depth", "lon", "lat")
         child = self.levels["east"]
-        self.assertEqual(read_level_depth(self.write(child, extra=0), child, "depth", "lon", "lat").shape,
-                         child.domain_shape)
+        self.assertEqual(
+            read_level_depth(
+                self.write(child, extra=0), child, "depth", "lon", "lat"
+            ).shape,
+            child.domain_shape,
+        )
         # a file in other units than the layout (scale: its units per layout unit)
         import netCDF4
 
@@ -531,7 +656,11 @@ class TestLevelDepthAndEdges(unittest.TestCase):
         with netCDF4.Dataset(path, "a") as nc:
             nc["lon"][:] = nc["lon"][:] * 1000.0
             nc["lat"][:] = nc["lat"][:] * 1000.0
-        self.assertTrue(np.isfinite(read_level_depth(path, root, "depth", "lon", "lat", scale=1000.0)).all())
+        self.assertTrue(
+            np.isfinite(
+                read_level_depth(path, root, "depth", "lon", "lat", scale=1000.0)
+            ).all()
+        )
         with self.assertRaisesRegex(ValueError, "cell centres"):
             read_level_depth(path, root, "depth", "lon", "lat")
 
@@ -542,21 +671,40 @@ class TestLevelDepthAndEdges(unittest.TestCase):
         root, child = self.levels["root"], self.levels["east"]
         wet = {n: np.ones(l.domain_shape, bool) for n, l in self.levels.items()}
         segs = level_edge_segments(root, wet["root"])
-        self.assertEqual([s[0] for s in segs], ["W", "E", "E", "S", "N"])  # the east edge split by the child's window
+        self.assertEqual(
+            [s[0] for s in segs], ["W", "E", "E", "S", "N"]
+        )  # the east edge split by the child's window
         east = [(s[2], s[3]) for s in segs if s[0] == "E"]
         self.assertEqual(east, [(1, 2), (6, 7)])  # rows 2..5 are the child's
-        self.assertEqual(level_edge_segments(child, wet["east"]), [("E", child.band + child.nx - 1, child.band,
-                                                                      child.band + child.ny)])
-        # only W open: its corners are its own (they are left out only where the perpendicular side is open too)
-        self.assertEqual(level_edge_segments(root, wet["root"], sides="W"), [("W", 0, 0, root.ny)])
-        self.assertEqual(level_edge_segments(child, wet["east"], sides="W"), [])  # not one of its outer sides
+        self.assertEqual(
+            level_edge_segments(child, wet["east"]),
+            [("E", child.band + child.nx - 1, child.band, child.band + child.ny)],
+        )
+        # only W open: its corners are its own (they are left out only where the
+        # perpendicular side is open too)
+        self.assertEqual(
+            level_edge_segments(root, wet["root"], sides="W"), [("W", 0, 0, root.ny)]
+        )
+        self.assertEqual(
+            level_edge_segments(child, wet["east"], sides="W"), []
+        )  # not one of its outer sides
         lon_e, lat_e = root.edges()
-        domain = pygetm.domain.create_spherical(lon_e, lat_e, interfaces=True, H=np.full(root.domain_shape, 10.0),
-                                                logger=pygetm.parallel.get_logger(level="ERROR"))
+        domain = pygetm.domain.create_spherical(
+            lon_e,
+            lat_e,
+            interfaces=True,
+            H=np.full(root.domain_shape, 10.0),
+            logger=pygetm.parallel.get_logger(level="ERROR"),
+        )
         domain.coupled = root.coupled()
-        added = add_edge_boundaries(domain, root, wet["root"], pygetm.FLATHER_TRANSPORT, pygetm.ZERO_GRADIENT)
+        added = add_edge_boundaries(
+            domain, root, wet["root"], pygetm.FLATHER_TRANSPORT, pygetm.ZERO_GRADIENT
+        )
         self.assertEqual(added, segs)
-        self.assertEqual(domain.open_boundaries.i.size, sum(m1 - m0 for _, _, m0, m1 in segs))  # the points added
+        self.assertEqual(
+            domain.open_boundaries.i.size, sum(m1 - m0 for _, _, m0, m1 in segs)
+        )  # the points added
+
 
 class TestNestingSponge(unittest.TestCase):
     def test_water_distance_and_weight(self):
@@ -607,7 +755,9 @@ class TestNestingOperators(unittest.TestCase):
         rng = np.random.default_rng(1)
         c = rng.normal(size=(9, 11))
         wet = rng.random((9, 11)) > 0.25
-        j, i = (x.ravel() for x in np.meshgrid(np.arange(9), np.arange(11), indexing="ij"))
+        j, i = (
+            x.ravel() for x in np.meshgrid(np.arange(9), np.arange(11), indexing="ij")
+        )
         for w in (wet, None):
             sx, sy = limited_slopes(c, w)
             px, py = limited_slopes_at(c, w, j, i)
@@ -623,9 +773,17 @@ class TestNestingMasks(unittest.TestCase):
         rng = np.random.default_rng(1)
         wet = {l.name: rng.random(l.extended_shape) > 0.3 for l in levels}
         H = {l.name: 5.0 + 10.0 * rng.random(l.extended_shape) for l in levels}
-        self.assertTrue(any(v for d in check_consistent(levels, wet).values() for v in d.values()))
+        self.assertTrue(
+            any(v for d in check_consistent(levels, wet).values() for v in d.values())
+        )
         wet2, H2, _ = make_consistent(levels, wet, H)
-        self.assertTrue(all(v == 0 for d in check_consistent(levels, wet2).values() for v in d.values()))
+        self.assertTrue(
+            all(
+                v == 0
+                for d in check_consistent(levels, wet2).values()
+                for v in d.values()
+            )
+        )
         wet3, _, changes = make_consistent(levels, wet2, H2)
         self.assertTrue(all(v == 0 for d in changes.values() for v in d.values()))
         for l in levels:
@@ -640,10 +798,18 @@ class TestNestingMasks(unittest.TestCase):
         H = {l.name: 5.0 + 10.0 * rng.random(l.extended_shape) for l in levels}
         wet2, H2, changes = make_consistent(levels, wet, H)
         self.assertGreater(changes["child"]["unused_dried"], 0)
-        self.assertTrue(all(v == 0 for d in check_consistent(levels, wet2).values() for v in d.values()))
+        self.assertTrue(
+            all(
+                v == 0
+                for d in check_consistent(levels, wet2).values()
+                for v in d.values()
+            )
+        )
         # root cells of the window outside the active region are left alone
-        np.testing.assert_array_equal(wet2["root"][2 + 14 : 2 + 20, 2 + 18 : 2 + 26], wet["root"][2 + 14 : 2 + 20, 2 + 18 : 2 + 26])
-
+        np.testing.assert_array_equal(
+            wet2["root"][2 + 14 : 2 + 20, 2 + 18 : 2 + 26],
+            wet["root"][2 + 14 : 2 + 20, 2 + 18 : 2 + 26],
+        )
 
     def test_faces_closed_over_closed_subfaces(self):
         # rule 3: a parent interface face between two wet cells whose child
@@ -665,12 +831,23 @@ class TestNestingMasks(unittest.TestCase):
         cf = root.closed_faces
         self.assertEqual(cf["is_x"].size, 1)
         self.assertTrue(cf["is_x"][0])
-        self.assertEqual((cf["face"][0][0], cf["face"][1][0]), (f["face"][0][n], f["face"][1][n]))
-        self.assertTrue(all(v == 0 for d in check_consistent(levels, wet2).values() for v in d.values()))
+        self.assertEqual(
+            (cf["face"][0][0], cf["face"][1][0]), (f["face"][0][n], f["face"][1][n])
+        )
+        self.assertTrue(
+            all(
+                v == 0
+                for d in check_consistent(levels, wet2).values()
+                for v in d.values()
+            )
+        )
         # in the domain mask: the U point closed, its T neighbours still wet
         import types
+
         hb = root.band
-        m = np.ones((2 * root.extended_shape[0] + 1, 2 * root.extended_shape[1] + 1), int)
+        m = np.ones(
+            (2 * root.extended_shape[0] + 1, 2 * root.extended_shape[1] + 1), int
+        )
         dom = types.SimpleNamespace(mask=m, _mask=m)
         close_faces(root, dom)
         fj, fi = f["face"][0][n] + hb, f["face"][1][n] + hb
@@ -690,7 +867,6 @@ class TestNestingMasks(unittest.TestCase):
 
         close_faces(root, _Other())
 
-
     def test_interface_depths(self):
         # the layout keeps interfaces out of drying water: shallow ring cells or
         # parent source cells are counted against interface_min_depth
@@ -705,15 +881,27 @@ class TestNestingMasks(unittest.TestCase):
         self.assertEqual(d["interface_shallow"], 0)
         self.assertEqual(d["min_depth_ring"], 10.0)
         bj, bi = child.ring_cells()
-        H[child.name][bj[0] + child.band, bi[0] + child.band] = 1.0  # one shallow ring cell
+        H[child.name][
+            bj[0] + child.band, bi[0] + child.band
+        ] = 1.0  # one shallow ring cell
         pj, pi, _, _ = child.ring_source(bj, bi)
-        H[root.name][pj[-1] + root.band, pi[-1] + root.band] = 2.0  # one shallow parent source cell
+        H[root.name][
+            pj[-1] + root.band, pi[-1] + root.band
+        ] = 2.0  # one shallow parent source cell
         d = interface_depths(levels, wet, H, lim)[child.name]
         self.assertEqual(d["interface_shallow"], 2)
         self.assertEqual((d["min_depth_ring"], d["min_depth_parent"]), (1.0, 2.0))
-        self.assertEqual(interface_depths(levels, wet, H, {})[child.name]["interface_shallow"], 0)  # not set
-        cfg = {"config": {"interface_min_depth": 2.5}, child.name: {"interface_min_depth": 4}}
-        self.assertEqual((interface_min_depth(cfg, child.name), interface_min_depth(cfg, root.name)), (4.0, 2.5))
+        self.assertEqual(
+            interface_depths(levels, wet, H, {})[child.name]["interface_shallow"], 0
+        )  # not set
+        cfg = {
+            "config": {"interface_min_depth": 2.5},
+            child.name: {"interface_min_depth": 4},
+        }
+        self.assertEqual(
+            (interface_min_depth(cfg, child.name), interface_min_depth(cfg, root.name)),
+            (4.0, 2.5),
+        )
         self.assertEqual(interface_min_depth({}, child.name), 0.0)
 
 
@@ -723,7 +911,9 @@ class TestNestingPlan(unittest.TestCase):
 
         tilings, off = {}, 0
         for lev in levels:
-            info = tiling_info(*layouts[lev.name][:2], *lev.extended_shape, **layouts[lev.name][2])
+            info = tiling_info(
+                *layouts[lev.name][:2], *lev.extended_shape, **layouts[lev.name][2]
+            )
             tilings[lev.name] = LevelTiling(info, lev.halo, off)
             off += tilings[lev.name].ntiles
         sends, recvs = {}, {}
@@ -750,7 +940,9 @@ class TestNestingPlan(unittest.TestCase):
             bj, bi = lev.ring_cells()
             pj, pi, _, _ = lev.ring_source(bj, bi)
             owned = (plan.ctil.owner(bj, bi) >= 0) & (plan.ptil.owner(pj, pi) >= 0)
-            self.assertEqual(sum(v[2].size for v in plan.pro.values()), int(owned.sum()))
+            self.assertEqual(
+                sum(v[2].size for v in plan.pro.values()), int(owned.sum())
+            )
         self.assertEqual(sends, recvs)
         self.assertTrue(all(v == 1 for v in sends.values()))
 
@@ -760,24 +952,41 @@ class TestNestingPlan(unittest.TestCase):
 
     def test_plans_unequal_protruding_removed(self):
         levels = small_hierarchy()
-        self._check(levels, {
-            "root": (2, 3, dict(xoff=-4)),
-            "child": (3, 2, dict(yoff=-5, removed=[(0, 1)])),
-            "gc": (2, 4, dict(xoff=-7, removed=[(1, 3), (0, 0)])),
-        })
+        self._check(
+            levels,
+            {
+                "root": (2, 3, dict(xoff=-4)),
+                "child": (3, 2, dict(yoff=-5, removed=[(0, 1)])),
+                "gc": (2, 4, dict(xoff=-7, removed=[(1, 3), (0, 0)])),
+            },
+        )
 
     def test_plans_active(self):
         levels = active_hierarchy()
         self._check(levels, {"root": (1, 1, {}), "child": (1, 1, {}), "gc": (1, 1, {})})
-        self._check(levels, {
-            "root": (2, 3, dict(xoff=-4)),
-            "child": (3, 2, dict(yoff=-5, removed=[(2, 1)])),
-            "gc": (2, 2, dict(xoff=-3)),
-        })
+        self._check(
+            levels,
+            {
+                "root": (2, 3, dict(xoff=-4)),
+                "child": (3, 2, dict(yoff=-5, removed=[(2, 1)])),
+                "gc": (2, 2, dict(xoff=-3)),
+            },
+        )
 
 
-def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=True, children=True, active=None,
-                   time_ratio=None, dt_root=20.0, **coupler_kwargs):
+def run_barotropic(
+    ratio,
+    nroot,
+    nsteps,
+    amplitude=0.5,
+    coriolis=1e-4,
+    slope=True,
+    children=True,
+    active=None,
+    time_ratio=None,
+    dt_root=20.0,
+    **coupler_kwargs,
+):
     """Closed basin, root (+ child), 2D barotropic; returns (volumes per
     output, gathered z of this level or None, level name, world)."""
     from pygetm.nesting import load_levels
@@ -786,30 +995,45 @@ def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=Tru
 
     cfg = {"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0)}
     if children:
-        cfg["child"] = dict(parent="root", istart=12, istop=24, jstart=8, jstop=20, ratio=ratio)
+        cfg["child"] = dict(
+            parent="root", istart=12, istop=24, jstart=8, jstop=20, ratio=ratio
+        )
         if active is not None:
             cfg["child"]["active"] = active.tolist()
         if time_ratio is not None:
             cfg["child"]["time_ratio"] = time_ratio
     levels = load_levels(cfg, root_band=0)
     world = parallel.MPI.COMM_WORLD
-    ranks = {"root": nroot, "child": world.size - nroot} if children else {"root": world.size}
+    ranks = (
+        {"root": nroot, "child": world.size - nroot}
+        if children
+        else {"root": world.size}
+    )
     nest = NestingRun(levels, ranks)
 
     def make_domain(lev, comm):
         lon, lat = lev.edges()
         xc = 0.5 * (lon[1:] + lon[:-1])
-        H = (20.0 + (10.0 * xc / 40.0 if slope else 0.0))[None, :] * np.ones((lat.size - 1, 1))
+        H = (20.0 + (10.0 * xc / 40.0 if slope else 0.0))[None, :] * np.ones(
+            (lat.size - 1, 1)
+        )
         if lev.parent is not None:
             H = np.where(lev.unused(), np.nan, H)  # window cells the child does not use
         return pygetm.domain.create_cartesian(
-            lon * 2e3, lat * 2e3, interfaces=True, H=H, f=coriolis, comm=comm,
+            lon * 2e3,
+            lat * 2e3,
+            interfaces=True,
+            H=H,
+            f=coriolis,
+            comm=comm,
             logger=parallel.get_logger(level="ERROR", comm=comm),
         )
 
     def make_sim(lev, domain):
         sim = pygetm.Simulation(
-            domain, runtype=pygetm.RunType.BAROTROPIC_2D, airsea=pygetm.airsea.Fluxes(),
+            domain,
+            runtype=pygetm.RunType.BAROTROPIC_2D,
+            airsea=pygetm.airsea.Fluxes(),
             logger=parallel.get_logger(level="ERROR", comm=domain.comm),
         )
         sim.airsea.taux.set(0.0)
@@ -824,18 +1048,30 @@ def run_barotropic(ratio, nroot, nsteps, amplitude=0.5, coriolis=1e-4, slope=Tru
     gj, gi = nest.global_indices()
     x = lev.lon0 + (gi + 0.5) * lev.dlon
     y = lev.lat0 + (gj + 0.5) * lev.dlat
-    sim.T.z.all_values[...] = amplitude * np.exp(-((x[None, :] - 18.0) ** 2 + (y[:, None] - 14.0) ** 2) / 8.0)
+    sim.T.z.all_values[...] = amplitude * np.exp(
+        -((x[None, :] - 18.0) ** 2 + (y[:, None] - 14.0) ** 2) / 8.0
+    )
     sim.T.z.all_values[sim.T.mask.all_values == 0] = 0.0
     import datetime
 
-    sim.start(datetime.datetime(2000, 1, 1), timestep=dt_root / lev.steps_per_root, split_factor=1, report=0)
+    sim.start(
+        datetime.datetime(2000, 1, 1),
+        timestep=dt_root / lev.steps_per_root,
+        split_factor=1,
+        report=0,
+    )
     vols = [cpl.level_volume()]
     for _ in range(nsteps * lev.steps_per_root):
         sim.advance()
     vols.append(cpl.level_volume())
     sim.finish()
     g = sim.T.z.gather()
-    return nest.world.allreduce(np.array(vols)), (None if g is None else np.array(g)), lev.name, nest.world
+    return (
+        nest.world.allreduce(np.array(vols)),
+        (None if g is None else np.array(g)),
+        lev.name,
+        nest.world,
+    )
 
 
 class TestNestingBarotropic(unittest.TestCase):
@@ -869,7 +1105,9 @@ class TestNestingBarotropic(unittest.TestCase):
     def test_volume_conserved_sponge(self):
         # the sponge damps momentum only: volume stays conserved
         nroot = (parallel.MPI.COMM_WORLD.size + 1) // 2
-        vols, z, _, _ = run_barotropic(3, nroot, 60, sponge_width=1.0, sponge_alpha=0.01)
+        vols, z, _, _ = run_barotropic(
+            3, nroot, 60, sponge_width=1.0, sponge_alpha=0.01
+        )
         self.assertLess(abs(vols[1] - vols[0]) / vols[0], 1e-13)
         if z is not None:
             self.assertTrue(np.isfinite(z[np.isfinite(z)]).all())
@@ -877,11 +1115,29 @@ class TestNestingBarotropic(unittest.TestCase):
     def test_tracer_time_ratio(self):
         from pygetm.nesting import load_levels
 
-        levels = load_levels({
-            "root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
-            "child": dict(parent="root", istart=10, istop=22, jstart=8, jstop=18, ratio=3, time_ratio=1),
-            "gc": dict(parent="child", istart=6, istop=18, jstart=6, jstop=18, ratio=2, time_ratio=4),
-        })
+        levels = load_levels(
+            {
+                "root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
+                "child": dict(
+                    parent="root",
+                    istart=10,
+                    istop=22,
+                    jstart=8,
+                    jstop=18,
+                    ratio=3,
+                    time_ratio=1,
+                ),
+                "gc": dict(
+                    parent="child",
+                    istart=6,
+                    istop=18,
+                    jstart=6,
+                    jstop=18,
+                    ratio=2,
+                    time_ratio=4,
+                ),
+            }
+        )
         self.assertEqual([l.steps_per_root for l in levels], [1, 1, 4])
         self.assertEqual(levels[2].time_ratio, 4)
 
@@ -902,41 +1158,60 @@ class TestNestingBarotropic(unittest.TestCase):
         if sub != parallel.MPI.COMM_NULL:
             from pygetm.nesting import load_levels
 
-            lev = load_levels({"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0)}, root_band=0)[0]
+            lev = load_levels(
+                {"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0)},
+                root_band=0,
+            )[0]
             lon, lat = lev.edges()
             xc = 0.5 * (lon[1:] + lon[:-1])
             H = (20.0 + 10.0 * xc / 40.0)[None, :] * np.ones((lat.size - 1, 1))
             domain = pygetm.domain.create_cartesian(
-                lon * 2e3, lat * 2e3, interfaces=True, H=H, f=1e-4, comm=sub,
+                lon * 2e3,
+                lat * 2e3,
+                interfaces=True,
+                H=H,
+                f=1e-4,
+                comm=sub,
                 logger=parallel.get_logger(level="ERROR", comm=sub),
             )
-            sim = pygetm.Simulation(domain, runtype=pygetm.RunType.BAROTROPIC_2D,
-                                    airsea=pygetm.airsea.Fluxes(),
-                                    logger=parallel.get_logger(level="ERROR", comm=sub))
+            sim = pygetm.Simulation(
+                domain,
+                runtype=pygetm.RunType.BAROTROPIC_2D,
+                airsea=pygetm.airsea.Fluxes(),
+                logger=parallel.get_logger(level="ERROR", comm=sub),
+            )
             sim.airsea.taux.set(0.0)
             sim.airsea.tauy.set(0.0)
             sim.airsea.sp.set(0.0)
             gj = np.arange(sim.T.ny_) - sim.T.haloy + sim.T.tiling.yoffset
             gi = np.arange(sim.T.nx_) - sim.T.halox + sim.T.tiling.xoffset
-            sim.T.z.all_values[...] = 0.5 * np.exp(-(((gi + 0.5)[None, :] - 18.0) ** 2 + ((gj + 0.5)[:, None] - 14.0) ** 2) / 8.0)
+            sim.T.z.all_values[...] = 0.5 * np.exp(
+                -(((gi + 0.5)[None, :] - 18.0) ** 2 + ((gj + 0.5)[:, None] - 14.0) ** 2)
+                / 8.0
+            )
             sim.T.z.all_values[sim.T.mask.all_values == 0] = 0.0
             import datetime
 
-            sim.start(datetime.datetime(2000, 1, 1), timestep=20.0, split_factor=1, report=0)
+            sim.start(
+                datetime.datetime(2000, 1, 1), timestep=20.0, split_factor=1, report=0
+            )
             for _ in range(100):
                 sim.advance()
             sim.finish()
             g = sim.T.z.gather()
             single = None if g is None else np.array(g)
         # compare on world rank 0 (root's rank 0, holds both root fields)
-        child = nworld.bcast(z_nested if (name == "child" and z_nested is not None) else None,
-                             root=nroot)
+        child = nworld.bcast(
+            z_nested if (name == "child" and z_nested is not None) else None, root=nroot
+        )
         if world.rank == 0:
             hole = np.zeros_like(single, dtype=bool)
             hole[8:20, 12:24] = True
             scale = np.abs(single).max()
             self.assertLess(np.abs(z_nested - single)[~hole].max() / scale, 1e-3)
-            self.assertLess(np.abs(child[2:-2, 2:-2] - single[8:20, 12:24]).max() / scale, 1e-3)
+            self.assertLess(
+                np.abs(child[2:-2, 2:-2] - single[8:20, 12:24]).max() / scale, 1e-3
+            )
 
 
 class TestCoupler(unittest.TestCase):
@@ -978,7 +1253,9 @@ class TestNestingMPMD(unittest.TestCase):
         mpiexec = shutil.which("mpiexec")
         if mpiexec is None:
             self.skipTest("no mpiexec")
-        case = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nesting_mpmd_case.py")
+        case = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "nesting_mpmd_case.py"
+        )
         env = dict(os.environ)
         for k in list(env):  # a fresh MPI launch, not this process's singleton
             if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
@@ -986,11 +1263,30 @@ class TestNestingMPMD(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out:
             py = sys.executable
             cmds = (
-                [mpiexec, "-n", "2", py, case, "mpmd", "root", out, ":", "-n", "1", py, case, "mpmd", "child", out],
+                [
+                    mpiexec,
+                    "-n",
+                    "2",
+                    py,
+                    case,
+                    "mpmd",
+                    "root",
+                    out,
+                    ":",
+                    "-n",
+                    "1",
+                    py,
+                    case,
+                    "mpmd",
+                    "child",
+                    out,
+                ],
                 [mpiexec, "-n", "3", py, case, "single", "-", out],
             )
             for cmd in cmds:
-                r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+                r = subprocess.run(
+                    cmd, env=env, capture_output=True, text=True, timeout=600
+                )
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             for name in ("root", "child"):
                 a = np.load(os.path.join(out, f"mpmd_{name}.npy"))
@@ -999,12 +1295,11 @@ class TestNestingMPMD(unittest.TestCase):
                 self.assertTrue(np.array_equal(a, b, equal_nan=True), name)
 
 
-
 class TestNestingDecomposition(unittest.TestCase):
-    """The same nest with the root on 1 and on 4 processes (2 x 2) is bit-identical; the child's east and
-    north edges lie on the root's subdomain boundaries there (nesting_mpmd_case.LAYOUT_EDGE), where the
-    transports at the interface faces belong to another tile than the cells they correct (Plan.uv_of).
-    Starts mpiexec itself."""
+    """The same nest with the root on 1 and on 4 processes (2 x 2) is bit-identical; the
+    child's east and north edges lie on the root's subdomain boundaries there
+    (nesting_mpmd_case.LAYOUT_EDGE), where the transports at the interface faces belong
+    to another tile than the cells they correct (Plan.uv_of). Starts mpiexec itself."""
 
     def test_root_tiling(self):
         import os
@@ -1018,15 +1313,32 @@ class TestNestingDecomposition(unittest.TestCase):
         mpiexec = shutil.which("mpiexec")
         if mpiexec is None:
             self.skipTest("no mpiexec")
-        case = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nesting_mpmd_case.py")
+        case = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "nesting_mpmd_case.py"
+        )
         env = dict(os.environ)
         for k in list(env):  # a fresh MPI launch, not this process's singleton
             if k.startswith(("PMI_", "PMIX_", "OMPI_", "MPICH_", "HYDRA_")):
                 env.pop(k)
         with tempfile.TemporaryDirectory() as out:
             for n in (2, 5):
-                r = subprocess.run([mpiexec, "-n", str(n), sys.executable, case, "single", "-", out, "edge"], env=env,
-                                   capture_output=True, text=True, timeout=600)
+                r = subprocess.run(
+                    [
+                        mpiexec,
+                        "-n",
+                        str(n),
+                        sys.executable,
+                        case,
+                        "single",
+                        "-",
+                        out,
+                        "edge",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             for name in ("root", "child"):
                 a = np.load(os.path.join(out, f"single2_{name}.npy"))
@@ -1035,18 +1347,43 @@ class TestNestingDecomposition(unittest.TestCase):
                 self.assertTrue(np.array_equal(a, b, equal_nan=True), name)
 
     def test_plan_roles(self):
-        """Plan: with the root split at the child's east edge, the faces there are corrected by the eastern tile
-        and their transports set by the western one."""
+        """Plan: with the root split at the child's east edge, the faces there are
+        corrected by the eastern tile and their transports set by the western one."""
         from pygetm.nesting.plan import LevelTiling, Plan
         from pygetm.nesting.geometry import load_levels
 
-        spec = {"root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
-                "child": dict(parent="root", istart=10, istop=20, jstart=6, jstop=15, ratio=3)}
+        spec = {
+            "root": dict(nx=40, ny=30, lon0=0.0, lat0=0.0, dlon=1.0, dlat=1.0),
+            "child": dict(
+                parent="root", istart=10, istop=20, jstart=6, jstop=15, ratio=3
+            ),
+        }
         levels = load_levels(spec, root_band=0)
         root, child = levels
-        ptil = LevelTiling(dict(map=[[0, 1]], nx_sub=20, ny_sub=30, xoffset_global=0, yoffset_global=0, halo=2), 0, 0)
-        ctil = LevelTiling(dict(map=[[0]], nx_sub=child.nx + 2 * child.band, ny_sub=child.ny + 2 * child.band,
-                                xoffset_global=0, yoffset_global=0, halo=2), child.band, 2)
+        ptil = LevelTiling(
+            dict(
+                map=[[0, 1]],
+                nx_sub=20,
+                ny_sub=30,
+                xoffset_global=0,
+                yoffset_global=0,
+                halo=2,
+            ),
+            0,
+            0,
+        )
+        ctil = LevelTiling(
+            dict(
+                map=[[0]],
+                nx_sub=child.nx + 2 * child.band,
+                ny_sub=child.ny + 2 * child.band,
+                xoffset_global=0,
+                yoffset_global=0,
+                halo=2,
+            ),
+            child.band,
+            2,
+        )
         plan = Plan(child, ptil, ctil)
         wf = root.wfaces["child"]
         east = wf["inside"] & wf["is_x"] & (wf["out"][1] == 20)
@@ -1055,21 +1392,29 @@ class TestNestingDecomposition(unittest.TestCase):
         for p, other in ((0, 1), (1, 0)):
             f = plan.faces_of[p]
             e = east[f]
-            # tile 1 owns the cells east of the hole, tile 0 the U points of those faces (i = 19)
+            # tile 1 owns the cells east of the hole, tile 0 the U points of those faces
+            # (i = 19)
             self.assertEqual(int((e & plan.corr_of[p]).sum()), n_east if p == 1 else 0)
             self.assertEqual(int((e & plan.uv_of[p]).sum()), n_east if p == 0 else 0)
         # every inside face is corrected once and has its transport set once
         for role in (plan.corr_of, plan.uv_of):
             seen = np.concatenate([plan.faces_of[p][role[p]] for p in (0, 1)])
             inside = np.nonzero(wf["inside"])[0]
-            self.assertTrue(np.array_equal(np.sort(seen[np.isin(seen, inside)]), inside))
+            self.assertTrue(
+                np.array_equal(np.sort(seen[np.isin(seen, inside)]), inside)
+            )
 
 
-@unittest.skipUnless(__import__("os").environ.get("PYGETM_TEST_FABM"), "FABM tests on demand: PYGETM_TEST_FABM=1")
+@unittest.skipUnless(
+    __import__("os").environ.get("PYGETM_TEST_FABM"),
+    "FABM tests on demand: PYGETM_TEST_FABM=1",
+)
 class TestNestingFABM(unittest.TestCase):
-    """Two levels in 3D with FABM (nesting_fabm_case.py: npzd + benthic predator, a bottom state variable):
-    Nested3D exchanges FABM's pelagic state by default, nitrogen crosses the interface, and the total over
-    both levels is conserved. On demand only (PYGETM_TEST_FABM=1). Starts mpiexec itself."""
+    """Two levels in 3D with FABM (nesting_fabm_case.py: npzd + benthic predator, a
+    bottom state variable): Nested3D exchanges FABM's pelagic state by default, nitrogen
+    crosses the interface, and the total over both levels is conserved. On demand only
+    (PYGETM_TEST_FABM=1). Starts mpiexec itself.
+    """
 
     def test_fabm_conserved(self):
         import os
@@ -1092,20 +1437,40 @@ class TestNestingFABM(unittest.TestCase):
         env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
         py = sys.executable
         with tempfile.TemporaryDirectory() as out:
-            cmd = [mpiexec, "-n", "2", py, case, "root", out, ":", "-n", "1", py, case, "child", out]
-            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+            cmd = [
+                mpiexec,
+                "-n",
+                "2",
+                py,
+                case,
+                "root",
+                out,
+                ":",
+                "-n",
+                "1",
+                py,
+                case,
+                "child",
+                out,
+            ]
+            r = subprocess.run(
+                cmd, env=env, capture_output=True, text=True, timeout=900
+            )
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             a, b = (np.load(os.path.join(out, f"{n}.npz")) for n in ("root", "child"))
             for name in ("npzd_nut", "npzd_phy", "npzd_zoo", "npzd_det"):
                 self.assertIn(name, list(b["tracers"]))
             total = a["nitrogen"] + b["nitrogen"]
             child = b["nitrogen"]
-            self.assertGreater(abs(child[-1] - child[0]) / child[0], 1e-6)  # nitrogen crossed the interface
+            self.assertGreater(
+                abs(child[-1] - child[0]) / child[0], 1e-6
+            )  # nitrogen crossed the interface
             self.assertLess(np.abs(total - total[0]).max() / total[0], 1e-7)
 
 
 def _launch_3d(mode, out, *opts):
-    """nesting_3d_case.py: root on 2 processes, child on 1 (one mpiexec component per level)."""
+    """nesting_3d_case.py: root on 2 processes, child on 1 (one mpiexec component per
+    level)."""
     import os
     import shutil
     import subprocess
@@ -1119,8 +1484,26 @@ def _launch_3d(mode, out, *opts):
             env.pop(k)
     env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
     py = sys.executable
-    cmd = [shutil.which("mpiexec"), "-n", "2", py, case, mode, "root", out, *opts,
-           ":", "-n", "1", py, case, mode, "child", out, *opts]
+    cmd = [
+        shutil.which("mpiexec"),
+        "-n",
+        "2",
+        py,
+        case,
+        mode,
+        "root",
+        out,
+        *opts,
+        ":",
+        "-n",
+        "1",
+        py,
+        case,
+        mode,
+        "child",
+        out,
+        *opts,
+    ]
     return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
 
 
@@ -1134,11 +1517,12 @@ def _skip_unless_mpiexec(test):
 
 
 class TestNesting3D(unittest.TestCase):
-    """Two levels in 3D (nesting_3d_case.py: sigma layers 5 and 8, a temperature front across the child's west
-    interface, uniform salinity, a closed basin): heat crosses the interface and the heat over both levels is
-    conserved (with the limiter's deferred amounts; to the coupling's 1e-7, the sync follows the tracer step),
-    salinity stays uniform, with the PPM and PCM remaps, and with a child on its own 3D step (3D sub-stepping)
-    whose ring is extrapolated in time. Starts mpiexec itself."""
+    """Two levels in 3D (nesting_3d_case.py: sigma layers 5 and 8, a temperature front
+    across the child's west interface, uniform salinity, a closed basin): heat crosses
+    the interface and the heat over both levels is conserved (with the limiter's
+    deferred amounts; to the coupling's 1e-7, the sync follows the tracer step),
+    salinity stays uniform, with the PPM and PCM remaps, and with a child on its own 3D
+    step (3D sub-stepping) whose ring is extrapolated in time. Starts mpiexec itself."""
 
     def check(self, *opts, ratio_3d=1):
         import os
@@ -1148,12 +1532,22 @@ class TestNesting3D(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out:
             r = _launch_3d("run", out, *opts)
             self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-            a, b = (np.load(os.path.join(out, f"run_{n}.npz")) for n in ("root", "child"))
+            a, b = (
+                np.load(os.path.join(out, f"run_{n}.npz")) for n in ("root", "child")
+            )
             heat = a["heat"] + b["heat"]
-            self.assertGreater(abs(b["heat"][-1] - b["heat"][0]) / abs(b["heat"][0]), 1e-6)  # heat crossed
+            self.assertGreater(
+                abs(b["heat"][-1] - b["heat"][0]) / abs(b["heat"][0]), 1e-6
+            )  # heat crossed
             self.assertLess(np.abs(heat - heat[0]).max() / abs(heat[0]), 1e-7)
             for lev in (a, b):
-                self.assertLess(max(abs(lev["salt_min"].min() - 35.0), abs(lev["salt_max"].max() - 35.0)), 1e-10)
+                self.assertLess(
+                    max(
+                        abs(lev["salt_min"].min() - 35.0),
+                        abs(lev["salt_max"].max() - 35.0),
+                    ),
+                    1e-10,
+                )
             self.assertEqual(int(b["ratio_3d"]), ratio_3d)
             if ratio_3d > 1:
                 self.assertGreater(int(b["n_extrapolated"]), 0)
@@ -1169,10 +1563,11 @@ class TestNesting3D(unittest.TestCase):
 
 
 class TestNestingRestart3D(unittest.TestCase):
-    """The 3D nest of nesting_3d_case.py with the child on its own 3D step and its ring extrapolated in time,
-    restarted halfway, continues bit-identically on both levels (every state field, and the heat series): with a
-    smooth front (the flux limiter does not clip), and with a step in temperature at the interface (it clips, and
-    the restart file holds deferred amounts). Starts mpiexec itself."""
+    """The 3D nest of nesting_3d_case.py with the child on its own 3D step and its ring
+    extrapolated in time, restarted halfway, continues bit-identically on both levels
+    (every state field, and the heat series): with a smooth front (the flux limiter does
+    not clip), and with a step in temperature at the interface (it clips, and the
+    restart file holds deferred amounts). Starts mpiexec itself."""
 
     def test_restart(self):
         self.check("sub")
@@ -1184,9 +1579,15 @@ class TestNestingRestart3D(unittest.TestCase):
 
         out = self.check("sub", "sharp", keep=True)
         try:
-            self.assertGreater(int(np.load(os.path.join(out, "first_root.npz"))["n_clipped"]), 0)
+            self.assertGreater(
+                int(np.load(os.path.join(out, "first_root.npz"))["n_clipped"]), 0
+            )
             with netCDF4.Dataset(os.path.join(out, "first_root.nc")) as nc:
-                d = [np.ma.filled(nc[v][:], 0.0) for v in nc.variables if v.startswith("nest_flux_deferred")]
+                d = [
+                    np.ma.filled(nc[v][:], 0.0)
+                    for v in nc.variables
+                    if v.startswith("nest_flux_deferred")
+                ]
             self.assertTrue(d and max(float(np.abs(x).max()) for x in d) > 0.0)
         finally:
             import shutil
@@ -1204,20 +1605,30 @@ class TestNestingRestart3D(unittest.TestCase):
         try:
             for mode in ("full", "first", "second"):
                 r = _launch_3d(mode, out, *opts)
-                self.assertEqual(r.returncode, 0, mode + ": " + r.stdout[-3000:] + r.stderr[-3000:])
+                self.assertEqual(
+                    r.returncode, 0, mode + ": " + r.stdout[-3000:] + r.stderr[-3000:]
+                )
             for name in ("root", "child"):
-                with xr.open_dataset(os.path.join(out, f"full_{name}.nc")) as a, \
-                        xr.open_dataset(os.path.join(out, f"second_{name}.nc")) as b:
+                with xr.open_dataset(
+                    os.path.join(out, f"full_{name}.nc")
+                ) as a, xr.open_dataset(os.path.join(out, f"second_{name}.nc")) as b:
                     for v in ("temp", "salt", "nest_layout_id"):
                         self.assertIn(v, a)
                     for v in a.data_vars:
                         x, y = a[v].values, b[v].values
-                        # pyGETM writes NaN where nothing is computed after a restart, 0 in a continuous run
-                        same = (x == y) | (np.isnan(x) & np.isnan(y)) | (np.isnan(y) & (x == 0.0))
+                        # pyGETM writes NaN where nothing is computed after a restart, 0
+                        # in a continuous run
+                        same = (
+                            (x == y)
+                            | (np.isnan(x) & np.isnan(y))
+                            | (np.isnan(y) & (x == 0.0))
+                        )
                         self.assertTrue(same.all(), f"{name} {v}")
                 f = np.load(os.path.join(out, f"full_{name}.npz"))
                 s = np.load(os.path.join(out, f"second_{name}.npz"))
-                self.assertTrue(np.array_equal(f["heat"][-len(s["heat"]):], s["heat"]), name)
+                self.assertTrue(
+                    np.array_equal(f["heat"][-len(s["heat"]) :], s["heat"]), name
+                )
         finally:
             if not keep:
                 import shutil
@@ -1227,10 +1638,13 @@ class TestNestingRestart3D(unittest.TestCase):
 
 
 class TestNestingThreeLevels(unittest.TestCase):
-    """Root, child and grandchild in 2D (nesting_levels_case.py; 2 + 2 + 1 processes): the water volume over all
-    three levels is conserved to round-off and water reaches the grandchild, with the grandchild on the child's
-    interface with the root (its fluxes passed up through the child) and one root cell inside it (the root's rim
-    reaches into the child's hole); in both the child sends up after its grandchild. Starts mpiexec itself."""
+    """Root, child and grandchild in 2D (nesting_levels_case.py; 2 + 2 + 1 processes):
+    the water volume over all three levels is conserved to round-off and water reaches
+    the grandchild, with the grandchild on the child's interface with the root (its
+    fluxes passed up through the child) and one root cell inside it (the root's rim
+    reaches into the child's hole); in both the child sends up after its grandchild.
+    Starts mpiexec itself.
+    """
 
     def check(self, where):
         import os
@@ -1249,15 +1663,47 @@ class TestNestingThreeLevels(unittest.TestCase):
         env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
         py = sys.executable
         with tempfile.TemporaryDirectory() as out:
-            cmd = [shutil.which("mpiexec"), "-n", "2", py, case, "root", out, where, ":", "-n", "2", py, case, "child",
-                   out, where, ":", "-n", "1", py, case, "grand", out, where]
-            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+            cmd = [
+                shutil.which("mpiexec"),
+                "-n",
+                "2",
+                py,
+                case,
+                "root",
+                out,
+                where,
+                ":",
+                "-n",
+                "2",
+                py,
+                case,
+                "child",
+                out,
+                where,
+                ":",
+                "-n",
+                "1",
+                py,
+                case,
+                "grand",
+                out,
+                where,
+            ]
+            r = subprocess.run(
+                cmd, env=env, capture_output=True, text=True, timeout=900
+            )
             self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-            v = {n: np.load(os.path.join(out, f"{n}.npz")) for n in ("root", "child", "grand")}
+            v = {
+                n: np.load(os.path.join(out, f"{n}.npz"))
+                for n in ("root", "child", "grand")
+            }
             total = sum(x["volume"] for x in v.values())
             scale = max(np.abs(x["volume"]).max() for x in v.values())
             self.assertLess(np.abs(total - total[0]).max() / scale, 1e-12)
-            self.assertGreater(np.abs(v["grand"]["volume"] - v["grand"]["volume"][0]).max() / scale, 0.1)
+            self.assertGreater(
+                np.abs(v["grand"]["volume"] - v["grand"]["volume"][0]).max() / scale,
+                0.1,
+            )
             self.assertTrue(bool(v["child"]["up_after_children"]))
             self.assertFalse(bool(v["root"]["up_after_children"]))
 
@@ -1267,10 +1713,12 @@ class TestNestingThreeLevels(unittest.TestCase):
     def test_grandchild_near_interface(self):
         self.check("near")
 
+
 class TestNestingErrors(unittest.TestCase):
-    """A failing level stops the whole nested job instead of leaving the others waiting (nesting_error_case.py:
-    the child raises, asks for a level not in the layout, calls sys.exit(3) in the run, or runs 3D without
-    Nested3D); each within the time-out, with its message. Starts mpiexec itself."""
+    """A failing level stops the whole nested job instead of leaving the others waiting
+    (nesting_error_case.py: the child raises, asks for a level not in the layout, calls
+    sys.exit(3) in the run, or runs 3D without Nested3D); each within the time-out, with
+    its message. Starts mpiexec itself."""
 
     def check(self, what, message, status=None):
         import os
@@ -1287,7 +1735,22 @@ class TestNestingErrors(unittest.TestCase):
                 env.pop(k)
         env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
         py = sys.executable
-        cmd = [shutil.which("mpiexec"), "-n", "2", py, case, what, "root", ":", "-n", "1", py, case, what, "child"]
+        cmd = [
+            shutil.which("mpiexec"),
+            "-n",
+            "2",
+            py,
+            case,
+            what,
+            "root",
+            ":",
+            "-n",
+            "1",
+            py,
+            case,
+            what,
+            "child",
+        ]
         try:
             r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired:
@@ -1311,10 +1774,13 @@ class TestNestingErrors(unittest.TestCase):
     def test_couplers_differ(self):
         self.check("no3d", "differ in run type or nesting couplers")
 
+
 class TestNestingRemovedTiles(unittest.TestCase):
-    """A root whose tiling removes a subdomain (nesting_removed_case.py: 3 x 3 on 8 processes, the centre all in the
-    hole's interior) runs bit-identically to the root on 1 process (both levels; the root outside the removed
-    subdomain, which the gather fills), and conserves the volume over both levels. Starts mpiexec itself."""
+    """A root whose tiling removes a subdomain (nesting_removed_case.py: 3 x 3 on 8
+    processes, the centre all in the hole's interior) runs bit-identically to the root
+    on 1 process (both levels; the root outside the removed subdomain, which the gather
+    fills), and conserves the volume over both levels. Starts mpiexec itself.
+    """
 
     def test_removed_subdomain(self):
         import os
@@ -1334,8 +1800,25 @@ class TestNestingRemovedTiles(unittest.TestCase):
         py = sys.executable
         with tempfile.TemporaryDirectory() as out:
             for n in (1, 8):
-                cmd = [shutil.which("mpiexec"), "-n", str(n), py, case, "root", out, ":", "-n", "1", py, case, "child", out]
-                r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+                cmd = [
+                    shutil.which("mpiexec"),
+                    "-n",
+                    str(n),
+                    py,
+                    case,
+                    "root",
+                    out,
+                    ":",
+                    "-n",
+                    "1",
+                    py,
+                    case,
+                    "child",
+                    out,
+                ]
+                r = subprocess.run(
+                    cmd, env=env, capture_output=True, text=True, timeout=900
+                )
                 self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
             load = lambda lev, n: np.load(os.path.join(out, f"{lev}_{n}.npz"))
             self.assertEqual(int(load("root", 8)["removed"]), 1)
@@ -1344,15 +1827,24 @@ class TestNestingRemovedTiles(unittest.TestCase):
             kept = np.abs(b) < 1e10  # the removed subdomain: the gather's fill value
             self.assertEqual(int((~kept).sum()), 14 * 10)
             self.assertTrue(np.array_equal(a[kept], b[kept], equal_nan=True))
-            self.assertTrue(np.array_equal(load("child", 1)["z"], load("child", 8)["z"], equal_nan=True))
+            self.assertTrue(
+                np.array_equal(
+                    load("child", 1)["z"], load("child", 8)["z"], equal_nan=True
+                )
+            )
             v = load("root", 8)["volume"] + load("child", 8)["volume"]
-            self.assertLess(np.abs(v - v[0]).max() / np.abs(load("child", 8)["volume"]).max(), 1e-12)
+            self.assertLess(
+                np.abs(v - v[0]).max() / np.abs(load("child", 8)["volume"]).max(), 1e-12
+            )
+
 
 class TestNestingFeatures(unittest.TestCase):
-    """Two levels in 2D with the features that meet the nesting (nesting_features_case.py), the volume over both
-    levels conserved to round-off (or grown by exactly the rivers' inflow): a child whose window reaches the root's
-    edge (an outer side), rivers given to every level (each kept by one), a dam in each level, a sluice between the
-    levels, a bank in the child that falls dry. Starts mpiexec itself."""
+    """Two levels in 2D with the features that meet the nesting
+    (nesting_features_case.py), the volume over both levels conserved to round-off (or
+    grown by exactly the rivers' inflow): a child whose window reaches the root's edge
+    (an outer side), rivers given to every level (each kept by one), a dam in each
+    level, a sluice between the levels, a bank in the child that falls dry. Starts
+    mpiexec itself."""
 
     def run_case(self, what):
         import os
@@ -1371,11 +1863,31 @@ class TestNestingFeatures(unittest.TestCase):
         env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
         py = sys.executable
         with tempfile.TemporaryDirectory() as out:
-            cmd = [shutil.which("mpiexec"), "-n", "2", py, case, what, "root", out, ":", "-n", "1", py, case, what,
-                   "child", out]
-            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+            cmd = [
+                shutil.which("mpiexec"),
+                "-n",
+                "2",
+                py,
+                case,
+                what,
+                "root",
+                out,
+                ":",
+                "-n",
+                "1",
+                py,
+                case,
+                what,
+                "child",
+                out,
+            ]
+            r = subprocess.run(
+                cmd, env=env, capture_output=True, text=True, timeout=900
+            )
             self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
-            a, b = (dict(np.load(os.path.join(out, f"{n}.npz"))) for n in ("root", "child"))
+            a, b = (
+                dict(np.load(os.path.join(out, f"{n}.npz"))) for n in ("root", "child")
+            )
         V = a["volume"] + b["volume"]
         scale = max(np.abs(a["volume"]).max(), np.abs(b["volume"]).max())
         return a, b, V, scale
@@ -1391,7 +1903,9 @@ class TestNestingFeatures(unittest.TestCase):
 
     def test_rivers(self):
         a, b, V, scale = self.run_case("rivers")
-        self.assertEqual((int(a["rivers"]), int(b["rivers"])), (1, 1))  # each kept by one level
+        self.assertEqual(
+            (int(a["rivers"]), int(b["rivers"])), (1, 1)
+        )  # each kept by one level
         self.assertConserved(V, scale, inflow=100.0 * a["time"])  # 2 x 50 m3 s-1
 
     def test_dams(self):
@@ -1402,13 +1916,16 @@ class TestNestingFeatures(unittest.TestCase):
 
     def test_sluice(self):
         a, b, V, scale = self.run_case("sluice")
-        self.assertGreater(float(b["sluice_volume"]), 1e4)  # water went from the root to the child
+        self.assertGreater(
+            float(b["sluice_volume"]), 1e4
+        )  # water went from the root to the child
         self.assertConserved(V, scale)
 
     def test_drying(self):
         a, b, V, scale = self.run_case("drying")
         self.assertGreater(int(b["dry_seen"]), 0)
         self.assertConserved(V, scale)
+
 
 class TestNestingRestart(unittest.TestCase):
     """A nested 2D run (root on 2 processes, child with time ratio 3) restarted
@@ -1438,29 +1955,65 @@ class TestNestingRestart(unittest.TestCase):
         env["PYTHONPATH"] = here + os.pathsep + env.get("PYTHONPATH", "")
         py = sys.executable
         with tempfile.TemporaryDirectory() as out:
+
             def launch(mode):
-                cmd = [mpiexec, "-n", "2", py, case, mode, "root", out, ":", "-n", "1", py, case, mode, "child", out]
-                return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
+                cmd = [
+                    mpiexec,
+                    "-n",
+                    "2",
+                    py,
+                    case,
+                    mode,
+                    "root",
+                    out,
+                    ":",
+                    "-n",
+                    "1",
+                    py,
+                    case,
+                    mode,
+                    "child",
+                    out,
+                ]
+                return subprocess.run(
+                    cmd, env=env, capture_output=True, text=True, timeout=600
+                )
 
             for mode in ("full", "first", "second", "mid"):
                 r = launch(mode)
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             for name in ("root", "child"):
-                with xr.open_dataset(os.path.join(out, f"full_{name}.nc")) as a, \
-                        xr.open_dataset(os.path.join(out, f"second_{name}.nc")) as b:
+                with xr.open_dataset(
+                    os.path.join(out, f"full_{name}.nc")
+                ) as a, xr.open_dataset(os.path.join(out, f"second_{name}.nc")) as b:
                     self.assertIn("nest_root_phase", a)
                     for v in a.data_vars:
                         x, y = a[v].values, b[v].values
-                        # pyGETM writes NaN on land after a restart, 0 in a continuous run
-                        same = (x == y) | (np.isnan(x) & np.isnan(y)) | (np.isnan(y) & (x == 0.0))
+                        # pyGETM writes NaN on land after a restart, 0 in a continuous
+                        # run
+                        same = (
+                            (x == y)
+                            | (np.isnan(x) & np.isnan(y))
+                            | (np.isnan(y) & (x == 0.0))
+                        )
                         self.assertTrue(same.all(), f"{name} {v}")
             r = launch("from_mid")
             self.assertNotEqual(r.returncode, 0)
-            self.assertIn("middle of a root 3D step (child: 2 of 3 steps)", r.stdout + r.stderr)
-            r = subprocess.run([mpiexec, "-n", "2", py, case, "alone", "root", out], env=env, capture_output=True, text=True,
-                               timeout=600)
+            self.assertIn(
+                "middle of a root 3D step (child: 2 of 3 steps)", r.stdout + r.stderr
+            )
+            r = subprocess.run(
+                [mpiexec, "-n", "2", py, case, "alone", "root", out],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
             self.assertNotEqual(r.returncode, 0)
-            self.assertIn("restart file(s) of root written with another set of levels", r.stdout + r.stderr)
+            self.assertIn(
+                "restart file(s) of root written with another set of levels",
+                r.stdout + r.stderr,
+            )
             with xr.open_dataset(os.path.join(out, "full_root.nc")) as a:
                 self.assertIn("nest_layout_id", a)
 

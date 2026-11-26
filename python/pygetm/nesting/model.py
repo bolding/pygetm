@@ -46,13 +46,27 @@ def _load_config(layout) -> Dict[str, Any]:
 class NestedModel:
     """This process's model in an MPMD nesting run (see module docs)."""
 
-    def __init__(self, layout, name: str, comm: Optional[MPI.Comm] = None, halo: int = 2,
-                 root_band: Optional[int] = 0, abort_on_error: bool = True):
-        if abort_on_error:  # first: an error below (a bad layout, a level name) must not leave the others waiting
+    def __init__(
+        self,
+        layout,
+        name: str,
+        comm: Optional[MPI.Comm] = None,
+        halo: int = 2,
+        root_band: Optional[int] = 0,
+        abort_on_error: bool = True,
+    ):
+        if (
+            abort_on_error
+            # first: an error below (a bad layout, a level name) must not leave
+            # the others waiting
+        ):
             install_abort_hook(comm if comm is not None else MPI.COMM_WORLD, name)
         self.config = _load_config(layout)
         if name not in self.config:
-            raise ValueError(f"level {name!r} is not in the layout ({[k for k in self.config if k != 'config']})")
+            raise ValueError(
+                f"level {name!r} is not in the layout "
+                f"({[k for k in self.config if k != 'config']})"
+            )
         self.halo, self.root_band = halo, root_band
         self.context = split_mpmd(name, comm)
         self.name = name
@@ -63,9 +77,13 @@ class NestedModel:
         specs = {k: v for k, v in self.config.items() if k != "config"}
         absent = [k for k in specs if k not in self.context.sizes]
         if absent:
-            raise ValueError(f"level(s) {absent} of the layout have no mpiexec component")
+            raise ValueError(
+                f"level(s) {absent} of the layout have no mpiexec component"
+            )
         # geometry only (active regions need the wet masks of share_depth)
-        self.levels = load_levels(self.config, halo=halo, root_band=root_band, active=False)
+        self.levels = load_levels(
+            self.config, halo=halo, root_band=root_band, active=False
+        )
         self._run: Optional[NestingRun] = None
         self.changes: Dict[str, dict] = {}
         self.violations: Dict[str, dict] = {}
@@ -77,7 +95,9 @@ class NestedModel:
         """This model's level (after :meth:`share_depth`: with its active region)."""
         return next(l for l in self.levels if l.name == self.name)
 
-    def share_depth(self, H: np.ndarray, active_wet: Optional[np.ndarray] = None) -> np.ndarray:
+    def share_depth(
+        self, H: np.ndarray, active_wet: Optional[np.ndarray] = None
+    ) -> np.ndarray:
         """Collective. ``H``: this level's depth on its extended grid (window
         plus band; NaN or masked = land), the same on all processes of the
         level. ``active_wet``: the wet mask the active regions are computed
@@ -89,7 +109,10 @@ class NestedModel:
         H_dom = None
         if me.has_overhang:  # the whole domain was given: the nesting works on the view
             if H.shape != me.domain_shape:
-                raise ValueError(f"{self.name}: depth has shape {H.shape}, expected the domain's {me.domain_shape}")
+                raise ValueError(
+                    f"{self.name}: depth has shape {H.shape}, expected the domain's "
+                    f"{me.domain_shape}"
+                )
             H_dom, H = H, me.to_view(H).copy()
             if active_wet is not None:
                 active_wet = me.to_view(np.asarray(active_wet))
@@ -100,32 +123,47 @@ class NestedModel:
         Hs = {n: h for n, h, _, _ in shared}
         wets = {n: w for n, _, w, _ in shared}
         actives = {n: a for n, _, _, a in shared}
-        self.levels = load_levels(self.config, halo=self.halo, root_band=self.root_band, wet=actives)
+        self.levels = load_levels(
+            self.config, halo=self.halo, root_band=self.root_band, wet=actives
+        )
         wets, Hs, self.changes = masks.make_consistent(self.levels, wets, Hs)
         self.violations = masks.check_consistent(self.levels, wets)
         # curvilinear levels: the refined parent grid where water crosses the interface
         masks.check_conforming(self.levels, wets)
-        # the layout keeps the interfaces out of water that floods and dries (masks.interface_depths)
-        lims = {l.name: masks.interface_min_depth(self.config, l.name) for l in self.levels}
+        # the layout keeps the interfaces out of water that floods and dries
+        # (masks.interface_depths)
+        lims = {
+            l.name: masks.interface_min_depth(self.config, l.name) for l in self.levels
+        }
         self.interface_depths = masks.interface_depths(self.levels, wets, Hs, lims)
         for n, d in self.interface_depths.items():
-            self.violations.setdefault(n, {})["interface_shallow"] = d["interface_shallow"]
+            self.violations.setdefault(n, {})["interface_shallow"] = d[
+                "interface_shallow"
+            ]
         mine_iface = self.interface_depths.get(self.name)
         if mine_iface and mine_iface["interface_shallow"] and self.comm.rank == 0:
-            warnings.warn(f"{self.name}: {mine_iface['interface_shallow']} interface cells shallower than "
-                          f"interface_min_depth {mine_iface['interface_min_depth']} m (least: ring "
-                          f"{mine_iface['min_depth_ring']:.2f} m, parent {mine_iface['min_depth_parent']:.2f} m): "
-                          f"the interface may fall dry", stacklevel=2)
+            warnings.warn(
+                f"{self.name}: {mine_iface['interface_shallow']} interface cells "
+                "shallower than "
+                f"interface_min_depth {mine_iface['interface_min_depth']} m (least: "
+                "ring "
+                f"{mine_iface['min_depth_ring']:.2f} m, parent "
+                f"{mine_iface['min_depth_parent']:.2f} m): "
+                f"the interface may fall dry",
+                stacklevel=2,
+            )
         self.wet = wets
         mine_H = np.where(wets[self.name], Hs[self.name], np.nan)
         if H_dom is not None:
             out = H_dom.copy()
             oj, oi = me.view_offset
             ny, nx = me.extended_shape
-            # the view's ring and window from the consistency; its overhang-side band and
-            # the overhang as given
+            # the view's ring and window from the consistency; its overhang-side band
+            # and the overhang as given
             keep = me._overhang_band()
-            out[oj : oj + ny, oi : oi + nx] = np.where(keep, out[oj : oj + ny, oi : oi + nx], mine_H)
+            out[oj : oj + ny, oi : oi + nx] = np.where(
+                keep, out[oj : oj + ny, oi : oi + nx], mine_H
+            )
             masks.check_overhang(me, np.isfinite(out), wets)
             return out
         return mine_H
@@ -154,7 +192,9 @@ class NestedModel:
     def run(self) -> NestingRun:
         """The :class:`NestingRun` of this model (after :meth:`share_depth`)."""
         if self._run is None:
-            self._run = NestingRun(self.levels, context=self.context, abort_on_error=False)
+            self._run = NestingRun(
+                self.levels, context=self.context, abort_on_error=False
+            )
         return self._run
 
 
@@ -167,7 +207,9 @@ def _lcm(values) -> int:
     return out
 
 
-def simple_root_step(dt_max: float, steps_per_root, period: Optional[float] = 3600.0) -> float:
+def simple_root_step(
+    dt_max: float, steps_per_root, period: Optional[float] = 3600.0
+) -> float:
     """The root step for :meth:`NestedModel.timestep`: the largest ``period / n``
     (n whole) not above ``dt_max`` for which every level's step (root step / its
     steps per root step) is a whole number of microseconds; with ``period``
@@ -179,7 +221,9 @@ def simple_root_step(dt_max: float, steps_per_root, period: Optional[float] = 36
     if period is None:
         us = int(math.floor(dt_max * 1e6 / lcm)) * lcm
         if us <= 0:
-            raise ValueError(f"time step {dt_max} s too small for whole microseconds on all levels")
+            raise ValueError(
+                f"time step {dt_max} s too small for whole microseconds on all levels"
+            )
         return us / 1e6
     P = int(round(float(period) * 1e6))  # microseconds
     n = max(1, int(math.ceil(P / (dt_max * 1e6) - 1e-9)))
@@ -187,12 +231,18 @@ def simple_root_step(dt_max: float, steps_per_root, period: Optional[float] = 36
         if P % n == 0 and (P // n) % lcm == 0:
             return (P // n) / 1e6
         n += 1
-    raise ValueError(f"no simple time step up to {dt_max} s for period {period} s and steps per root step {steps_per_root}")
+    raise ValueError(
+        f"no simple time step up to {dt_max} s for period {period} s and steps per "
+        f"root step {steps_per_root}"
+    )
 
 
 def level_step(dt_root: float, steps_per_root: int) -> float:
     """A level's step from the root step (whole microseconds when the root step
     is a multiple of steps_per_root microseconds)."""
     us = int(round(dt_root * 1e6))
-    return (us // int(steps_per_root)) / 1e6 if us % int(steps_per_root) == 0 else dt_root / steps_per_root
-
+    return (
+        (us // int(steps_per_root)) / 1e6
+        if us % int(steps_per_root) == 0
+        else dt_root / steps_per_root
+    )

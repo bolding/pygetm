@@ -3,6 +3,7 @@
 the tile, its tiling, the plans with the parent and the children, local indices,
 the ring this tile receives, its edge faces, and the receive of the children's
 sub-face messages."""
+
 from typing import Callable, List, Tuple
 
 import numpy as np
@@ -27,7 +28,8 @@ class Endpoint:
         self.rj = self.ri = np.zeros(0, dtype=int)
         if self.up is not None:
             self.ring = self.up.ring_to(self.t)
-            #: the ring cells: parent cell (a, b: sub-cell position in it) and child cell (bj, bi)
+            #: the ring cells: parent cell (a, b: sub-cell position in it) and child
+            #: cell (bj, bi)
             self.ring_cells = self.up.ring_cells(self.t)
             self.rj, self.ri = self.loc(self.ring_cells["bj"], self.ring_cells["bi"])
 
@@ -35,7 +37,9 @@ class Endpoint:
         """Local (with halos) indices of global cells of this level on this tile."""
         return self.til.local(self.t, j, i)
 
-    def recv_subfaces(self, plan: Plan, rows: int, tag: Tag, recv: Callable) -> np.ndarray:
+    def recv_subfaces(
+        self, plan: Plan, rows: int, tag: Tag, recv: Callable
+    ) -> np.ndarray:
         """The children's messages about this tile's interface faces with child ``plan``
         (:attr:`Plan.faces_of`): every child tile sends ``rows`` values per sub-face it
         computes; returns them as (rows, faces, r sub-faces), 0 where none came.

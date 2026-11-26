@@ -16,8 +16,12 @@ def test_remap_conserves_and_is_monotone():
     hs, hd = columns(200, 30, D), columns(200, 17, D)
     c = rng.normal(size=(200, 30))
     cd = vr.remap(hs, c, hd)
-    np.testing.assert_allclose((cd * hd).sum(-1), (c * hs).sum(-1), rtol=1e-12, atol=1e-12)
-    assert (cd.max(-1) <= c.max(-1) + 1e-12).all() and (cd.min(-1) >= c.min(-1) - 1e-12).all()
+    np.testing.assert_allclose(
+        (cd * hd).sum(-1), (c * hs).sum(-1), rtol=1e-12, atol=1e-12
+    )
+    assert (cd.max(-1) <= c.max(-1) + 1e-12).all() and (
+        cd.min(-1) >= c.min(-1) - 1e-12
+    ).all()
 
 
 def test_remap_identity_and_uniform():
@@ -45,14 +49,18 @@ def test_ppm_conserves_and_is_monotone():
     hd *= (h.sum(-1) / hd.sum(-1))[:, None]
     out = vr.remap(h, c, hd, "ppm")
     assert np.abs((out * hd).sum(-1) - (c * h).sum(-1)).max() < 1e-12
-    assert (out.max(-1) - c.max(-1)).max() < 1e-12 and (c.min(-1) - out.min(-1)).max() < 1e-12
+    assert (out.max(-1) - c.max(-1)).max() < 1e-12 and (
+        c.min(-1) - out.min(-1)
+    ).max() < 1e-12
     assert np.abs(vr.remap(h, np.full_like(c, 4.2), hd, "ppm") - 4.2).max() < 1e-12
 
 
 def test_ppm_more_accurate_than_pcm():
     """Layer means of a thin pycnocline (tanh) from 10 onto 20 layers in 35 m."""
     lnc = lambda x: np.abs(x) + np.log1p(np.exp(-2 * np.abs(x))) - np.log(2)
-    means = lambda z: 12 - 3 * np.diff(3 * lnc((z - 15) / 3), axis=-1) / np.diff(z, axis=-1)
+    means = lambda z: 12 - 3 * np.diff(3 * lnc((z - 15) / 3), axis=-1) / np.diff(
+        z, axis=-1
+    )
     hs, hd = np.full((1, 10), 3.5), np.full((1, 20), 1.75)
     ref = means(vr.interfaces(hd))
     e_pcm = np.abs(vr.remap(hs, means(vr.interfaces(hs)), hd, "pcm") - ref).max()
@@ -75,9 +83,11 @@ def test_compiled_kernel_matches_numpy(scheme):
     zs = vr.interfaces(hs)
     hd = rng.uniform(0.1, 2.0, (n, nd))
     zd = vr.interfaces(hd) * (zs[:, -1] / vr.interfaces(hd)[:, -1])[:, None]
-    zd[:50] = zs[:50, :1] + np.linspace(0, 1, nd + 1)[None] * zs[:50, -1:] * 1.3  # beyond the source
+    zd[:50] = (
+        zs[:50, :1] + np.linspace(0, 1, nd + 1)[None] * zs[:50, -1:] * 1.3
+    )  # beyond the source
     zd[50:100, : ns + 1] = zs[50:100]  # coinciding interfaces
-    zd[50:100, ns + 1:] = zs[50:100, -1:]
+    zd[50:100, ns + 1 :] = zs[50:100, -1:]
     zd[50:100] = np.maximum.accumulate(zd[50:100], axis=1)
     c = rng.normal(size=(3, n, ns))
     ref = vr.apply(vr.prepare(zs, zd), c, hs, scheme)
@@ -117,9 +127,10 @@ def test_numpy_switch(monkeypatch):
 
 @pytest.mark.parametrize("compiled", [False, True])
 def test_ppm_linear_exact_in_second_layers(compiled, monkeypatch):
-    # a linear profile on uniform layers, the interfaces shifted by a fraction of a layer:
-    # with the edges next to the outermost layers from the two layer means, the parabola
-    # is exact in the second layers too (IDEAL V2: a pycnocline in the bottom layers)
+    # a linear profile on uniform layers, the interfaces shifted by a fraction of a
+    # layer: with the edges next to the outermost layers from the two layer means, the
+    # parabola is exact in the second layers too (IDEAL V2: a pycnocline in the bottom
+    # layers)
     if not compiled:
         monkeypatch.setenv("PYGETM_NESTING_REMAP", "numpy")
     nz, D = 15, 20.0
@@ -130,7 +141,8 @@ def test_ppm_linear_exact_in_second_layers(compiled, monkeypatch):
     zd[0], zd[-1] = 0.0, D
     out = vr.contents(zs[None], zd[None], c[None], hs, scheme="ppm")[0, 0] / np.diff(zd)
     exact = 1.0 + 0.3 * 0.5 * (zd[1:] + zd[:-1])
-    # target layers 1 .. nz-3 lie within source layers 1 .. nz-2 (not the outermost ones)
+    # target layers 1 .. nz-3 lie within source layers 1 .. nz-2 (not the outermost
+    # ones)
     np.testing.assert_allclose(out[1:-2], exact[1:-2], rtol=0, atol=1e-12)
 
 
@@ -138,42 +150,87 @@ def test_macro_ratios():
     """3D sub-stepping: a child's 3D step is its parent's divided by a whole number."""
     from pygetm.nesting.nested3d import macro_ratios
 
-    # the shared 3D step (split = parent's x time ratio), then the strait's own (a third)
-    shared = {"c": (None, 180.0, 10, 1), "s": ("c", 180.0, 10, 1), "t": ("s", 180.0, 30, 3)}
+    # the shared 3D step (split = parent's x time ratio), then the strait's own (a
+    # third)
+    shared = {
+        "c": (None, 180.0, 10, 1),
+        "s": ("c", 180.0, 10, 1),
+        "t": ("s", 180.0, 30, 3),
+    }
     assert macro_ratios(shared) == {"s": 1, "t": 1}
     own = {"c": (None, 180.0, 10, 1), "s": ("c", 180.0, 10, 1), "t": ("s", 60.0, 10, 3)}
     assert macro_ratios(own) == {"s": 1, "t": 3}
     # a chain: both levels sub-step
     chain = {"c": (None, 180.0, 10, 1), "s": ("c", 90.0, 5, 1), "t": ("s", 30.0, 5, 3)}
     assert macro_ratios(chain) == {"s": 2, "t": 3}
-    for bad in ({"c": (None, 180.0, 10, 1), "t": ("c", 72.0, 12, 3)},  # 30 / 12: no whole number
-                {"c": (None, 180.0, 10, 1), "t": ("c", 360.0, 60, 3)},  # longer than the parent's
-                {"c": (None, 180.0, 10, 1), "t": ("c", 50.0, 10, 3)}):  # time steps that do not fit
+    for bad in (
+        {
+            "c": (None, 180.0, 10, 1),
+            "t": ("c", 72.0, 12, 3),
+        },  # 30 / 12: no whole number
+        {
+            "c": (None, 180.0, 10, 1),
+            "t": ("c", 360.0, 60, 3),
+        },  # longer than the parent's
+        {"c": (None, 180.0, 10, 1), "t": ("c", 50.0, 10, 3)},
+    ):  # time steps that do not fit
         with pytest.raises(ValueError):
             macro_ratios(bad)
 
 
 def test_compiled_helpers_refuse_bad_arguments():
-    """Review F10: the compiled kernels index without bounds checks, so their wrappers refuse cells outside the
-    array (also negative ones, which numpy would wrap) and columns without layers."""
+    """Review F10: the compiled kernels index without bounds checks, so their wrappers
+    refuse cells outside the array (also negative ones, which numpy would wrap) and
+    columns without layers."""
     _pygetm = pytest.importorskip("pygetm._pygetm")
     arr = np.zeros((4, 5, 6))
     out = np.zeros((2, 4))
-    for jj, ii in (([0, 5], [0, 0]), ([0, 0], [0, 6]), ([-1, 0], [0, 0]), ([0, 0], [0, -1])):
+    for jj, ii in (
+        ([0, 5], [0, 0]),
+        ([0, 0], [0, 6]),
+        ([-1, 0], [0, 0]),
+        ([0, 0], [0, -1]),
+    ):
         jj, ii = np.array(jj, dtype=np.intc), np.array(ii, dtype=np.intc)
         with pytest.raises(ValueError, match="outside the array"):
             _pygetm.gather_columns(arr, jj, ii, out)
         with pytest.raises(ValueError, match="outside the array"):
             _pygetm.scatter_columns(arr, jj, ii, out)
-    _pygetm.gather_columns(arr, np.array([0, 4], dtype=np.intc), np.array([0, 5], dtype=np.intc), out)  # the corners
+    _pygetm.gather_columns(
+        arr, np.array([0, 4], dtype=np.intc), np.array([0, 5], dtype=np.intc), out
+    )  # the corners
     n, nt = 3, 2
-    with pytest.raises(ValueError, match="layers"):  # no source layer: interfaces (n, 1)
-        _pygetm.vertical_remap(np.zeros((n, 1)), np.zeros((n, 3)), np.zeros((n, 0)), np.zeros((nt, n, 0)),
-                               np.zeros((nt, n, 2)))
+    with pytest.raises(
+        ValueError, match="layers"
+    ):  # no source layer: interfaces (n, 1)
+        _pygetm.vertical_remap(
+            np.zeros((n, 1)),
+            np.zeros((n, 3)),
+            np.zeros((n, 0)),
+            np.zeros((nt, n, 0)),
+            np.zeros((nt, n, 2)),
+        )
     with pytest.raises(ValueError, match="layers"):  # no target layer
-        _pygetm.vertical_remap(np.zeros((n, 3)), np.zeros((n, 1)), np.ones((n, 2)), np.zeros((nt, n, 2)),
-                               np.zeros((nt, n, 0)))
+        _pygetm.vertical_remap(
+            np.zeros((n, 3)),
+            np.zeros((n, 1)),
+            np.ones((n, 2)),
+            np.zeros((nt, n, 2)),
+            np.zeros((nt, n, 0)),
+        )
     with pytest.raises(ValueError, match="layers"):
-        _pygetm.remap_z(np.zeros((n, 0)), np.ones((n, 2)), np.ones(n), np.zeros((nt, n, 0)), np.zeros((nt, n, 2)))
+        _pygetm.remap_z(
+            np.zeros((n, 0)),
+            np.ones((n, 2)),
+            np.ones(n),
+            np.zeros((nt, n, 0)),
+            np.zeros((nt, n, 2)),
+        )
     with pytest.raises(ValueError, match="layers"):
-        _pygetm.remap_z(np.ones((n, 2)), np.zeros((n, 0)), np.ones(n), np.zeros((nt, n, 2)), np.zeros((nt, n, 0)))
+        _pygetm.remap_z(
+            np.ones((n, 2)),
+            np.zeros((n, 0)),
+            np.ones(n),
+            np.zeros((nt, n, 2)),
+            np.zeros((nt, n, 0)),
+        )

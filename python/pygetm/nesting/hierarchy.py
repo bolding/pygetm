@@ -59,14 +59,13 @@ def split_world(
 
     names = list(ranks)
     color = next(
-        i for i, name in enumerate(names)
+        i
+        for i, name in enumerate(names)
         if offsets[name] <= comm.rank < offsets[name] + ranks[name]
     )
     domain_comm = parallel.mpi4py_autofree(comm.Split(color, comm.rank))
     nesting_comm = parallel.mpi4py_autofree(comm.Dup())
-    return NestingContext(
-        names[color], domain_comm, nesting_comm, offsets, dict(ranks)
-    )
+    return NestingContext(names[color], domain_comm, nesting_comm, offsets, dict(ranks))
 
 
 def mpmd_blocks(entries) -> dict:
@@ -84,14 +83,18 @@ def mpmd_blocks(entries) -> dict:
     app_name: dict = {}
     for rank, (name, app) in enumerate(entries):
         if app_name.setdefault(app, name) != name:
-            raise ValueError(f"MPMD component {app} runs domains {app_name[app]!r} and {name!r}")
+            raise ValueError(
+                f"MPMD component {app} runs domains {app_name[app]!r} and {name!r}"
+            )
         if name not in blocks:
             blocks[name] = [rank, 0, app]
         offset, size, app0 = blocks[name]
         if app != app0:
             raise ValueError(f"domain {name!r} is in MPMD components {app0} and {app}")
         if rank != offset + size:
-            raise ValueError(f"ranks of domain {name!r} are not contiguous (rank {rank})")
+            raise ValueError(
+                f"ranks of domain {name!r} are not contiguous (rank {rank})"
+            )
         blocks[name][1] += 1
     return {name: (b[0], b[1]) for name, b in blocks.items()}
 
@@ -118,6 +121,8 @@ def split_mpmd(name: str, comm: Optional[MPI.Comm] = None) -> NestingContext:
     blocks = mpmd_blocks(comm.allgather((name, -1 if app is None else int(app))))
     offsets = {n: b[0] for n, b in blocks.items()}
     sizes = {n: b[1] for n, b in blocks.items()}
-    domain_comm = parallel.mpi4py_autofree(comm.Split(list(blocks).index(name), comm.rank))
+    domain_comm = parallel.mpi4py_autofree(
+        comm.Split(list(blocks).index(name), comm.rank)
+    )
     nesting_comm = parallel.mpi4py_autofree(comm.Dup())
     return NestingContext(name, domain_comm, nesting_comm, offsets, sizes)

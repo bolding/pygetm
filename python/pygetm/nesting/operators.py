@@ -27,7 +27,9 @@ def minmod(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.where(a * b > 0.0, np.where(np.abs(a) < np.abs(b), a, b), 0.0)
 
 
-def limited_slopes(c: np.ndarray, wet: "np.ndarray | None" = None) -> "tuple[np.ndarray, np.ndarray]":
+def limited_slopes(
+    c: np.ndarray, wet: "np.ndarray | None" = None
+) -> "tuple[np.ndarray, np.ndarray]":
     """Minmod-limited slopes (per cell, in units of the cell) along x and y.
 
     Cells on the outermost row/column of ``c`` get slope 0. With a ``wet``
@@ -53,7 +55,9 @@ def limited_slopes(c: np.ndarray, wet: "np.ndarray | None" = None) -> "tuple[np.
     return sx, sy
 
 
-def limited_slopes_at(c: np.ndarray, wet: "np.ndarray | None", j, i) -> "tuple[np.ndarray, np.ndarray]":
+def limited_slopes_at(
+    c: np.ndarray, wet: "np.ndarray | None", j, i
+) -> "tuple[np.ndarray, np.ndarray]":
     """:func:`limited_slopes` at the cells (j, i) only, with the same
     arithmetic (identical values), for the few cells a parent sends."""
     j, i = np.asarray(j), np.asarray(i)
@@ -129,5 +133,6 @@ __all__ = [
 
 
 def interp_time(s0, s1, a):
-    """Linear in time between two snapshots: s0 at a = 0, s1 at a = 1 (a > 1 extrapolates)."""
+    """Linear in time between two snapshots: s0 at a = 0, s1 at a = 1 (a > 1
+    extrapolates)."""
     return (1.0 - a) * s0 + a * s1

@@ -31,7 +31,9 @@ class TestRiverIn(unittest.TestCase):
 
     def test_inside_and_hole(self):
         self.assertTrue(_river_in(self.dom, river(500.0, 500.0), self.computed))
-        self.assertFalse(_river_in(self.dom, river(2500.0, 1500.0), self.computed))  # in the hole
+        self.assertFalse(
+            _river_in(self.dom, river(2500.0, 1500.0), self.computed)
+        )  # in the hole
 
     def test_edge_between_a_hole_and_a_computed_cell(self):
         # on the edge between the hole cell and its computed neighbour: this level's
@@ -41,9 +43,15 @@ class TestRiverIn(unittest.TestCase):
         self.assertFalse(_river_in(self.dom, river(9000.0, 500.0), self.computed))
 
     def test_by_index(self):
-        self.assertTrue(_river_in(self.dom, river(0, 0, CoordinateType.IJ), self.computed))
-        self.assertFalse(_river_in(self.dom, river(2, 1, CoordinateType.IJ), self.computed))
-        self.assertFalse(_river_in(self.dom, river(9, 1, CoordinateType.IJ), self.computed))
+        self.assertTrue(
+            _river_in(self.dom, river(0, 0, CoordinateType.IJ), self.computed)
+        )
+        self.assertFalse(
+            _river_in(self.dom, river(2, 1, CoordinateType.IJ), self.computed)
+        )
+        self.assertFalse(
+            _river_in(self.dom, river(9, 1, CoordinateType.IJ), self.computed)
+        )
 
 
 if __name__ == "__main__":

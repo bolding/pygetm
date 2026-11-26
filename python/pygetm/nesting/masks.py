@@ -40,13 +40,18 @@ import numpy as np
 from .geometry import Level
 
 
-def make_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict[str, np.ndarray]):
+def make_consistent(
+    levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict[str, np.ndarray]
+):
     """Child-led consistency of wet masks and depths (levels parents first).
     Returns new (wet, H) and, per level, the number of cells changed."""
     levels = list(levels)
     wet = {k: v.copy() for k, v in wet.items()}
     H = {k: np.where(wet[k], v, np.nan) for k, v in H.items()}
-    changes = {l.name: {"hole_wetted": 0, "hole_dried": 0, "band_dried": 0, "unused_dried": 0} for l in levels}
+    changes = {
+        l.name: {"hole_wetted": 0, "hole_dried": 0, "band_dried": 0, "unused_dried": 0}
+        for l in levels
+    }
 
     for lev in reversed(levels):
         if lev.parent is None:
@@ -66,8 +71,12 @@ def make_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict
             # there the parent keeps its own land (it must be land: check_conforming)
             act = act & conforming_parent_cells(lev, wet[lev.name])
             if (wet[p.name][sl] & lev.active & ~act).any():
-                raise ValueError(f"{lev.name}: {p.name} has water in the window beyond the conforming band "
-                                 f"({int((wet[p.name][sl] & lev.active & ~act).sum())} cells): it must be land there")
+                raise ValueError(
+                    f"{lev.name}: {p.name} has water in the window beyond the "
+                    "conforming band "
+                    f"({int((wet[p.name][sl] & lev.active & ~act).sum())} cells): it "
+                    "must be land there"
+                )
         before = wet[p.name][sl].copy()
         changes[p.name]["hole_wetted"] += int((act & anywet & ~before).sum())
         changes[p.name]["hole_dried"] += int((act & ~anywet & before).sum())
@@ -95,7 +104,9 @@ def make_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict
     return wet, H, changes
 
 
-def _open_without_subfaces(lev: Level, c: Level, wet: Dict[str, np.ndarray]) -> np.ndarray:
+def _open_without_subfaces(
+    lev: Level, c: Level, wet: Dict[str, np.ndarray]
+) -> np.ndarray:
     """Per interface face of child ``c`` in ``lev`` (``lev.wfaces[c.name]``):
     open in ``lev`` (both cells wet, the outside one computed by ``lev``)
     while all r sub-faces of the child are closed."""
@@ -127,32 +138,37 @@ def closed_faces(lev: Level, wet: Dict[str, np.ndarray]) -> Dict[str, np.ndarray
         is_x.append(f["is_x"][bad])
         fj.append(f["face"][0][bad])
         fi.append(f["face"][1][bad])
-    return dict(is_x=np.concatenate(is_x), face=(np.concatenate(fj), np.concatenate(fi)))
+    return dict(
+        is_x=np.concatenate(is_x), face=(np.concatenate(fj), np.concatenate(fi))
+    )
 
 
 def close_faces(lev: Level, domain) -> None:
     """Close :attr:`Level.closed_faces` in ``domain`` (the level's domain
     including its band; its supergrid mask, before the grids are built)."""
     cf = getattr(lev, "closed_faces", None)
-    # domain.mask raises on processes other than the domain's rank 0 (no global mask there)
+    # domain.mask raises on processes other than the domain's rank 0 (no global mask
+    # there)
     if cf is None or cf["is_x"].size == 0 or getattr(domain, "_mask", None) is None:
         return
     h = lev.band
     fj, fi = cf["face"][0] + h, cf["face"][1] + h
     x = cf["is_x"]
-    # supergrid: T (j, i) at (2j + 1, 2i + 1); U east of it at (2j + 1, 2i + 2), V north at (2j + 2, 2i + 1)
+    # supergrid: T (j, i) at (2j + 1, 2i + 1); U east of it at (2j + 1, 2i + 2), V north
+    # at (2j + 2, 2i + 1)
     domain.mask[2 * fj[x] + 1, 2 * fi[x] + 2] = 0
     domain.mask[2 * fj[~x] + 2, 2 * fi[~x] + 1] = 0
 
 
 def check_dams(lev: Level, domain) -> None:
     """Dams (:mod:`pygetm.dams`: faces closed between two wet cells) must stay off the
-    level's interface: a closed face between a computed and a coupled cell raises
-    (the parent's and the child's fluxes there would differ). Faces between two
-    coupled cells (the child's band, the parent's hole) are reopened, and the
-    corners among them: the level that computes those cells has the dam itself.
-    Call before :func:`close_faces` (which closes interface faces by rule 3).
-    The global mask lives on the domain's rank 0 only (an error there aborts all levels)."""
+    level's interface: a closed face between a computed and a coupled cell raises (the
+    parent's and the child's fluxes there would differ). Faces between two coupled cells
+    (the child's band, the parent's hole) are reopened, and the corners among them: the
+    level that computes those cells has the dam itself. Call before :func:`close_faces`
+    (which closes interface faces by rule 3). The global mask lives on the domain's rank
+    0 only (an error there aborts all levels).
+    """
     if domain.comm.rank != 0 or domain._mask is None:
         return
     m = domain.mask
@@ -166,8 +182,12 @@ def check_dams(lev: Level, domain) -> None:
         bad = dam & (ea != eb)
         if bad.any():
             j, i = np.argwhere(bad)[0]
-            raise ValueError(f"{lev.name}: a dam closes {int(bad.sum())} {name} face(s) on the level's interface"
-                             f" (first between domain cells (j {j}, i {i}) and the next); move it off the interface")
+            raise ValueError(
+                f"{lev.name}: a dam closes {int(bad.sum())} {name} face(s) on the "
+                "level's interface"
+                f" (first between domain cells (j {j}, i {i}) and the next); move it "
+                "off the interface"
+            )
         um[dam & ea & eb] = 1
     xm = m[2:-1:2, 2:-1:2]  # inner corners
     t4 = tw[:-1, :-1] & tw[:-1, 1:] & tw[1:, :-1] & tw[1:, 1:]
@@ -190,9 +210,15 @@ def check_consistent(levels: Iterable[Level], wet: Dict[str, np.ndarray]):
         out[lev.name] = {
             "hole_mismatch": int((lev.active & (hole != cw.any(axis=(1, 3)))).sum()),
             "unused_wet": int((lev.unused() & wet[lev.name]).sum()),
-            "band_wet_over_dry_parent": int((wet[lev.name][bj + h, bi + h] & ~wet[p.name][pj + p.band, pi + p.band]).sum()),
+            "band_wet_over_dry_parent": int(
+                (
+                    wet[lev.name][bj + h, bi + h]
+                    & ~wet[p.name][pj + p.band, pi + p.band]
+                ).sum()
+            ),
             # open in the parent with all sub-faces closed and not closed by rule 3
-            "face_open_over_closed": int(_open_without_subfaces(p, lev, wet).sum()) - _n_closed(p, lev, wet),
+            "face_open_over_closed": int(_open_without_subfaces(p, lev, wet).sum())
+            - _n_closed(p, lev, wet),
         }
     return out
 
@@ -205,19 +231,28 @@ def _n_closed(p: Level, c: Level, wet: Dict[str, np.ndarray]) -> int:
     bad = _open_without_subfaces(p, c, wet)
     f = p.wfaces[c.name]
     have = set(zip(cf["is_x"].tolist(), cf["face"][0].tolist(), cf["face"][1].tolist()))
-    want = zip(f["is_x"][bad].tolist(), f["face"][0][bad].tolist(), f["face"][1][bad].tolist())
+    want = zip(
+        f["is_x"][bad].tolist(), f["face"][0][bad].tolist(), f["face"][1][bad].tolist()
+    )
     return sum(k in have for k in want)
 
 
 def interface_min_depth(config: dict, name: str) -> float:
     """``interface_min_depth`` of level ``name`` in a layout (its own key, else
     ``config:``; 0: not checked)."""
-    v = (config.get(name) or {}).get("interface_min_depth", (config.get("config") or {}).get("interface_min_depth", 0.0))
+    v = (config.get(name) or {}).get(
+        "interface_min_depth",
+        (config.get("config") or {}).get("interface_min_depth", 0.0),
+    )
     return float(v or 0.0)
 
 
-def interface_depths(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dict[str, np.ndarray],
-                     min_depth: Dict[str, float]) -> Dict[str, dict]:
+def interface_depths(
+    levels: Iterable[Level],
+    wet: Dict[str, np.ndarray],
+    H: Dict[str, np.ndarray],
+    min_depth: Dict[str, float],
+) -> Dict[str, dict]:
     """The water at every child's interface: per child level, the least depth
     (``H``, positive down, on the extended shapes) of its wet ring cells and
     of the wet parent cells they are filled from, and how many of each are
@@ -240,7 +275,9 @@ def interface_depths(levels: Iterable[Level], wet: Dict[str, np.ndarray], H: Dic
             "min_depth_ring": float(cd.min(initial=np.inf)),
             "min_depth_parent": float(pd.min(initial=np.inf)),
             "interface_min_depth": lim,
-            "interface_shallow": int((cd < lim).sum() + (pd < lim).sum()) if lim > 0.0 else 0,
+            "interface_shallow": (
+                int((cd < lim).sum() + (pd < lim).sum()) if lim > 0.0 else 0
+            ),
         }
     return out
 
@@ -256,14 +293,17 @@ def conforming_band(lev: Level, wet_level: np.ndarray) -> np.ndarray:
 
 
 def conforming_parent_cells(lev: Level, wet_level: np.ndarray) -> np.ndarray:
-    """Parent cells of the window (window shape) that hold cells of the conforming band."""
+    """Parent cells of the window (window shape) that hold cells of the conforming
+    band."""
     h, r = lev.band, lev.ratio
     i0, i1, j0, j1 = lev.window
     band = conforming_band(lev, wet_level)[h:-h, h:-h]
     return band.reshape(j1 - j0, r, i1 - i0, r).any(axis=(1, 3))
 
 
-def check_conforming(levels: Iterable[Level], wet: Dict[str, np.ndarray], tol: float = 1e-6) -> None:
+def check_conforming(
+    levels: Iterable[Level], wet: Dict[str, np.ndarray], tol: float = 1e-6
+) -> None:
     """Curvilinear levels (``grid``): raise unless
 
     1. the grid coincides with the parent's grid refined by the ratio (to ``tol``
@@ -282,7 +322,10 @@ def check_conforming(levels: Iterable[Level], wet: Dict[str, np.ndarray], tol: f
             continue
         p, r, h = lev.parent, lev.ratio, lev.band
         if p.grid is not None:
-            raise ValueError(f"{lev.name}: a curvilinear level in a curvilinear parent is not supported")
+            raise ValueError(
+                f"{lev.name}: a curvilinear level in a curvilinear parent is not "
+                "supported"
+            )
         w = wet[lev.name]
         if not (lev._ring_mask() & w).any():
             raise ValueError(f"{lev.name}: no water crosses the interface")
@@ -297,11 +340,16 @@ def check_conforming(levels: Iterable[Level], wet: Dict[str, np.ndarray], tol: f
         dev = np.maximum(np.abs(x - xr), np.abs(y - yr))[sb]
         cell = min(abs(lev.dlon), abs(lev.dlat))
         if np.nanmax(dev) > tol * cell:
-            raise ValueError(f"{lev.name}: the grid differs from the refined parent grid by up to {np.nanmax(dev):.3g} "
-                             f"(a cell is {cell:.3g}) in the band where water crosses the interface "
-                             f"({2 * r + h} cells around the wet ring cells): it must coincide there, or the parent "
-                             f"must be land there so that no water crosses the interface")
-        # 2. wet cells outside the band: the parent cell under each must be land or the hole
+            raise ValueError(
+                f"{lev.name}: the grid differs from the refined parent grid by up to "
+                f"{np.nanmax(dev):.3g} "
+                f"(a cell is {cell:.3g}) in the band where water crosses the interface "
+                f"({2 * r + h} cells around the wet ring cells): it must coincide "
+                "there, or the parent "
+                f"must be land there so that no water crosses the interface"
+            )
+        # 2. wet cells outside the band: the parent cell under each must be land or the
+        #    hole
         xc, yc = x[1::2, 1::2], y[1::2, 1::2]
         out = w & ~band
         if out.any():
@@ -309,15 +357,26 @@ def check_conforming(levels: Iterable[Level], wet: Dict[str, np.ndarray], tol: f
             pj = np.floor((yc[out] - p.lat0) / p.dlat).astype(int)
             inside = (pi >= 0) & (pi < p.nx) & (pj >= 0) & (pj < p.ny)
             pw = wet[p.name][pj[inside] + p.band, pi[inside] + p.band]
-            hole = p.hole[pj[inside], pi[inside]] if getattr(p, "hole", None) is not None else np.zeros(pw.shape, bool)
+            hole = (
+                p.hole[pj[inside], pi[inside]]
+                if getattr(p, "hole", None) is not None
+                else np.zeros(pw.shape, bool)
+            )
             twice = int((pw & ~hole).sum())
             if twice:
-                raise ValueError(f"{lev.name}: {twice} wet cells lie over water that {p.name} computes "
-                                 "(the parent must be land under the level outside its conforming band)")
-            # wet cells outside the parent's domain are allowed: nothing lies beneath them
+                raise ValueError(
+                    f"{lev.name}: {twice} wet cells lie over water that {p.name} "
+                    "computes "
+                    "(the parent must be land under the level outside its conforming "
+                    "band)"
+                )
+            # wet cells outside the parent's domain are allowed: nothing lies beneath
+            # them
 
 
-def check_overhang(lev: Level, wet_domain: np.ndarray, wet: Dict[str, np.ndarray]) -> None:
+def check_overhang(
+    lev: Level, wet_domain: np.ndarray, wet: Dict[str, np.ndarray]
+) -> None:
     """A level's overhang (``overhang``): raise if any of its wet cells lies over
     water its parent computes (outside the parent's domain is allowed)."""
     if not lev.has_overhang:
@@ -339,4 +398,7 @@ def check_overhang(lev: Level, wet_domain: np.ndarray, wet: Dict[str, np.ndarray
     hole = p.hole[pj[inside], pi[inside]]
     twice = int((pw & ~hole).sum())
     if twice:
-        raise ValueError(f"{lev.name}: {twice} wet cells of its overhang lie over water that {p.name} computes")
+        raise ValueError(
+            f"{lev.name}: {twice} wet cells of its overhang lie over water that "
+            f"{p.name} computes"
+        )

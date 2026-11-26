@@ -1,7 +1,14 @@
-"""pygetm.nesting.launch: the launch commands of a nested run (mpiexec, srun --multi-prog, Slurm job)."""
+"""pygetm.nesting.launch: the launch commands of a nested run (mpiexec, srun
+--multi-prog, Slurm job)."""
+
 import pytest
 
-from pygetm.nesting.launch import mpiexec_command, slurm_job, srun_command, srun_multiprog
+from pygetm.nesting.launch import (
+    mpiexec_command,
+    slurm_job,
+    srun_command,
+    srun_multiprog,
+)
 
 M = [("root", 4), ("child", 2), ("gc", 1)]
 S = "NEAB/models/{level}/run.py"
@@ -9,9 +16,11 @@ S = "NEAB/models/{level}/run.py"
 
 def test_mpiexec_single_line():
     cmd = mpiexec_command(M, S, "--out runs/x", multiline=False)
-    assert cmd == ("mpiexec -n 4 python NEAB/models/root/run.py --out runs/x"
-                   " : -n 2 python NEAB/models/child/run.py --out runs/x"
-                   " : -n 1 python NEAB/models/gc/run.py --out runs/x")
+    assert cmd == (
+        "mpiexec -n 4 python NEAB/models/root/run.py --out runs/x"
+        " : -n 2 python NEAB/models/child/run.py --out runs/x"
+        " : -n 1 python NEAB/models/gc/run.py --out runs/x"
+    )
 
 
 def test_mpiexec_multiline_and_bind():
@@ -34,11 +43,18 @@ def test_multiprog_blocks():
 
 def test_srun_and_job():
     assert srun_command(M, "x.conf") == "srun -n 7 --multi-prog x.conf"
-    assert srun_command(M, "x.conf", bind="core") == \
-        "srun -n 7 --cpu-bind=cores --distribution=block:block --multi-prog x.conf"
-    job = slurm_job(M, S, partition="short", time="01:00:00", bind="core", setup=["module load mpi"])
+    assert (
+        srun_command(M, "x.conf", bind="core")
+        == "srun -n 7 --cpu-bind=cores --distribution=block:block --multi-prog x.conf"
+    )
+    job = slurm_job(
+        M, S, partition="short", time="01:00:00", bind="core", setup=["module load mpi"]
+    )
     assert "#SBATCH --ntasks=7" in job and "#SBATCH --partition=short" in job
-    assert 'srun -n 7 --cpu-bind=cores --distribution=block:block --multi-prog "$conf"' in job
+    assert (
+        'srun -n 7 --cpu-bind=cores --distribution=block:block --multi-prog "$conf"'
+        in job
+    )
     assert "4-5       python NEAB/models/child/run.py" in job
     assert job.index("module load mpi") < job.index("srun")
     assert "#SBATCH --hint=nomultithread" in job and "<<EOF" in job

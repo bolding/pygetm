@@ -64,13 +64,31 @@ def boundary_faces(mask: np.ndarray) -> Dict[str, Any]:
     j, i = np.nonzero(left != right)
     i = i - 1
     lin = left[j, i + 1]
-    out.append((np.ones(j.size, bool), j, i, np.where(lin, i, i + 1), np.where(lin, i + 1, i), np.where(lin, 1.0, -1.0)))
+    out.append(
+        (
+            np.ones(j.size, bool),
+            j,
+            i,
+            np.where(lin, i, i + 1),
+            np.where(lin, i + 1, i),
+            np.where(lin, 1.0, -1.0),
+        )
+    )
     # y faces: V point (j, i) between cells (j, i) and (j + 1, i), j = -1..ny-1
     low, high = pad[:-1, 1:-1], pad[1:, 1:-1]
     j, i = np.nonzero(low != high)
     j = j - 1
     lin = low[j + 1, i]
-    out.append((np.zeros(j.size, bool), j, i, np.where(lin, j, j + 1), np.where(lin, j + 1, j), np.where(lin, 1.0, -1.0)))
+    out.append(
+        (
+            np.zeros(j.size, bool),
+            j,
+            i,
+            np.where(lin, j, j + 1),
+            np.where(lin, j + 1, j),
+            np.where(lin, 1.0, -1.0),
+        )
+    )
     xs, ys = out
     cat = lambda k: np.concatenate([xs[k], ys[k]])
     is_x = cat(0)
@@ -87,8 +105,14 @@ class Level:
     hole, rims and the faces at its interfaces. Call :meth:`finish` once all
     children have been added (:func:`load_levels` does this)."""
 
-    def __init__(self, name: str, cfg: Mapping[str, Any], parent: Optional["Level"] = None,
-                 halo: int = 2, band: Optional[int] = None):
+    def __init__(
+        self,
+        name: str,
+        cfg: Mapping[str, Any],
+        parent: Optional["Level"] = None,
+        halo: int = 2,
+        band: Optional[int] = None,
+    ):
         self.name = name
         self.parent = parent
         self.cfg = cfg
@@ -112,7 +136,9 @@ class Level:
             i0, i1 = int(cfg["istart"]), int(cfg["istop"])
             j0, j1 = int(cfg["jstart"]), int(cfg["jstop"])
             if not (0 <= i0 < i1 <= parent.nx and 0 <= j0 < j1 <= parent.ny):
-                raise ValueError(f"{name}: window {(i0, i1, j0, j1)} outside {parent.name}")
+                raise ValueError(
+                    f"{name}: window {(i0, i1, j0, j1)} outside {parent.name}"
+                )
             self.ratio, self.window = r, (i0, i1, j0, j1)
             #: steps per parent step (YAML ``time_ratio``, default: ratio); 1 =
             #: the parent's time step
@@ -125,15 +151,27 @@ class Level:
             #: outer edge (the root's edge, or an outer side of the parent):
             #: the child's own open boundary there
             at_edge = (i0 == 0, i1 == parent.nx, j0 == 0, j1 == parent.ny)
-            self.outer_sides = "".join(s for s, at in zip(SIDES, at_edge) if at and parent.is_outer(s))
-            # a window 1 .. halo-1 cells from the root's outer edge would take its ring from the edge's open
-            # boundary cells (and faces beyond them): on the edge (an outer side) or at least halo cells in
+            self.outer_sides = "".join(
+                s for s, at in zip(SIDES, at_edge) if at and parent.is_outer(s)
+            )
+            # a window 1 .. halo-1 cells from the root's outer edge would take its ring
+            # from the edge's open boundary cells (and faces beyond them): on the edge
+            # (an outer side) or at least halo cells in
             gap = dict(W=i0, E=parent.nx - i1, S=j0, N=parent.ny - j1)
-            close = [s for s in SIDES if 0 < gap[s] < halo and parent.is_outer(s)
-                     and (parent.band == 0 or parent.parent is not None)]  # no band of the parent's beyond it
+            close = [
+                s
+                for s in SIDES
+                if 0 < gap[s] < halo
+                and parent.is_outer(s)
+                and (parent.band == 0 or parent.parent is not None)
+            ]  # no band of the parent's beyond it
             if close:
-                raise ValueError(f"{name}: window {gap} cells from the root's outer edge on side(s) {close}: put it "
-                                 f"on the edge (its own open boundary there) or at least {halo} cells in")
+                raise ValueError(
+                    f"{name}: window {gap} cells from the root's outer edge on side(s) "
+                    f"{close}: put it "
+                    f"on the edge (its own open boundary there) or at least {halo} "
+                    "cells in"
+                )
             self.lon0 = parent.lon0 + i0 * parent.dlon
             self.lat0 = parent.lat0 + j0 * parent.dlat
             parent.children.append(self)
@@ -142,7 +180,9 @@ class Level:
         self.active: Optional[np.ndarray] = None
         self.set_active(None)
         self.index = -1
-        self.steps_per_root = 1 if parent is None else parent.steps_per_root * self.time_ratio
+        self.steps_per_root = (
+            1 if parent is None else parent.steps_per_root * self.time_ratio
+        )
         #: optional curvilinear grid: a file (.npz with arrays x, y) holding the
         #: level's supergrid including its band, shape (2 (ny + 2 band) + 1,
         #: 2 (nx + 2 band) + 1), in the layout's units. Without it the grid is
@@ -151,7 +191,9 @@ class Level:
         #: :func:`pygetm.nesting.masks.check_conforming`).
         self.grid = cfg.get("grid")
         if self.grid is not None and parent is None:
-            raise ValueError(f"{name}: a curvilinear grid is supported for child levels only")
+            raise ValueError(
+                f"{name}: a curvilinear grid is supported for child levels only"
+            )
         self._supergrid = None
         #: cells of a curvilinear child beyond its window on each side ("W", "E",
         #: "S", "N"; YAML ``overhang: [w, e, s, n]``): computed by the child alone,
@@ -166,7 +208,9 @@ class Level:
             raise ValueError(f"{name}: an overhang needs a curvilinear grid (grid)")
         if any(ov):
             # a side that continues as overhang is not the level's own open boundary
-            self.outer_sides = "".join(s for s in self.outer_sides if not self.overhang[s])
+            self.outer_sides = "".join(
+                s for s in self.outer_sides if not self.overhang[s]
+            )
 
     def is_outer(self, side: str) -> bool:
         """Whether this level's side ("W", "E", "S", "N") lies on the root's
@@ -185,9 +229,13 @@ class Level:
             return
         r = self.ratio
         shape = (self.ny // r, self.nx // r)
-        mask = np.ones(shape, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        mask = (
+            np.ones(shape, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        )
         if mask.shape != shape:
-            raise ValueError(f"{self.name}: active region has shape {mask.shape}, expected {shape}")
+            raise ValueError(
+                f"{self.name}: active region has shape {mask.shape}, expected {shape}"
+            )
         if not mask.any():
             raise ValueError(f"{self.name}: empty active region")
         self.active = mask
@@ -208,7 +256,10 @@ class Level:
     def domain_shape(self):
         """Shape of the level's pyGETM domain: the view plus the overhang."""
         o = self.overhang
-        return (self.ny + 2 * self.band + o["S"] + o["N"], self.nx + 2 * self.band + o["W"] + o["E"])
+        return (
+            self.ny + 2 * self.band + o["S"] + o["N"],
+            self.nx + 2 * self.band + o["W"] + o["E"],
+        )
 
     @property
     def view_offset(self):
@@ -268,8 +319,12 @@ class Level:
             ny, nx = self.domain_shape
             shape = (2 * ny + 1, 2 * nx + 1)
             if x.shape != shape or y.shape != shape:
-                raise ValueError(f"{self.name}: grid {self.grid} has shape {x.shape}, {y.shape}; expected {shape}"
-                                 " (supergrid of the domain: the window part, the overhang and the band)")
+                raise ValueError(
+                    f"{self.name}: grid {self.grid} has shape {x.shape}, {y.shape}; "
+                    f"expected {shape}"
+                    " (supergrid of the domain: the window part, the overhang and the "
+                    "band)"
+                )
             self._supergrid = x, y
         return self._supergrid
 
@@ -289,7 +344,10 @@ class Level:
         """Coordinates (x, y) of the level's cell centres (ny, nx), without the band."""
         x, y = self.supergrid()
         h = self.band
-        sl = (slice(2 * h + 1, 2 * (h + self.ny), 2), slice(2 * h + 1, 2 * (h + self.nx), 2))
+        sl = (
+            slice(2 * h + 1, 2 * (h + self.ny), 2),
+            slice(2 * h + 1, 2 * (h + self.nx), 2),
+        )
         return x[sl], y[sl]
 
     def edges(self):
@@ -304,10 +362,17 @@ class Level:
 
     @property
     def sends_up_after_children(self) -> bool:
-        """Whether this level's sync sends up only after its children's: a child passes fluxes on up (it touches
-        this level's interface), or the parent's rim reaches into this level's hole (a child near it)."""
-        return bool(self.children) and (self.parent_rim_in_hole or any(
-            bool((np.asarray(self.wfaces[c.name]["up"]) >= 0).any()) for c in self.children))
+        """Whether this level's sync sends up only after its children's: a child passes
+        fluxes on up (it touches this level's interface), or the parent's rim reaches
+        into this level's hole (a child near it).
+        """
+        return bool(self.children) and (
+            self.parent_rim_in_hole
+            or any(
+                bool((np.asarray(self.wfaces[c.name]["up"]) >= 0).any())
+                for c in self.children
+            )
+        )
 
     def hole_of(self, child: "Level") -> np.ndarray:
         """The child's active region in this level's cells (ny, nx)."""
@@ -331,18 +396,26 @@ class Level:
         hole = np.zeros((self.ny, self.nx), dtype=bool)
         for c in self.children:
             i0, i1, j0, j1 = c.window
-            if (j0 < 0) or hole[j0:j1, i0:i1].any() or any(
-                    _overlap(c.window, o.window) for o in self.children if o is not c):
+            if (
+                (j0 < 0)
+                or hole[j0:j1, i0:i1].any()
+                or any(
+                    _overlap(c.window, o.window) for o in self.children if o is not c
+                )
+            ):
                 raise ValueError(f"overlapping child windows in {self.name}")
             if (c.active & ~self.cactive[j0:j1, i0:i1]).any():
-                raise ValueError(f"{c.name}: active region outside the active region of {self.name}")
+                raise ValueError(
+                    f"{c.name}: active region outside the active region of {self.name}"
+                )
             hole |= self.hole_of(c)
         self.hole = hole
         #: cells this level computes
         self.computed = self.cactive & ~hole
         needed = dilate(self.computed, h)
-        #: the parent's rim reaches into this level's hole (a child near, not only on, this level's
-        #: interface): what goes up must then wait for the children's restriction
+        #: the parent's rim reaches into this level's hole (a child near, not only on,
+        #: this level's interface): what goes up must then wait for the children's
+        #: restriction
         self.parent_rim_in_hole = False
         if self.parent is not None:
             prim = self.parent.rims[self.name]
@@ -355,22 +428,35 @@ class Level:
                     self.parent_rim_in_hole |= bool(hole[jj, ii].any())
         self.rims: Dict[str, np.ndarray] = {}
         if self.has_overhang and self.children:
-            raise ValueError(f"{self.name}: a level with an overhang cannot have children")
+            raise ValueError(
+                f"{self.name}: a level with an overhang cannot have children"
+            )
         for c in self.children:
-            self.rims[c.name] = np.argwhere(self.hole_of(c) & needed)  # (n, 2) global (j, i), row-major
+            self.rims[c.name] = np.argwhere(
+                self.hole_of(c) & needed
+            )  # (n, 2) global (j, i), row-major
 
         if self.parent is None:
             # the root's edge: faces on the boundary of its domain
             f = boundary_faces(self.cactive)
-            self.edge = dict(is_x=f["is_x"], face=f["face"], inner=f["inner"], sign=f["sign"])
+            self.edge = dict(
+                is_x=f["is_x"], face=f["face"], inner=f["inner"], sign=f["sign"]
+            )
         # else: self.edge was set by the parent's finish (faces of the parent's
         # interface, r sub-faces each, in this level's indices)
         lookup = {}
         if self.parent is not None:
             e = self.edge
             for k in range(e["is_x"].size):
-                lookup[(bool(e["is_x"][k]), int(e["face"][0][k]), int(e["face"][1][k]),
-                        int(e["inner"][0][k]), int(e["inner"][1][k]))] = k
+                lookup[
+                    (
+                        bool(e["is_x"][k]),
+                        int(e["face"][0][k]),
+                        int(e["face"][1][k]),
+                        int(e["inner"][0][k]),
+                        int(e["inner"][1][k]),
+                    )
+                ] = k
 
         # interface faces of every child, in this level's indices
         self.wfaces: Dict[str, Dict[str, Any]] = {}
@@ -386,26 +472,45 @@ class Level:
                     outer |= beyond
             if outer.any():
                 keep = ~outer
-                f = {k: (tuple(x[keep] for x in v) if isinstance(v, tuple) else v[keep]) for k, v in f.items()}
+                f = {
+                    k: (tuple(x[keep] for x in v) if isinstance(v, tuple) else v[keep])
+                    for k, v in f.items()
+                }
                 oj, oi = f["other"]
                 in_dom = in_dom[keep]
             ojc, oic = np.clip(oj, 0, self.ny - 1), np.clip(oi, 0, self.nx - 1)
             inside = in_dom & self.computed[ojc, oic]
             if (in_dom & ~inside & self.cactive[ojc, oic]).any():
-                raise ValueError(f"{c.name}: its active region touches another child's in {self.name}")
+                raise ValueError(
+                    f"{c.name}: its active region touches another child's in "
+                    f"{self.name}"
+                )
             up = -np.ones(inside.size, dtype=int)
             for n in np.nonzero(~inside)[0]:
                 if self.parent is None:
                     continue
-                key = (bool(f["is_x"][n]), int(f["face"][0][n]), int(f["face"][1][n]),
-                       int(f["inner"][0][n]), int(f["inner"][1][n]))
+                key = (
+                    bool(f["is_x"][n]),
+                    int(f["face"][0][n]),
+                    int(f["face"][1][n]),
+                    int(f["inner"][0][n]),
+                    int(f["inner"][1][n]),
+                )
                 if key not in lookup:
-                    raise ValueError(f"{c.name}: interface face {key} is neither inside {self.name} nor on its interface")
+                    raise ValueError(
+                        f"{c.name}: interface face {key} is neither inside {self.name} "
+                        "nor on its interface"
+                    )
                 up[n] = lookup[key]
             self.wfaces[c.name] = dict(
-                is_x=f["is_x"], face=f["face"], hole=f["inner"], out=f["other"],
+                is_x=f["is_x"],
+                face=f["face"],
+                hole=f["inner"],
+                out=f["other"],
                 # sign of the correction of the outside cell: +1 if it lies west/south
-                sign=-f["sign"], inside=inside, up=up,
+                sign=-f["sign"],
+                inside=inside,
+                up=up,
             )
             c.edge = _child_edge(c, f)
 
@@ -476,7 +581,12 @@ class Level:
         and the position (a, b) of the child cell within it."""
         i0, _, j0, _ = self.window
         r = self.ratio
-        return j0 + np.floor_divide(j, r), i0 + np.floor_divide(i, r), np.mod(j, r), np.mod(i, r)
+        return (
+            j0 + np.floor_divide(j, r),
+            i0 + np.floor_divide(i, r),
+            np.mod(j, r),
+            np.mod(i, r),
+        )
 
 
 def _overlap(w1, w2) -> bool:
@@ -508,7 +618,9 @@ def dilate(mask: np.ndarray, width: int) -> np.ndarray:
     ny, nx = mask.shape
     for dj in range(-width, width + 1):
         for di in range(-width, width + 1):
-            if (dj or di) and abs(dj) < ny and abs(di) < nx:  # a shift beyond the array reaches nothing
+            if (
+                (dj or di) and abs(dj) < ny and abs(di) < nx
+            ):  # a shift beyond the array reaches nothing
                 src = mask[max(0, -dj) : ny - max(0, dj), max(0, -di) : nx - max(0, di)]
                 out[max(0, dj) : ny - max(0, -dj), max(0, di) : nx - max(0, -di)] |= src
     return out
@@ -546,7 +658,12 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
         LO, LA = level.centres()
     ok = wet.copy()
     barred = np.zeros_like(ok)
-    tests = {"lon_lt": lambda v: LO < v, "lon_gt": lambda v: LO > v, "lat_lt": lambda v: LA < v, "lat_gt": lambda v: LA > v}
+    tests = {
+        "lon_lt": lambda v: LO < v,
+        "lon_gt": lambda v: LO > v,
+        "lat_lt": lambda v: LA < v,
+        "lat_gt": lambda v: LA > v,
+    }
     for b in spec.get("barriers", []) or []:
         sel = np.ones_like(ok)
         for key, v in b.items():
@@ -560,12 +677,17 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
     ids = []
     for sx, sy in seeds:
         if level.grid is None:
-            seed = lab[int(np.argmin(abs(lat - float(sy)))), int(np.argmin(abs(lon - float(sx))))]
+            seed = lab[
+                int(np.argmin(abs(lat - float(sy)))),
+                int(np.argmin(abs(lon - float(sx)))),
+            ]
         else:
             k = int(np.argmin((LO - float(sx)) ** 2 + (LA - float(sy)) ** 2))
             seed = lab.flat[k]
         if seed == 0:
-            raise ValueError(f"{level.name}: seed {[sx, sy]} is on land or behind a barrier")
+            raise ValueError(
+                f"{level.name}: seed {[sx, sy]} is on land or behind a barrier"
+            )
         ids.append(seed)
     r = level.ratio
     connected = np.isin(lab, ids)
@@ -576,7 +698,12 @@ def active_region(level: Level, spec: Mapping[str, Any], wet: np.ndarray) -> np.
     # into the parent's area)
     other, _ = ndimage.label(wet & ~connected)
     sides = {"W": other[:, 0], "E": other[:, -1], "S": other[0], "N": other[-1]}
-    edge = np.unique(np.concatenate([v for s, v in sides.items() if s not in level.outer_sides] + [other[barred & wet]]))
+    edge = np.unique(
+        np.concatenate(
+            [v for s, v in sides.items() if s not in level.outer_sides]
+            + [other[barred & wet]]
+        )
+    )
     kept = np.isin(other, edge[edge > 0])
     blocks = lambda m: m.reshape(level.ny // r, r, level.nx // r, r).any(axis=(1, 3))
     # every parent cell without water the parent keeps is active: land always
@@ -605,8 +732,13 @@ def read_layout(path) -> Dict[str, Any]:
     return config
 
 
-def load_levels(config, halo: int = 2, root_band: Optional[int] = None,
-                wet: Optional[Mapping[str, np.ndarray]] = None, active: bool = True) -> List[Level]:
+def load_levels(
+    config,
+    halo: int = 2,
+    root_band: Optional[int] = None,
+    wet: Optional[Mapping[str, np.ndarray]] = None,
+    active: bool = True,
+) -> List[Level]:
     """Levels from a nesting YAML file (path) or mapping, parents before
     children; keys other than levels (e.g. ``config``) are ignored.
     ``root_band``: width of the root's band (default ``halo``; 0 when the
@@ -621,7 +753,10 @@ def load_levels(config, halo: int = 2, root_band: Optional[int] = None,
     specs = {k: v for k, v in config.items() if k != "config"}
     roots = [k for k, v in specs.items() if not v.get("parent")]
     if len(roots) != 1:
-        raise ValueError(f"a nesting layout needs exactly one root (a level without parent), not {roots}")
+        raise ValueError(
+            "a nesting layout needs exactly one root (a level without parent), not "
+            f"{roots}"
+        )
     levels: List[Level] = []
     done: Dict[str, Level] = {}
     while len(done) < len(specs):
@@ -631,8 +766,13 @@ def load_levels(config, halo: int = 2, root_band: Optional[int] = None,
                 continue
             parent = spec.get("parent")
             if parent is None or parent in done:
-                lev = Level(name, spec, done.get(parent), halo=halo,
-                            band=root_band if parent is None else None)
+                lev = Level(
+                    name,
+                    spec,
+                    done.get(parent),
+                    halo=halo,
+                    band=root_band if parent is None else None,
+                )
                 lev.index = len(levels)
                 levels.append(lev)
                 done[name] = lev
@@ -645,7 +785,10 @@ def load_levels(config, halo: int = 2, root_band: Optional[int] = None,
             continue
         if isinstance(spec, Mapping):
             if wet is None or lev.name not in wet:
-                raise ValueError(f"{lev.name}: an active region from a seed needs the level's wet mask")
+                raise ValueError(
+                    f"{lev.name}: an active region from a seed needs the level's wet "
+                    "mask"
+                )
             lev.set_active(active_region(lev, spec, wet[lev.name]))
         else:
             lev.set_active(np.asarray(spec, dtype=bool))
