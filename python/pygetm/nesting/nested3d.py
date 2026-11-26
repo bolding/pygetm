@@ -100,6 +100,7 @@ from mpi4py import MPI
 from ..constants import CENTERS, CellType
 from ..simulation import Coupler
 from .endpoint import Endpoint
+from .exchange import Messages
 from .plan import Plan, Tag
 from .runtime import NestingRun, check_couplers, sync_order
 from . import vremap
@@ -255,6 +256,8 @@ class Nested3D(Coupler):
         self.logger = sim.logger.getChild("nesting")
         #: this process's end of the level's interfaces (shared with Nested2D)
         self.ep = ep = Endpoint(nest)
+        #: the persistent point-to-point messages of this process's 3D exchanges
+        self.msgs = Messages()
         self.lev, self.t, self.til = ep.lev, ep.t, ep.til
         self.up, self.down = ep.up, ep.down
         #: the stretch of the amounts (flux register, transports) between columns of
@@ -387,7 +390,7 @@ class Nested3D(Coupler):
 
     def _recv(self, comm: MPI.Comm, buf: np.ndarray, source: int, tag: int) -> None:
         t0 = MPI.Wtime()
-        comm.Recv(buf, source=source, tag=tag)
+        self.msgs.recv_into(comm, buf, source, tag)
         self.t_wait += MPI.Wtime() - t0
 
     # --- child side ------------------------------------------------------------
@@ -450,7 +453,7 @@ class Nested3D(Coupler):
                     np.concatenate([hface.T] + [r[fk].T for r in self.reg], axis=0)
                 )
                 reqs.append(
-                    self.up.comm.Isend(buf, dest=self.up.poff + p, tag=Tag.FLUX_3D)
+                    self.msgs.send(self.up.comm, self.up.poff + p, Tag.FLUX_3D, buf)
                 )
             self.reg[...] = 0.0
         T = self.sim.T
@@ -470,7 +473,7 @@ class Nested3D(Coupler):
                 vremap.gather_columns(f.all_values, jj, ii, out=B[1 + n])
             B[1:, w <= 0.0] = 0.0
             buf[-k:] = w
-            reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=Tag.RIM_3D))
+            reqs.append(self.msgs.send(self.up.comm, self.up.poff + p, Tag.RIM_3D, buf))
         return reqs
 
     def _recv_ring(self) -> None:
@@ -1021,7 +1024,7 @@ class Nested3D(Coupler):
                     vremap.gather_columns(f.all_values, j2, i2, out=buf[k, 1 + n])
                 if k:
                     buf[k, 0][~self.wet[j2, i2]] = 0.0
-            reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=Tag.RING_3D))
+            reqs.append(self.msgs.send(plan.comm, plan.coff + tt, Tag.RING_3D, buf))
         return reqs
 
     def _recv_rim(self, plan: Plan, nzc: int) -> None:
@@ -1153,7 +1156,7 @@ class Nested3D(Coupler):
             q = self._water_sum.pop(key) / (self.sim.macrotimestep * self.ratio_3d)
             buf = np.ascontiguousarray(np.concatenate([h.T, q.T], axis=0))
             reqs.append(
-                self.up.comm.Isend(buf, dest=self.up.poff + p, tag=Tag.TRANSPORT_3D)
+                self.msgs.send(self.up.comm, self.up.poff + p, Tag.TRANSPORT_3D, buf)
             )
         return reqs
 
@@ -1244,7 +1247,7 @@ class Nested3D(Coupler):
                     axis=0,
                 )
                 buf = np.ascontiguousarray(np.where(np.isfinite(buf), buf, 0.0))
-                reqs.append(plan.comm.Isend(buf, dest=plan.coff + t, tag=tx[axis].tag))
+                reqs.append(self.msgs.send(plan.comm, plan.coff + t, tx[axis].tag, buf))
         return reqs
 
     def _recv_ring_uv(self) -> None:

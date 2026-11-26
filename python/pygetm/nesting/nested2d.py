@@ -48,6 +48,7 @@ from .plan import LevelTiling, Plan, Tag
 from .runtime import NestingRun, check_couplers, sync_order
 from . import operators as ops
 from .endpoint import Endpoint
+from .exchange import Messages
 
 if TYPE_CHECKING:
     from ..core import Array, Grid
@@ -89,12 +90,15 @@ class ExchangeClock:
         "halo",
         "halo_wait",
         "halo_wait0",
+        "messages",
         "transfer",
         "wait",
     )
 
-    def __init__(self):
+    def __init__(self, messages: Messages):
         HaloWaitTimer.install()
+        #: the persistent point-to-point messages (:mod:`pygetm.nesting.exchange`)
+        self.messages = messages
         self.wait = 0.0
         self.transfer = 0.0
         self.halo = 0.0
@@ -115,12 +119,8 @@ class ExchangeClock:
         return max(HaloWaitTimer.total() - self.halo_wait0 - self.halo_wait, 0.0)
 
     def recv(self, comm: MPI.Comm, buf: np.ndarray, source: int, tag: int) -> None:
-        t0 = MPI.Wtime()
-        comm.Probe(source=source, tag=tag)
-        t1 = MPI.Wtime()
-        comm.Recv(buf, source=source, tag=tag)
-        self.wait += t1 - t0
-        self.transfer += MPI.Wtime() - t1
+        """Receive into ``buf``, timed (waiting and transfer)."""
+        self.messages.recv_into(comm, buf, source, tag, timer=self)
 
     def waitall(self, reqs: List[MPI.Request]) -> None:
         t0 = MPI.Wtime()
@@ -195,19 +195,25 @@ class PointTransfer:
                 )
 
     def send(
-        self, world: MPI.Comm, me: int, values: np.ndarray, loc: Locate
+        self,
+        world: MPI.Comm,
+        me: int,
+        values: np.ndarray,
+        loc: Locate,
+        messages: Messages,
     ) -> List[MPI.Request]:
         """Source side: send this tile's values (an ``all_values`` array)."""
         reqs = []
         for (p, t), (_, _, sj, si) in self.pairs.items():
             if p == me:
-                buf = np.ascontiguousarray(values[loc(sj, si)])
-                reqs.append(world.Isend(buf, dest=self.dst_off + t, tag=self.tag))
+                reqs.append(
+                    messages.send(
+                        world, self.dst_off + t, self.tag, values[loc(sj, si)]
+                    )
+                )
         return reqs
 
-    def recv(
-        self, world: MPI.Comm, me: int, clock: Optional[ExchangeClock] = None
-    ) -> np.ndarray:
+    def recv(self, world: MPI.Comm, me: int, clock: ExchangeClock) -> np.ndarray:
         """Destination side: weighted values at this tile's points."""
         dj, di, w = self.dst_of.get(
             me, (np.zeros(0, int),) * 2 + (np.zeros((0, self.K)),)
@@ -215,12 +221,9 @@ class PointTransfer:
         vals = np.zeros((dj.size, self.K))
         for (p, t), (pos, k, sj, _) in sorted(self.pairs.items()):
             if t == me:
-                buf = np.empty(sj.size)
-                if clock is None:
-                    world.Recv(buf, source=self.src_off + p, tag=self.tag)
-                else:
-                    clock.recv(world, buf, self.src_off + p, self.tag)
-                vals[pos, k] = buf
+                vals[pos, k] = clock.messages.recv(
+                    world, self.src_off + p, self.tag, (sj.size,), timer=clock
+                )
         out = np.zeros(dj.size)
         for kk in range(self.K):
             out = out + w[:, kk] * vals[:, kk]
@@ -400,7 +403,9 @@ class Nested2D(Coupler):
         self.t_sync = 0.0
         self._t_start = None
         #: waiting and transfer within the syncs (MPI calls of the exchanges)
-        self.clock = ExchangeClock()
+        #: the persistent point-to-point messages of this process's 2D exchanges
+        self.msgs = Messages()
+        self.clock = ExchangeClock(self.msgs)
         #: time in the coupler's own work during the model step (ring values,
         #: window volumes, edge registers)
         self.t_stage = 0.0
@@ -732,18 +737,21 @@ class Nested2D(Coupler):
                 buf = np.ascontiguousarray(
                     np.stack([np.where(weight > 0, z[jj, ii], 0.0), weight])
                 )
-                reqs.append(self.up.comm.Isend(buf, dest=self.up.poff + p, tag=Tag.RIM))
+                reqs.append(
+                    self.msgs.send(self.up.comm, self.up.poff + p, Tag.RIM, buf)
+                )
         reqs += self.up_faces["rim_x"].send(
-            self.up.comm, self.t, self.U.all_values, self.loc
+            self.up.comm, self.t, self.U.all_values, self.loc, self.msgs
         )
         reqs += self.up_faces["rim_y"].send(
-            self.up.comm, self.t, self.V.all_values, self.loc
+            self.up.comm, self.t, self.V.all_values, self.loc, self.msgs
         )
         if fluxes:
             for (_, p), fk in self.up.faces_from(self.t):
-                vals = np.ascontiguousarray(self.reg[fk])
                 reqs.append(
-                    self.up.comm.Isend(vals, dest=self.up.poff + p, tag=Tag.FLUX)
+                    self.msgs.send(
+                        self.up.comm, self.up.poff + p, Tag.FLUX, self.reg[fk]
+                    )
                 )
             self.reg = np.zeros_like(self.reg)
         if not wait:
@@ -770,9 +778,13 @@ class Nested2D(Coupler):
                 jj, ii = self.loc(pj, pi)
                 sx, sy = ops.limited_slopes_at(z, self.wetmask, jj, ii)
                 buf = np.ascontiguousarray(np.stack([z[jj, ii], sx, sy]))
-                reqs.append(plan.comm.Isend(buf, dest=plan.coff + tt, tag=Tag.RING))
-        reqs += faces["ring_x"].send(plan.comm, self.t, self.U.all_values, self.loc)
-        reqs += faces["ring_y"].send(plan.comm, self.t, self.V.all_values, self.loc)
+                reqs.append(self.msgs.send(plan.comm, plan.coff + tt, Tag.RING, buf))
+        reqs += faces["ring_x"].send(
+            plan.comm, self.t, self.U.all_values, self.loc, self.msgs
+        )
+        reqs += faces["ring_y"].send(
+            plan.comm, self.t, self.V.all_values, self.loc, self.msgs
+        )
         return reqs
 
     def _window_volumes(self, plan: Plan) -> np.ndarray:
