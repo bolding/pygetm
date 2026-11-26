@@ -1092,6 +1092,12 @@ class Nested2D(Coupler):
             f"{self.lev.name} tile {self.t}: {t['sync']:.1f} s of {t['elapsed']:.1f} s"
             f" in the 2D syncs ({t['wait']:.1f} s waiting for partners)"
         )
+        self.logger.info(
+            f"{self.lev.name} tile {self.t}: work {t['work']:.1f} s, halo updates"
+            f" {t['halo']:.1f} s ({t['halo_wait']:.1f} s waiting for the level's other"
+            f" tiles), transfer {t['transfer']:.1f} s, stage {self.t_stage:.1f} s,"
+            f" {t['steps']} steps"
+        )
         if self.max_correction > 0.0:
             self.logger.info(
                 f"largest elevation correction by flux matching:"
