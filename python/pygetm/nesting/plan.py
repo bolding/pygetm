@@ -51,6 +51,7 @@ class LevelTiling:
         "offi",
         "offj",
         "offset",
+        "origins",
         "xoff",
         "yoff",
     )
@@ -72,6 +73,8 @@ class LevelTiling:
         self.offj, self.offi = band + int(view_offset[0]), band + int(view_offset[1])
         self.offset = world_offset
         self.ntiles = int((self.map >= 0).sum())
+        #: global (j, i) of the first interior cell of every tile (fixed: computed once)
+        self.origins = self._origins()
 
     @staticmethod
     def info(grid: "Grid") -> dict:
@@ -107,11 +110,16 @@ class LevelTiling:
 
     def origin(self, t: int) -> Tuple[int, int]:
         """Global (j, i) of the first interior cell of tile t."""
-        row, col = (int(x[0]) for x in np.nonzero(self.map == t))
-        return (
-            row * self.ny_sub + self.yoff - self.offj,
-            col * self.nx_sub + self.xoff - self.offi,
-        )
+        return self.origins[t]
+
+    def _origins(self) -> Dict[int, Tuple[int, int]]:
+        out = {}
+        for row, col in zip(*np.nonzero(self.map >= 0)):
+            out[int(self.map[row, col])] = (
+                int(row) * self.ny_sub + self.yoff - self.offj,
+                int(col) * self.nx_sub + self.xoff - self.offi,
+            )
+        return out
 
     def local(
         self, t: int, j: npt.ArrayLike, i: npt.ArrayLike

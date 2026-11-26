@@ -21,7 +21,7 @@ Flux matching
 
 import numpy as np
 import numpy.typing as npt
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 
 def minmod(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -57,33 +57,87 @@ def limited_slopes(
     return sx, sy
 
 
+class SlopeStencil(NamedTuple):
+    """What :func:`limited_slopes_at` needs about the cells (j, i) of an array of a
+    given shape and wet mask, fixed while the mask is: flat indices of each cell and its
+    neighbours, and whether each difference counts (both cells wet)."""
+
+    shape: Tuple[int, int]
+    x: np.ndarray  # cells with a west and an east neighbour
+    y: np.ndarray  # cells with a south and a north neighbour
+    cx: np.ndarray
+    w: np.ndarray
+    e: np.ndarray
+    cy: np.ndarray
+    s: np.ndarray
+    n: np.ndarray
+    okw: np.ndarray
+    oke: np.ndarray
+    oks: np.ndarray
+    okn: np.ndarray
+    dry: np.ndarray
+
+
+def slope_stencil(
+    shape: Tuple[int, int],
+    wet: Optional[np.ndarray],
+    j: npt.ArrayLike,
+    i: npt.ArrayLike,
+) -> SlopeStencil:
+    """The :class:`SlopeStencil` of cells (j, i) of an array of ``shape``."""
+    j, i = np.asarray(j), np.asarray(i)
+    ny, nx = shape
+    wet = np.ones(shape, dtype=bool) if wet is None else np.asarray(wet, dtype=bool)
+    x = (i > 0) & (i < nx - 1)
+    y = (j > 0) & (j < ny - 1)
+    jx, ix = j[x], i[x]
+    jy, iy = j[y], i[y]
+    flat = np.ravel_multi_index
+    return SlopeStencil(
+        shape=(ny, nx),
+        x=x,
+        y=y,
+        cx=flat((jx, ix), shape),
+        w=flat((jx, ix - 1), shape),
+        e=flat((jx, ix + 1), shape),
+        cy=flat((jy, iy), shape),
+        s=flat((jy - 1, iy), shape),
+        n=flat((jy + 1, iy), shape),
+        okw=wet[jx, ix] & wet[jx, ix - 1],
+        oke=wet[jx, ix] & wet[jx, ix + 1],
+        oks=wet[jy, iy] & wet[jy - 1, iy],
+        okn=wet[jy, iy] & wet[jy + 1, iy],
+        dry=~wet[j, i],
+    )
+
+
+def limited_slopes_stencil(
+    c: np.ndarray, st: SlopeStencil
+) -> Tuple[np.ndarray, np.ndarray]:
+    """:func:`limited_slopes_at` with a precomputed :class:`SlopeStencil` (identical
+    arithmetic)."""
+    assert c.shape == st.shape
+    cf = c.ravel()
+    sx = np.zeros(st.x.shape)
+    sy = np.zeros(st.y.shape)
+    with np.errstate(invalid="ignore"):
+        dw = np.where(st.okw, cf[st.cx] - cf[st.w], 0.0)
+        de = np.where(st.oke, cf[st.e] - cf[st.cx], 0.0)
+        ds = np.where(st.oks, cf[st.cy] - cf[st.s], 0.0)
+        dn = np.where(st.okn, cf[st.n] - cf[st.cy], 0.0)
+    sx[st.x] = minmod(dw, de)
+    sy[st.y] = minmod(ds, dn)
+    sx[st.dry] = 0.0
+    sy[st.dry] = 0.0
+    return sx, sy
+
+
 def limited_slopes_at(
     c: np.ndarray, wet: Optional[np.ndarray], j: npt.ArrayLike, i: npt.ArrayLike
 ) -> Tuple[np.ndarray, np.ndarray]:
     """:func:`limited_slopes` at the cells (j, i) only, with the same
     arithmetic (identical values), for the few cells a parent sends."""
-    j, i = np.asarray(j), np.asarray(i)
-    ny, nx = c.shape
-    if wet is None:
-        wet = np.ones(c.shape, dtype=bool)
-    wet = np.asarray(wet, dtype=bool)
-    sx = np.zeros(j.shape)
-    sy = np.zeros(j.shape)
-    x = (i > 0) & (i < nx - 1)
-    y = (j > 0) & (j < ny - 1)
-    jx, ix = j[x], i[x]
-    jy, iy = j[y], i[y]
-    with np.errstate(invalid="ignore"):
-        dw = np.where(wet[jx, ix] & wet[jx, ix - 1], c[jx, ix] - c[jx, ix - 1], 0.0)
-        de = np.where(wet[jx, ix] & wet[jx, ix + 1], c[jx, ix + 1] - c[jx, ix], 0.0)
-        ds = np.where(wet[jy, iy] & wet[jy - 1, iy], c[jy, iy] - c[jy - 1, iy], 0.0)
-        dn = np.where(wet[jy, iy] & wet[jy + 1, iy], c[jy + 1, iy] - c[jy, iy], 0.0)
-    sx[x] = minmod(dw, de)
-    sy[y] = minmod(ds, dn)
-    dry = ~wet[j, i]
-    sx[dry] = 0.0
-    sy[dry] = 0.0
-    return sx, sy
+    return limited_slopes_stencil(c, slope_stencil(c.shape, wet, j, i))
 
 
 def subcell_offset(k: npt.ArrayLike, r: int) -> np.ndarray:
@@ -134,6 +188,8 @@ __all__ = [
     "minmod",
     "limited_slopes",
     "limited_slopes_at",
+    "slope_stencil",
+    "limited_slopes_stencil",
     "subcell_offset",
     "prolong",
     "restrict",

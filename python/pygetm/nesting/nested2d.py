@@ -405,6 +405,9 @@ class Nested2D(Coupler):
         #: waiting and transfer within the syncs (MPI calls of the exchanges)
         #: the persistent point-to-point messages of this process's 2D exchanges
         self.msgs = Messages()
+        #: the ring cells this tile sends to each child tile, with their slope stencils
+        #: (fixed: built at the first sync)
+        self._ring_stencils: Dict[Tuple[str, int], tuple] = {}
         self.clock = ExchangeClock(self.msgs)
         #: time in the coupler's own work during the model step (ring values,
         #: window volumes, edge registers)
@@ -775,8 +778,13 @@ class Nested2D(Coupler):
         reqs = []
         for (p, tt), (pj, pi, *_rest) in plan.pro.items():
             if p == self.t:
-                jj, ii = self.loc(pj, pi)
-                sx, sy = ops.limited_slopes_at(z, self.wetmask, jj, ii)
+                key = (plan.child.name, tt)
+                if key not in self._ring_stencils:
+                    jj, ii = self.loc(pj, pi)
+                    st = ops.slope_stencil(z.shape, self.wetmask, jj, ii)
+                    self._ring_stencils[key] = (jj, ii, st)
+                jj, ii, st = self._ring_stencils[key]
+                sx, sy = ops.limited_slopes_stencil(z, st)
                 buf = np.ascontiguousarray(np.stack([z[jj, ii], sx, sy]))
                 reqs.append(self.msgs.send(plan.comm, plan.coff + tt, Tag.RING, buf))
         reqs += faces["ring_x"].send(
