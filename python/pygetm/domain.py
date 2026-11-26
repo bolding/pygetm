@@ -497,7 +497,7 @@ class Domain:
         self.coordinate_type = coordinate_type
         self.root_logger = logger or parallel.get_logger()
         self.logger = self.root_logger.getChild("domain")
-        self._external = None
+        self._coupled = None
 
         if self.comm.rank != 0:
             self._x = self._y = self._lon = self._lat = None
@@ -812,26 +812,26 @@ class Domain:
         self._mask = self._map_array(values, missing_value=0, dtype=int)
 
     @property
-    def external(self) -> Optional[np.ndarray]:
+    def coupled(self) -> Optional[np.ndarray]:
         """Cell centers (T points, shape ``(ny, nx)``) whose values are set from
         outside the model, e.g., by nesting. Where these are water, their cell
-        type becomes :attr:`CellType.EXTERNAL`: wet and with open faces, but not
-        updated by the model. U, V and X points with external T points on all
-        sides become external too. None (default) if there are no such points.
+        type becomes :attr:`CellType.COUPLED`: wet and with open faces, but not
+        updated by the model. U, V and X points with coupled T points on all
+        sides become coupled too. None (default) if there are no such points.
 
         This attribute is None on non-root MPI nodes.
         """
-        return self._external
+        return self._coupled
 
-    @external.setter
-    def external(self, values: Optional[npt.ArrayLike]):
+    @coupled.setter
+    def coupled(self, values: Optional[npt.ArrayLike]):
         if self.comm.rank != 0 or values is None:
-            self._external = None
+            self._coupled = None
             return
         values = np.asarray(values, dtype=bool)
         if values.shape != (self.ny, self.nx):
-            raise ValueError(f"external has shape {values.shape}, expected {(self.ny, self.nx)}")
-        self._external = values.copy()
+            raise ValueError(f"coupled has shape {values.shape}, expected {(self.ny, self.nx)}")
+        self._coupled = values.copy()
 
     @property
     def H(self) -> Optional[np.ndarray]:
@@ -1319,23 +1319,23 @@ class Domain:
 
         self.open_boundaries.adjust_mask(mask)
 
-        if self._external is not None:
+        if self._coupled is not None:
             # After U, V, X masks have been derived from the T mask: faces
-            # between an external and an active point stay open (ACTIVE). Faces
-            # and corners with external points on all sides are external too,
+            # between a coupled and an active point stay open (ACTIVE). Faces
+            # and corners with coupled points on all sides are coupled too,
             # so the model does not overwrite values set there from outside
             # (e.g. transports in a nested child's ring). Kernels update only
-            # ACTIVE points; advection stencils treat EXTERNAL faces as open.
-            ext_ex = expand_2d(
-                self._external.astype(int), edges_x=edges_x, edges_y=edges_y, missing_value=0
+            # ACTIVE points; advection stencils treat COUPLED faces as open.
+            cpl_ex = expand_2d(
+                self._coupled.astype(int), edges_x=edges_x, edges_y=edges_y, missing_value=0
             ).astype(bool)
-            uext = ext_ex[1:-1, 1:] & ext_ex[1:-1, :-1]
-            vext = ext_ex[1:, 1:-1] & ext_ex[:-1, 1:-1]
-            xext = ext_ex[1:, 1:] & ext_ex[:-1, 1:] & ext_ex[1:, :-1] & ext_ex[:-1, :-1]
-            umask[uext & (umask == CellType.ACTIVE)] = CellType.EXTERNAL
-            vmask[vext & (vmask == CellType.ACTIVE)] = CellType.EXTERNAL
-            xmask[xext & (xmask == CellType.ACTIVE)] = CellType.EXTERNAL
-            tmask[self._external & (tmask == CellType.ACTIVE)] = CellType.EXTERNAL
+            ucpl = cpl_ex[1:-1, 1:] & cpl_ex[1:-1, :-1]
+            vcpl = cpl_ex[1:, 1:-1] & cpl_ex[:-1, 1:-1]
+            xcpl = cpl_ex[1:, 1:] & cpl_ex[:-1, 1:] & cpl_ex[1:, :-1] & cpl_ex[:-1, :-1]
+            umask[ucpl & (umask == CellType.ACTIVE)] = CellType.COUPLED
+            vmask[vcpl & (vmask == CellType.ACTIVE)] = CellType.COUPLED
+            xmask[xcpl & (xmask == CellType.ACTIVE)] = CellType.COUPLED
+            tmask[self._coupled & (tmask == CellType.ACTIVE)] = CellType.COUPLED
 
         return mask
 
