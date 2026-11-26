@@ -11,8 +11,8 @@ This package currently provides:
   :func:`split_mpmd` for an MPMD launch (one ``mpiexec`` component per domain)
 * :mod:`pygetm.nesting.geometry`: the hierarchy (:class:`Level`,
   :func:`load_levels`): windows, ratios, holes, rims, ring cells and the faces
-  at every interface; :meth:`Level.external` for
-  :attr:`pygetm.domain.Domain.external`
+  at every interface; :meth:`Level.coupled` for
+  :attr:`pygetm.domain.Domain.coupled`
 * :mod:`pygetm.nesting.masks`: child-led land/sea consistency between levels
 * :mod:`pygetm.nesting.operators`: conservative transfer operators (limited
   linear prolongation, weighted restriction, face sums for flux matching)

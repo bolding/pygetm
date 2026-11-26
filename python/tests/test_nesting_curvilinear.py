@@ -128,7 +128,7 @@ class TestOverhang(unittest.TestCase):
         cfg, child, w, wc_dom = self.build()
         self.assertEqual(child.domain_shape, (child.ny + 2 * BAND + self.OVER, child.nx + 2 * BAND))
         self.assertNotIn("N", child.outer_sides)  # the side continues as overhang
-        ext = child.external()
+        ext = child.coupled()
         self.assertEqual(ext.shape, child.domain_shape)
         self.assertFalse(ext[BAND + child.ny:].any())  # overhang (and the view's band there) computed
         self.assertTrue(ext[:BAND].all())  # the ring at the mouth

@@ -71,7 +71,7 @@ def edge_segments(wet, band=0, sides="WESN", exclude=None):
 def level_edge_segments(lev: Level, wet: np.ndarray, sides: str = None) -> List[Tuple[str, int, int, int]]:
     """The open boundary stretches of level ``lev`` (:func:`edge_segments`): the root along all its edges (its band is
     0: the boundary is its outer cells), a child along its outer sides (on its last window row/column, the band beyond
-    is dry); without the cells the level does not compute (:meth:`Level.external`: the root's hole, the part of its
+    is dry); without the cells the level does not compute (:meth:`Level.coupled`: the root's hole, the part of its
     edge a child owns). ``wet``: the level's wet cells on its domain (band included), e.g. ``np.isfinite(H)`` of the
     depth after :meth:`~pygetm.nesting.NestedModel.share_depth`. A child without outer sides: none. ``sides``: only
     these of them (e.g. "W"; default all)."""
@@ -80,7 +80,7 @@ def level_edge_segments(lev: Level, wet: np.ndarray, sides: str = None) -> List[
         own = "".join(c for c in own if c in sides)
     if not own:
         return []
-    return edge_segments(np.asarray(wet, dtype=bool), lev.band, own, lev.external())
+    return edge_segments(np.asarray(wet, dtype=bool), lev.band, own, lev.coupled())
 
 
 def add_edge_boundaries(domain, lev: Level, wet: np.ndarray, type_2d: int, type_3d: int,

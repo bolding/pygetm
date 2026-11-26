@@ -30,8 +30,8 @@ Every parent and child is a :class:`pygetm.Simulation` with
     volume through its edge faces (U dy dt) to its flux register;
   - after the last sub-step: send restriction and register to the parent.
 
-Faces with ring (or hole) cells on both sides are EXTERNAL
-(:attr:`pygetm.domain.Domain.external`), so the model keeps the transports
+Faces with ring (or hole) cells on both sides are COUPLED
+(:attr:`pygetm.domain.Domain.coupled`), so the model keeps the transports
 set there; faces between ring and computed cells are computed by the level
 itself and are the interface faces matched by the flux registers.
 """
@@ -414,9 +414,9 @@ class Nested2D(Coupler):
         data += b"".join(one(c, True) for c in lev.children)
         return float(zlib.crc32(data))
 
-    def _clean_external_after_restart(self, sim):
+    def _clean_coupled_after_restart(self, sim):
         """After a restart: the restart file holds NaN where the writer masks the
-        field, which includes this level's EXTERNAL cells inside the domain (a
+        field, which includes this level's COUPLED cells inside the domain (a
         parent's hole, a child's band); a continuous run has finite values there.
         Nothing computed uses them (the rim and ring are set by the syncs), but
         diagnostics such as Coriolis are evaluated there and pyGETM's start-up
@@ -431,7 +431,7 @@ class Nested2D(Coupler):
             a = getattr(field, "array", field)
             if not hasattr(a, "grid") or not hasattr(a, "all_values") or a.ndim == 0 or getattr(a, "on_boundary", False):
                 continue
-            ext = a.grid.mask.all_values == CellType.EXTERNAL
+            ext = a.grid.mask.all_values == CellType.COUPLED
             v = a.all_values
             bad = ~np.isfinite(v) & np.broadcast_to(ext, v.shape)
             v[bad] = 0.0
@@ -794,7 +794,7 @@ class Nested2D(Coupler):
         # (Momentum(An_timestep_once=True); upstream pyGETM's default would multiply it by the step twice)
         sim.momentum._An_timestep_once = True
         self._check_restart_phase(sim)
-        self._clean_external_after_restart(sim)
+        self._clean_coupled_after_restart(sim)
         if self.sponge_width > 0.0 and self.up is not None:
             self._set_sponge(sim)
         self._sync([None] * len(self.down), self.up is not None, fluxes=False)

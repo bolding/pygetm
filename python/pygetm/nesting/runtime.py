@@ -2,7 +2,7 @@
 
 :class:`NestingRun` places every level on its own group of MPI processes
 (:func:`pygetm.nesting.split_world`), builds the level's pyGETM grids with the
-ring band and the hole marked external (:attr:`pygetm.domain.Domain.external`),
+ring band and the hole marked coupled (:attr:`pygetm.domain.Domain.coupled`),
 shares the tilings of all levels and builds the exchange plans
 (:class:`pygetm.nesting.plan.Plan`).
 """
@@ -134,7 +134,7 @@ class NestingRun:
         subdomains with water)."""
         lev = self.level
         domain = make_domain(lev, self.comm)
-        domain.external = lev.external()
+        domain.coupled = lev.coupled()
         domain.tiling_mask = lev.tiling_mask()
         masks.check_dams(lev, domain)  # dams (pygetm.dams) off the interfaces
         masks.close_faces(lev, domain)  # interface faces with all child sub-faces closed
@@ -147,12 +147,12 @@ class NestingRun:
         """Build this level's :class:`pygetm.Simulation`. ``make_domain(level,
         comm)`` returns the level's domain including its band;
         ``make_simulation(level, domain)`` the simulation (its halo must equal
-        ``level.halo``). The band and the hole are marked external before the
+        ``level.halo``). The band and the hole are marked coupled before the
         simulation builds its grids; subdomains holding only hole cells that
         nothing reads are removed. Returns the simulation."""
         lev = self.level
         domain = make_domain(lev, self.comm)
-        domain.external = lev.external()
+        domain.coupled = lev.coupled()
         domain.tiling_mask = lev.tiling_mask()
         masks.check_dams(lev, domain)  # dams (pygetm.dams) off the interfaces
         masks.close_faces(lev, domain)  # interface faces with all child sub-faces closed
@@ -174,7 +174,7 @@ class NestingRun:
         rivers = list(domain.rivers.values())
         held = None
         if self.comm.rank == 0:
-            computed = ~np.asarray(lev.external(), dtype=bool)  # domain-shaped: hole and band excluded
+            computed = ~np.asarray(lev.coupled(), dtype=bool)  # domain-shaped: hole and band excluded
             held = {r.name: _river_in(domain, r, computed) for r in rivers}
         claims = self.world.allgather((lev.name, held))
         owners: Dict[str, list] = {}

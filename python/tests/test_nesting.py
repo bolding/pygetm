@@ -147,8 +147,8 @@ class TestAdvectionFlux(unittest.TestCase):
 
 
 class TestExternalCells(unittest.TestCase):
-    def test_external_cells(self):
-        # Cells marked external are wet with valid depth and open faces, are
+    def test_coupled_cells(self):
+        # Cells marked coupled are wet with valid depth and open faces, are
         # not updated by advection, and are excluded from ACTIVE-only sums
         nx, ny = 40, 24
         domain = pygetm.domain.create_cartesian(
@@ -159,9 +159,9 @@ class TestExternalCells(unittest.TestCase):
             f=0.0,
             logger=parallel.get_logger(level="ERROR"),
         )
-        external = np.zeros((ny, nx), dtype=bool)
-        external[:, :2] = True  # a band on the west side
-        domain.external = external
+        coupled = np.zeros((ny, nx), dtype=bool)
+        coupled[:, :2] = True  # a band on the west side
+        domain.coupled = coupled
         T = domain.create_grids(1, halox=2, haloy=2, velocity_grids=1)
         if T is None:
             return
@@ -177,19 +177,19 @@ class TestExternalCells(unittest.TestCase):
         own[T.haloy : -T.haloy, T.halox : -T.halox] = True
         inside &= own
         ext = inside & (ig < 2)
-        self.assertTrue((T.mask.all_values[ext] == CellType.EXTERNAL).all())
+        self.assertTrue((T.mask.all_values[ext] == CellType.COUPLED).all())
         self.assertTrue((T.mask.all_values[inside & ~ext] == CellType.ACTIVE).all())
-        # depth valid (not fill) in external cells
+        # depth valid (not fill) in coupled cells
         self.assertTrue(np.allclose(T.H.all_values[ext], 10.0))
         self.assertTrue(np.allclose(T.D.all_values[ext], 10.0))
-        # faces between external and active cells are open and computed
+        # faces between coupled and active cells are open and computed
         uopen = T.ugrid.mask.all_values[inside & (ig == 1)]
         self.assertTrue((uopen == CellType.ACTIVE).all())
-        # faces with external cells on both sides are external
-        uext = T.ugrid.mask.all_values[inside & (ig == 0)]
-        self.assertTrue((uext == CellType.EXTERNAL).all())
+        # faces with coupled cells on both sides are coupled
+        ucpl = T.ugrid.mask.all_values[inside & (ig == 0)]
+        self.assertTrue((ucpl == CellType.COUPLED).all())
         self.assertTrue(np.allclose(T.ugrid.D.all_values[inside & (ig == 0)], 10.0))
-        # advection: external cells keep their values, active ones change
+        # advection: coupled cells keep their values, active ones change
         f = T.array(fill=0.0)
         f.all_values[ext] = 1.0
         f.update_halos()
@@ -258,11 +258,11 @@ class TestNestingGeometry(unittest.TestCase):
         root, child, gc = levels
         self.assertEqual((child.nx, child.ny), (48, 36))
         self.assertEqual(gc.steps_per_root, 9)
-        self.assertEqual(root.external().shape, root.extended_shape)
-        # band and hole are external, the rest is computed
-        self.assertTrue(root.external()[:2].all())
-        self.assertFalse(root.external()[2 + 8 - 3, 2 + 10 - 3])
-        self.assertTrue(root.external()[2 + 8, 2 + 10])
+        self.assertEqual(root.coupled().shape, root.extended_shape)
+        # band and hole are coupled, the rest is computed
+        self.assertTrue(root.coupled()[:2].all())
+        self.assertFalse(root.coupled()[2 + 8 - 3, 2 + 10 - 3])
+        self.assertTrue(root.coupled()[2 + 8, 2 + 10])
         # rim of the child in the root lies in the hole, next to computed cells
         rim = root.rims["child"]
         self.assertTrue((~root.computed[rim[:, 0], rim[:, 1]]).all())
@@ -305,7 +305,7 @@ class TestNestingGeometry(unittest.TestCase):
         root, child = levels
         self.assertEqual(root.extended_shape, (30, 40))
         self.assertEqual(child.band, 2)
-        ext = root.external()
+        ext = root.coupled()
         self.assertTrue(ext[8:20, 10:26].all())
         self.assertEqual(int(ext.sum()), 12 * 16)
 
@@ -315,7 +315,7 @@ class TestNestingGeometry(unittest.TestCase):
         self.assertTrue(root.hole[8:14, 10:26].all())
         self.assertFalse(root.hole[14:20, 18:26].any())
         self.assertTrue(root.computed[14:20, 18:26].all())
-        np.testing.assert_array_equal(root.external(), ~np.pad(root.computed, 2, constant_values=False))
+        np.testing.assert_array_equal(root.coupled(), ~np.pad(root.computed, 2, constant_values=False))
         # ring: non-active cells within the band of the active region, also inside the window
         b = child.band
         bj, bi = child.ring_cells()
@@ -553,7 +553,7 @@ class TestLevelDepthAndEdges(unittest.TestCase):
         lon_e, lat_e = root.edges()
         domain = pygetm.domain.create_spherical(lon_e, lat_e, interfaces=True, H=np.full(root.domain_shape, 10.0),
                                                 logger=pygetm.parallel.get_logger(level="ERROR"))
-        domain.external = root.external()
+        domain.coupled = root.coupled()
         added = add_edge_boundaries(domain, root, wet["root"], pygetm.FLATHER_TRANSPORT, pygetm.ZERO_GRADIENT)
         self.assertEqual(added, segs)
         self.assertEqual(domain.open_boundaries.i.size, sum(m1 - m0 for _, _, m0, m1 in segs))  # the points added

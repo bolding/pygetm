@@ -409,9 +409,9 @@ class Level:
             )
             c.edge = _child_edge(c, f)
 
-    def external(self) -> np.ndarray:
+    def coupled(self) -> np.ndarray:
         """Cells (including the band) set from outside or not used: all but
-        the cells this level computes. For :attr:`pygetm.domain.Domain.external`
+        the cells this level computes. For :attr:`pygetm.domain.Domain.coupled`
         (domain-shaped: with an overhang, its cells are computed)."""
         h = self.band
         ext = np.ones(self.extended_shape, dtype=bool)

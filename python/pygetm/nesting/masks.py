@@ -147,16 +147,16 @@ def close_faces(lev: Level, domain) -> None:
 
 def check_dams(lev: Level, domain) -> None:
     """Dams (:mod:`pygetm.dams`: faces closed between two wet cells) must stay off the
-    level's interface: a closed face between a computed and an external cell raises
+    level's interface: a closed face between a computed and a coupled cell raises
     (the parent's and the child's fluxes there would differ). Faces between two
-    external cells (the child's band, the parent's hole) are reopened, and the
+    coupled cells (the child's band, the parent's hole) are reopened, and the
     corners among them: the level that computes those cells has the dam itself.
     Call before :func:`close_faces` (which closes interface faces by rule 3).
     The global mask lives on the domain's rank 0 only (an error there aborts all levels)."""
     if domain.comm.rank != 0 or domain._mask is None:
         return
     m = domain.mask
-    ext = np.asarray(lev.external(), dtype=bool)
+    ext = np.asarray(lev.coupled(), dtype=bool)
     tw = m[1::2, 1::2] != 0
     for name, um, a, b, ea, eb in (
         ("U", m[1::2, 2:-1:2], tw[:, :-1], tw[:, 1:], ext[:, :-1], ext[:, 1:]),
